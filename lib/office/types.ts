@@ -90,6 +90,8 @@ export type Station = {
   /** Rotation around Y; 0 means the seated worker faces +Z. */
   facing: number;
   kind: "desk" | "executive";
+  /** Monitor setup: two 24" screens on an arm, or one curved 34" ultrawide. */
+  monitors: "dual" | "ultrawide";
   /** Waypoints from the chair to the zone door (used by the meeting walk). */
   exit: [number, number][];
 };

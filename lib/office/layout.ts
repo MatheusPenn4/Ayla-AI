@@ -21,32 +21,33 @@ export const FLOOR: Rect = { x0: -14, x1: 14, z0: -10, z1: 10 };
 export const CORRIDOR_Z = -2.2;
 
 export const ZONES: Record<ZoneId, ZoneInfo> = {
-  director: { id: "director", name: "Diretoria", short: "DIR", accent: "#f0bd5e", rect: { x0: -13.4, x1: -5, z0: -9.4, z1: -3.2 }, doorIn: [-5.9, -4], doorOut: [-5.9, CORRIDOR_Z], focus: [-9, -6.2] },
-  lounge: { id: "lounge", name: "Copa & Fila", short: "COPA", accent: "#8fd6ff", rect: { x0: -4.4, x1: 3.2, z0: -9.4, z1: -3.2 }, doorIn: [-0.6, -3.8], doorOut: [-0.6, CORRIDOR_Z], focus: [-0.6, -6.4] },
-  meeting: { id: "meeting", name: "Sala de reunião", short: "REUNIÃO", accent: "#b69cff", rect: { x0: 4, x1: 13.4, z0: -9.4, z1: -3 }, doorIn: [5.1, -3.8], doorOut: [5.1, CORRIDOR_Z], focus: [8.8, -6.2] },
-  dev: { id: "dev", name: "Desenvolvimento", short: "DEV", accent: "#4fd8c4", rect: { x0: -13.4, x1: 1.4, z0: -1.4, z1: 9.4 }, doorIn: [0.1, -0.6], doorOut: [0.1, CORRIDOR_Z], focus: [-6, 3.6] },
-  qa: { id: "qa", name: "QA & Revisão", short: "QA", accent: "#ff9a76", rect: { x0: 3, x1: 13.4, z0: -1.4, z1: 9.4 }, doorIn: [4.1, -0.6], doorOut: [4.1, CORRIDOR_Z], focus: [8.4, 3.6] },
+  director: { id: "director", name: "Diretoria", short: "DIR", accent: "#e0b36a", rect: { x0: -13.4, x1: -5, z0: -9.4, z1: -3.2 }, doorIn: [-5.9, -4], doorOut: [-5.9, CORRIDOR_Z], focus: [-9, -6.2] },
+  lounge: { id: "lounge", name: "Copa & Fila", short: "COPA", accent: "#9fb8d8", rect: { x0: -4.4, x1: 3.2, z0: -9.4, z1: -3.2 }, doorIn: [-0.6, -3.8], doorOut: [-0.6, CORRIDOR_Z], focus: [-0.6, -6.4] },
+  meeting: { id: "meeting", name: "Sala de reunião", short: "REUNIÃO", accent: "#8f9dff", rect: { x0: 4, x1: 13.4, z0: -9.4, z1: -3 }, doorIn: [5.1, -3.8], doorOut: [5.1, CORRIDOR_Z], focus: [8.8, -6.2] },
+  dev: { id: "dev", name: "Desenvolvimento", short: "DEV", accent: "#35d0ff", rect: { x0: -13.4, x1: 1.4, z0: -1.4, z1: 9.4 }, doorIn: [0.1, -0.6], doorOut: [0.1, CORRIDOR_Z], focus: [-6, 3.6] },
+  qa: { id: "qa", name: "QA & Revisão", short: "QA", accent: "#5b8cff", rect: { x0: 3, x1: 13.4, z0: -1.4, z1: 9.4 }, doorIn: [4.1, -0.6], doorOut: [4.1, CORRIDOR_Z], focus: [8.4, 3.6] },
 };
 
 export const WORK_ZONES: WorkZoneId[] = ["director", "dev", "qa"];
 
 /** Four desks around a shared divider: two facing +Z, two facing -Z. */
-function cluster(prefix: string, zone: WorkZoneId, cx: number, cz: number, sideX: number, only?: number[]): Station[] {
-  const back = cz - 2.2, front = cz + 2.2;
-  const seats: Station[] = [
-    { id: `${prefix}-a`, zone, x: cx - 0.95, z: cz - 1.2, facing: 0, kind: "desk", exit: [[cx - 0.95, back]] },
-    { id: `${prefix}-b`, zone, x: cx + 0.95, z: cz - 1.2, facing: 0, kind: "desk", exit: [[cx + 0.95, back]] },
-    { id: `${prefix}-c`, zone, x: cx - 0.95, z: cz + 1.2, facing: Math.PI, kind: "desk", exit: [[cx - 0.95, front], [sideX, front], [sideX, back]] },
-    { id: `${prefix}-d`, zone, x: cx + 0.95, z: cz + 1.2, facing: Math.PI, kind: "desk", exit: [[cx + 0.95, front], [sideX, front], [sideX, back]] },
-  ];
-  return only ? only.map(i => seats[i]) : seats;
-}
+type Monitors = Station["monitors"];
 
-function pair(prefix: string, zone: WorkZoneId, cx: number, cz: number, sideX: number): Station[] {
+function cluster(prefix: string, zone: WorkZoneId, cx: number, cz: number, sideX: number, monitors: Monitors): Station[] {
   const back = cz - 2.2, front = cz + 2.2;
   return [
-    { id: `${prefix}-a`, zone, x: cx, z: cz - 1.2, facing: 0, kind: "desk", exit: [[cx, back]] },
-    { id: `${prefix}-c`, zone, x: cx, z: cz + 1.2, facing: Math.PI, kind: "desk", exit: [[cx, front], [sideX, front], [sideX, back]] },
+    { id: `${prefix}-a`, zone, x: cx - 0.95, z: cz - 1.2, facing: 0, kind: "desk", monitors, exit: [[cx - 0.95, back]] },
+    { id: `${prefix}-b`, zone, x: cx + 0.95, z: cz - 1.2, facing: 0, kind: "desk", monitors, exit: [[cx + 0.95, back]] },
+    { id: `${prefix}-c`, zone, x: cx - 0.95, z: cz + 1.2, facing: Math.PI, kind: "desk", monitors, exit: [[cx - 0.95, front], [sideX, front], [sideX, back]] },
+    { id: `${prefix}-d`, zone, x: cx + 0.95, z: cz + 1.2, facing: Math.PI, kind: "desk", monitors, exit: [[cx + 0.95, front], [sideX, front], [sideX, back]] },
+  ];
+}
+
+function pair(prefix: string, zone: WorkZoneId, cx: number, cz: number, sideX: number, monitors: Monitors): Station[] {
+  const back = cz - 2.2, front = cz + 2.2;
+  return [
+    { id: `${prefix}-a`, zone, x: cx, z: cz - 1.2, facing: 0, kind: "desk", monitors, exit: [[cx, back]] },
+    { id: `${prefix}-c`, zone, x: cx, z: cz + 1.2, facing: Math.PI, kind: "desk", monitors, exit: [[cx, front], [sideX, front], [sideX, back]] },
   ];
 }
 
@@ -54,13 +55,17 @@ export const DEV_CLUSTERS: [number, number][] = [[-8.8, 3.6], [-3.4, 3.6]];
 export const QA_CLUSTER: [number, number] = [6.4, 3.6];
 export const QA_PAIR: [number, number] = [10.9, 3.6];
 
+// Monitor plan (intentional, per area):
+//  - Diretoria: executive desk with a curved 34" ultrawide; staff desk with dual monitors.
+//  - Desenvolvimento: cluster 1 (studio/creation) curved ultrawides; cluster 2 (engineering) dual monitors.
+//  - QA & Revisão: 4-desk test cluster with dual monitors (app + test tooling); review pair with ultrawides (side-by-side diffs).
 export const STATIONS: Station[] = [
-  { id: "dir-main", zone: "director", x: -9.6, z: -7.5, facing: 0, kind: "executive", exit: [[-8, -7.5], [-8, -4.4]] },
-  { id: "dir-staff", zone: "director", x: -12.3, z: -4.6, facing: Math.PI / 2, kind: "desk", exit: [[-12.3, -3.9], [-8, -3.9]] },
-  ...cluster("dev1", "dev", DEV_CLUSTERS[0][0], DEV_CLUSTERS[0][1], -6.1),
-  ...cluster("dev2", "dev", DEV_CLUSTERS[1][0], DEV_CLUSTERS[1][1], -0.7),
-  ...cluster("qa1", "qa", QA_CLUSTER[0], QA_CLUSTER[1], 9.1),
-  ...pair("qa2", "qa", QA_PAIR[0], QA_PAIR[1], 9.1),
+  { id: "dir-main", zone: "director", x: -9.6, z: -7.5, facing: 0, kind: "executive", monitors: "ultrawide", exit: [[-8, -7.5], [-8, -4.4]] },
+  { id: "dir-staff", zone: "director", x: -12.0, z: -4.1, facing: Math.PI, kind: "desk", monitors: "dual", exit: [[-12.0, -3.75], [-8, -3.75]] },
+  ...cluster("dev1", "dev", DEV_CLUSTERS[0][0], DEV_CLUSTERS[0][1], -6.1, "ultrawide"),
+  ...cluster("dev2", "dev", DEV_CLUSTERS[1][0], DEV_CLUSTERS[1][1], -0.7, "dual"),
+  ...cluster("qa1", "qa", QA_CLUSTER[0], QA_CLUSTER[1], 9.1, "dual"),
+  ...pair("qa2", "qa", QA_PAIR[0], QA_PAIR[1], 9.1, "ultrawide"),
 ];
 
 export const STATION_BY_ID = new Map(STATIONS.map(s => [s.id, s]));

@@ -75,6 +75,12 @@ export class Placer {
     g.scale(1, sy, 1);
     return this.at(g, color, x, y, z);
   }
+  /** A placer whose local frame is an arbitrary matrix (e.g. a tilted monitor). */
+  static fromMatrix(batch: GeometryBatch, m: THREE.Matrix4) {
+    const p = new Placer(batch);
+    p.base = m.clone();
+    return p;
+  }
   child(ox: number, oz: number, ry = 0, oy = 0) {
     const p = new Placer(this.batch);
     p.base = this.base.clone().multiply(matrix(ox, oy, oz, ry));

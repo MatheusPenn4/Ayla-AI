@@ -97,7 +97,7 @@ export class OfficeEngine {
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.toneMappingExposure = 1.22;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     const canvas = this.renderer.domElement;
     canvas.tabIndex = 0;
@@ -105,7 +105,7 @@ export class OfficeEngine {
     canvas.setAttribute("aria-label", "Escritório 3D. Arraste para girar, role para aproximar, setas para deslocar, Q e E para girar, + e − para zoom, R para recentralizar.");
     host.appendChild(canvas);
 
-    this.scene.fog = new THREE.Fog("#0a0c1a", 70, 170);
+    this.scene.fog = new THREE.Fog("#07090f", 70, 170);
     const aniso = Math.min(settings.anisotropy, this.renderer.capabilities.getMaxAnisotropy());
     this.world = buildWorld(aniso);
     this.scene.add(this.world.root);
@@ -113,9 +113,9 @@ export class OfficeEngine {
     this.kit = new CharacterKit(this.blobTex);
 
     // Lighting: cool moonlight key + warm/cool pools per zone.
-    this.hemi = new THREE.HemisphereLight("#a9b6ff", "#2a2140", 1.25);
+    this.hemi = new THREE.HemisphereLight("#b4c3ee", "#1b1f2b", 1.45);
     this.scene.add(this.hemi);
-    this.sun = new THREE.DirectionalLight("#fff0dc", 1.9);
+    this.sun = new THREE.DirectionalLight("#f2f5ff", 2.1);
     this.sun.position.set(-9, 20, 13);
     this.sun.target.position.set(0, 0, 0);
     const sc = this.sun.shadow.camera;
@@ -124,7 +124,7 @@ export class OfficeEngine {
     this.sun.shadow.normalBias = 0.03;
     this.scene.add(this.sun, this.sun.target);
     const pools: [string, number, number, number, number][] = [
-      ["#c8fff4", -6, 3.4, 3.6, 30], ["#ffd2bd", 8.4, 3.4, 3.6, 26], ["#ffcf8a", -9.4, 3.2, -6.2, 26], ["#c7b2ff", 8.9, 3, -6.2, 22], ["#9fdcff", -0.6, 3, -6.2, 18],
+      ["#bfefff", -6, 3.4, 3.6, 30], ["#c9d8ff", 8.4, 3.4, 3.6, 28], ["#ffd49a", -9.4, 3.2, -6.2, 26], ["#c3cbff", 8.9, 3, -6.2, 22], ["#b8e6ff", -0.6, 3, -6.2, 18],
     ];
     for (const [color, x, y, z, intensity] of pools) {
       const l = new THREE.PointLight(color, intensity, 13, 1.6);
@@ -141,7 +141,8 @@ export class OfficeEngine {
     c.screenSpacePanning = false;
     c.minDistance = 11; c.maxDistance = 95;
     c.minPolarAngle = 0.32; c.maxPolarAngle = 1.2;
-    c.minAzimuthAngle = -0.5; c.maxAzimuthAngle = 1.65;
+    // Keeps the back wall (and the PENSEI ALTO sign) readable from every allowed angle.
+    c.minAzimuthAngle = -0.5; c.maxAzimuthAngle = 1.3;
     c.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
     c.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
     c.keyPanSpeed = 22;
@@ -227,6 +228,7 @@ export class OfficeEngine {
 
   setDashboard(data: DashboardData) {
     for (const ws of this.world.wallScreens) ws.draw(data);
+    this.world.refreshFonts();
     const n = Math.min(10, data.demandCount);
     while (this.inboxPapers.length > n) this.world.inbox.remove(this.inboxPapers.pop()!);
     while (this.inboxPapers.length < n) {
@@ -371,7 +373,7 @@ export class OfficeEngine {
       this.sun.shadow.map = null;
     }
     this.points.forEach((p, i) => (p.visible = i < s.pointLights));
-    this.hemi.intensity = s.pointLights ? 1.25 : 1.75;
+    this.hemi.intensity = s.pointLights ? 1.45 : 1.95;
     if (tier !== "low" && !this.envTex) {
       const pmrem = new THREE.PMREMGenerator(this.renderer);
       const room = new RoomEnvironment();

@@ -9,10 +9,13 @@ Não há arquivos de modelo (glTF/FBX/OBJ) nem imagens de textura no projeto. To
 | O quê | Onde | Como é feito |
 |---|---|---|
 | Arquitetura (piso, paredes, salas, vidro, telas de parede) | `components/office/scene/world.ts` | Primitivas do three.js mescladas por material (`batch.ts`) |
-| Mobiliário (mesas, cadeiras, monitores, estantes, sofás, bancada de testes, arcade, plantas) | `components/office/scene/world.ts` | Primitivas com cor por vértice, mescladas em poucas malhas |
+| Mobiliário (estantes, sofás, bancada e parede de dispositivos, storyboard, arcade, plantas) | `components/office/scene/world.ts` | Primitivas com cor por vértice, mescladas em poucas malhas |
+| Estações de trabalho (mesa com estrutura de aço, monitores duplos 24" com braço ou ultrawide 34" curvo, periféricos, gabinete, cadeira) | `components/office/scene/workstation.ts` | Geradas a partir de `lib/office/layout.ts`; a curvatura do ultrawide é aplicada aos vértices da tela e da moldura |
+| Letreiro "PENSEI ALTO" | `components/office/scene/sign.ts` | Contornos das letras desenhados para este projeto (tipografia geométrica chanfrada), extrudados em 3D; halo gerado em `<canvas>`. Não é um logotipo oficial nem usa arquivo de fonte |
+| Luz indireta (rodapés, sancas, reflexos de tela) | `components/office/scene/world.ts` + `textures.ts` (`glowAtlas`) | Planos aditivos com textura procedural; nenhuma luz real extra |
 | Personagens (corpo articulado, cabelos, roupas, acessórios) | `components/office/scene/character.ts` | `RoundedBoxGeometry`, cones e icosaedros; rig com quadril, joelhos, ombros e cabeça |
 | Animações (respirar, digitar, olhar, acenar, caminhar até a reunião, surgir ao ser contratado) | `components/office/scene/character.ts` | Poses calculadas no código, sem clipes externos |
-| Texturas (carpete, madeira, concreto, horizonte noturno, telas dos monitores, painéis de parede) | `components/office/scene/textures.ts` | Geradas em `<canvas>` no navegador |
+| Texturas (carpete grafite, nogueira, epóxi, pedra, concreto, horizonte noturno, telas dos monitores, painéis de parede) | `components/office/scene/textures.ts` | Geradas em `<canvas>` no navegador |
 | Retratos 2D dos funcionários | `components/office/avatar.tsx` | SVG gerado a partir da mesma aparência do personagem 3D |
 
 A imagem `reference/escritorio-referencia.png` serviu só como referência de direção de arte (composição, escala e clima). Nada dela foi copiado nem é distribuído no app.

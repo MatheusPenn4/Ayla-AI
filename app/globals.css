@@ -7,7 +7,7 @@
   color-scheme: dark;
   --bg: #0a0c1a; --bg-2: #0e1124; --panel: #131733; --panel-2: #191e40; --panel-3: #20264f;
   --line: #262c57; --line-2: #363f7a; --text: #eef0ff; --muted: #a4abd6; --dim: #737ba9;
-  --gold: #f0bd5e; --gold-2: #ffd98a; --teal: #4fd8c4; --coral: #ff9a76; --violet: #b69cff; --sky: #8fd6ff; --red: #ff7a7a; --green: #6be3a0;
+  --gold: #f0bd5e; --gold-2: #ffd98a; --teal: #35d0ff; --coral: #5b8cff; --violet: #b69cff; --sky: #8fd6ff; --red: #ff7a7a; --green: #6be3a0;
   --font-display: "Oxanium Variable", "Trebuchet MS", sans-serif;
   --font-body: "Figtree Variable", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Mono", monospace;
@@ -109,7 +109,7 @@ svg { flex: none; }
 .stage-footer button:hover { color: var(--text); text-decoration: underline; }
 
 /* ------------------------------------------------------------------ scene */
-.office-view { position: absolute; inset: 0; overflow: hidden; background: radial-gradient(120% 90% at 55% 40%, #1d1c45 0%, #111332 45%, #07080f 100%); }
+.office-view { position: absolute; inset: 0; overflow: hidden; background: radial-gradient(120% 90% at 55% 40%, #141a2c 0%, #0b0f1c 45%, #05060b 100%); }
 .office-view::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(90% 70% at 50% 45%, transparent 60%, #04050c99 100%); }
 .office-view.is-hidden { visibility: hidden; }
 .office-canvas-wrap, .office-canvas { position: absolute; inset: 0; }
