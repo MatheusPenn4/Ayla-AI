@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { DEFAULT_AGENTS, baseTools, newId } from "@/lib/office/defaults";
+import { DEFAULT_AGENTS, newId } from "@/lib/office/defaults";
+import { dismissPreset as dismissPresetOf, filterTargets, profileForHire } from "@/lib/office/profile";
 import { STATION_BY_ID, freeStation } from "@/lib/office/layout";
 import { STORAGE_V2, assignStations, loadOffice, saveOffice } from "@/lib/office/storage";
 import type { Agent, Appearance, Demand, WorkZoneId } from "@/lib/office/types";
 
-export type NewWorkerInput = { name: string; role: string; description: string; color: string; zone: WorkZoneId; look: Appearance; stationId?: string };
+/** templateId: hire template whose profile is copied into the new collaborator (null = start from scratch). */
+export type NewWorkerInput = { name: string; role: string; description: string; color: string; zone: WorkZoneId; look: Appearance; stationId?: string; templateId?: string | null };
 type Result = { ok: true; id: string } | { ok: false; error: string };
 
 export function useOffice() {
@@ -48,6 +50,7 @@ export function useOffice() {
     const name = draft.name.trim(), role = draft.role.trim();
     if (!name || !role) return { ok: false, error: "Preencha nome e função." };
     if (!Number.isFinite(draft.budget) || draft.budget < 1000 || draft.budget > 1_000_000) return { ok: false, error: "O orçamento deve ficar entre 1.000 e 1.000.000 tokens." };
+    if (draft.maxCycles !== null && (!Number.isInteger(draft.maxCycles) || draft.maxCycles < 1 || draft.maxCycles > 10)) return { ok: false, error: "O máximo de devoluções deve ser um número inteiro entre 1 e 10 (ou ficar em branco)." };
     const current = agents.find(a => a.id === draft.id);
     if (!current) return { ok: false, error: "Funcionário não encontrado." };
     let stationId = current.stationId;
@@ -56,7 +59,8 @@ export function useOffice() {
       if (!free) return { ok: false, error: "Não há estação livre nessa área." };
       stationId = free;
     }
-    setAgents(list => list.map(a => (a.id === draft.id ? { ...draft, name, role, stationId, handoffTo: draft.handoffTo.filter(id => id !== draft.id) } : a)));
+    const ids = agents.map(a => a.id);
+    setAgents(list => list.map(a => (a.id === draft.id ? { ...draft, name, role, stationId, handoffTo: filterTargets(draft.handoffTo, ids, draft.id).filter(t => t !== "user"), returnTo: filterTargets(draft.returnTo, ids, draft.id) } : a)));
     return { ok: true, id: draft.id };
   }, [agents]);
 
@@ -68,21 +72,27 @@ export function useOffice() {
     const stationId = requested ?? freeStation(input.zone, taken);
     if (!stationId) return { ok: false, error: "Todas as estações desta área estão ocupadas. Escolha outra área." };
     const id = newId();
+    const profile = profileForHire(input.templateId ?? null, agents.map(a => a.id));
     const agent: Agent = {
-      id, name, role, color: input.color, description: input.description.trim() || `Especialista em ${role}.`,
-      model: "A definir", modelName: "", instructions: "", limits: "", deliverable: "", handoff: "", handoffTo: ["director"],
-      budget: 10000, tools: { ...baseTools }, custom: true, zone: input.zone, stationId, look: input.look,
+      ...profile,
+      id, name, role, color: input.color, description: input.description.trim() || profile.description || `Especialista em ${role}.`,
+      model: "A definir", modelName: "", custom: true, zone: input.zone, stationId, look: input.look,
     };
     setAgents(list => [...list, agent]);
     return { ok: true, id };
   }, [agents]);
 
   const removeAgent = useCallback((id: string) => {
-    setAgents(list => list.filter(a => a.id !== id || !a.custom).map(a => ({ ...a, handoffTo: a.handoffTo.filter(h => h !== id) })));
+    setAgents(list => list.filter(a => a.id !== id || !a.custom).map(a => ({ ...a, handoffTo: a.handoffTo.filter(h => h !== id), returnTo: a.returnTo.filter(h => h !== id) })));
+  }, []);
+
+  /** "Keep my current sheet": stops suggesting the newest preset version for this collaborator. */
+  const dismissPreset = useCallback((id: string) => {
+    setAgents(list => list.map(a => (a.id === id ? dismissPresetOf(a) : a)));
   }, []);
 
   const addDemand = useCallback((d: Demand) => setDemands(list => [d, ...list]), []);
   const removeDemand = useCallback((id: string) => setDemands(list => list.filter(d => d.id !== id)), []);
 
-  return { agents, demands, hydrated, migratedFrom, saveAgent, addAgent, removeAgent, addDemand, removeDemand };
+  return { agents, demands, hydrated, migratedFrom, saveAgent, addAgent, removeAgent, dismissPreset, addDemand, removeDemand };
 }

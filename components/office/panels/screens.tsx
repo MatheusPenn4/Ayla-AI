@@ -1,12 +1,13 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowRight, BriefcaseBusiness, ClipboardList, Code2, FolderOpen, GitBranch, Plus, Trash2 } from "lucide-react";
+import { ArrowRight, BriefcaseBusiness, ClipboardList, Code2, FolderOpen, GitBranch, Plus, Sparkles, Trash2 } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Avatar } from "../avatar";
 import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
 import { CAPACITY, WORK_ZONES, zoneCapacity } from "@/lib/office/layout";
 import { buildDemandPayload, formatBytes, orchestrator } from "@/lib/integration/contracts";
+import { presetUpdate } from "@/lib/office/profile";
 import type { Agent, Demand } from "@/lib/office/types";
 
 const when = (iso: string) => {
@@ -14,13 +15,22 @@ const when = (iso: string) => {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString("pt-BR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 };
 
-export function TeamScreen({ agents, onOpen, onHire }: { agents: Agent[]; onOpen: (a: Agent) => void; onHire: () => void }) {
+export function TeamScreen({ agents, onOpen, onReview, onHire }: { agents: Agent[]; onOpen: (a: Agent) => void; onReview: (a: Agent) => void; onHire: () => void }) {
+  const updates = agents.filter(a => presetUpdate(a));
+  const pending = updates.filter(a => !presetUpdate(a)!.dismissed);
   return (
     <div className="work-screen">
       <div className="screen-heading">
         <div><span className="eyebrow">EQUIPE / FUNCIONÁRIOS</span><h2>Quem trabalha aqui</h2><p>Configure instruções, ferramentas, limites e encaminhamentos de cada personagem.</p></div>
         <button className="btn-primary" onClick={onHire} disabled={agents.length >= CAPACITY}><Plus size={16} /> Contratar</button>
       </div>
+      {!!pending.length && (
+        <div className="preset-banner wide" role="status">
+          <Sparkles size={16} aria-hidden />
+          <p><b>Novas instruções padrão para {pending.length} {pending.length === 1 ? "colaborador" : "colaboradores"}.</b> Suas fichas atuais continuam valendo; compare e aplique só o que quiser. Nome, visual, estação e demandas não mudam.</p>
+          <div className="banner-actions">{pending.map(a => <button key={a.id} className="btn-secondary" onClick={() => onReview(a)}>Revisar {a.name}</button>)}</div>
+        </div>
+      )}
       <div className="capacity">
         {WORK_ZONES.map(z => {
           const n = agents.filter(a => a.zone === z).length, cap = zoneCapacity(z);
@@ -37,12 +47,12 @@ export function TeamScreen({ agents, onOpen, onHire }: { agents: Agent[]; onOpen
       <div className="team-grid">
         {agents.map((a, i) => (
           <button key={a.id} className="team-tile" style={{ "--accent": a.color } as React.CSSProperties} onClick={() => onOpen(a)}>
-            <span className="tile-index">Nº {String(i + 1).padStart(2, "0")} · {ZONE_LABEL[a.zone]}</span>
+            <span className="tile-index">Nº {String(i + 1).padStart(2, "0")} · {ZONE_LABEL[a.zone]}{presetUpdate(a) && !presetUpdate(a)!.dismissed ? <em className="tile-flag">atualização disponível</em> : null}</span>
             <Avatar look={a.look} color={a.color} size={64} />
             <span className="tile-role">{a.role}</span>
             <h3>{a.name}</h3>
             <p>{a.description}</p>
-            <span className="tile-tools">{TOOL_INFO.filter(t => a.tools[t.key]).map(t => <i key={t.key}>{t.label}</i>)}</span>
+            <span className="tile-tools" title="Permissões planejadas (nenhuma conectada)">{TOOL_INFO.filter(t => a.tools[t.key]).map(t => <i key={t.key}>{t.label}</i>)}</span>
             <span className="tile-bottom">{a.model === "A definir" ? "Provedor a definir" : String(a.model)}{a.modelName ? ` · ${a.modelName}` : ""}<ArrowRight size={16} /></span>
           </button>
         ))}

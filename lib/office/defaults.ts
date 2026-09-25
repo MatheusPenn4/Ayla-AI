@@ -1,13 +1,18 @@
 import type { Accessory, Agent, Appearance, HairStyle, Outfit, ToolKey, WorkZoneId } from "./types";
+import { DEFAULT_PROFILES, PRESET_VERSION } from "./presets";
 
 export const baseTools: Record<ToolKey, boolean> = { read: true, edit: false, terminal: false, github: false, browser: false };
 
+/**
+ * Planned permissions. A switch only records what the collaborator *should* be
+ * allowed to do once the engine exists; nothing is connected in this phase.
+ */
 export const TOOL_INFO: { key: ToolKey; label: string; description: string }[] = [
-  { key: "read", label: "Ler arquivos", description: "Inspecionar código e documentação" },
-  { key: "edit", label: "Editar arquivos", description: "Propor alterações no projeto" },
-  { key: "terminal", label: "Terminal", description: "Executar comandos e testes" },
-  { key: "github", label: "GitHub", description: "Acessar repositórios conectados" },
-  { key: "browser", label: "Navegador", description: "Verificar páginas e interfaces" },
+  { key: "read", label: "Ler arquivos", description: "Leitura do repositório ou da pasta associada à demanda" },
+  { key: "edit", label: "Editar arquivos", description: "Alterar arquivos em uma cópia de trabalho (nunca direto em produção)" },
+  { key: "terminal", label: "Terminal", description: "Executar comandos de build e testes em ambiente isolado" },
+  { key: "github", label: "GitHub", description: "Consultar repositório, issues e pull requests pela integração" },
+  { key: "browser", label: "Navegador", description: "Abrir e verificar páginas e interfaces em um navegador de teste" },
 ];
 
 export const PROVIDERS = ["A definir", "OpenAI", "Claude", "Outro provedor"] as const;
@@ -52,53 +57,21 @@ export function lookFromSeed(seed: string): Appearance {
   };
 }
 
-type Seed = Omit<Agent, "handoffTo" | "modelName" | "custom"> & { handoffTo?: string[] };
+type Seed = Pick<Agent, "id" | "name" | "role" | "color" | "zone" | "stationId" | "look">;
 
 const seeds: Seed[] = [
-  {
-    id: "director", name: "Diretor", role: "Orquestração", color: "#669adf", zone: "director", stationId: "dir-main",
-    description: "Recebe a missão, define o plano e distribui o trabalho entre especialistas.", model: "A definir",
-    instructions: "Compreenda o objetivo, inspecione o contexto disponível, divida tarefas independentes quando isso trouxer ganho e consolide a entrega.",
-    limits: "Não modificar produção nem publicar sem autorização. Não delegar tarefas pequenas sem necessidade.",
-    deliverable: "Plano curto, responsáveis, resultado consolidado, evidências e riscos.", handoff: "Arquiteto, Desenvolvedor, QA e Revisor",
-    handoffTo: ["architect", "developer", "qa", "reviewer"], budget: 20000, tools: { ...baseTools, github: true },
-    look: { skin: "#eab58f", hair: "slick", hairColor: "#c9ccd3", outfit: "blazer", accessory: "beard", pants: "#2b3246" },
-  },
-  {
-    id: "architect", name: "Arquiteto", role: "Arquitetura", color: "#ad95d9", zone: "dev", stationId: "dev2-a",
-    description: "Analisa dependências, impacto técnico e decisões de estrutura.", model: "A definir",
-    instructions: "Mapeie o código relevante, contratos e impactos da mudança. Recomende a menor solução coerente.",
-    limits: "Não alterar código fora do escopo aprovado.", deliverable: "Proposta técnica, arquivos afetados, dependências e riscos.",
-    handoff: "Desenvolvedor", handoffTo: ["developer"], budget: 12000, tools: { ...baseTools },
-    look: { skin: "#8d5a36", hair: "curly", hairColor: "#1f1a1c", outfit: "sweater", accessory: "glasses", pants: "#3a3f4f" },
-  },
-  {
-    id: "developer", name: "Desenvolvedor", role: "Implementação", color: "#56c9bd", zone: "dev", stationId: "dev2-b",
-    description: "Implementa alterações de código com escopo e critérios claros.", model: "A definir",
-    instructions: "Leia o contexto da tarefa, implemente a mudança com cuidado, preserve padrões do projeto e relate os arquivos modificados.",
-    limits: "Não realizar deploy nem alterar segredos ou configuração de produção.", deliverable: "Código alterado, descrição da solução e validação.",
-    handoff: "QA", handoffTo: ["qa"], budget: 24000, tools: { ...baseTools, edit: true, terminal: true },
-    look: { skin: "#f6d3b8", hair: "spiky", hairColor: "#3b2a22", outfit: "hoodie", accessory: "headphones", pants: "#26394a" },
-  },
-  {
-    id: "qa", name: "QA", role: "Qualidade", color: "#e6a07f", zone: "qa", stationId: "qa1-a",
-    description: "Confere critérios de aceite e registra evidências reais.", model: "A definir",
-    instructions: "Verifique os critérios de aceite e execute testes relevantes. Relate falhas reproduzíveis.",
-    limits: "Não marcar como validado sem executar a checagem correspondente.", deliverable: "Checklist, resultados, falhas e evidências.",
-    handoff: "Revisor", handoffTo: ["reviewer"], budget: 10000, tools: { ...baseTools, terminal: true, browser: true },
-    look: { skin: "#d49a6a", hair: "bun", hairColor: "#a3663a", outfit: "vest", accessory: "headset", pants: "#33403a" },
-  },
-  {
-    id: "reviewer", name: "Revisor", role: "Revisão final", color: "#d0b26f", zone: "qa", stationId: "qa1-b",
-    description: "Revisa a entrega consolidada antes de chegar a você.", model: "A definir",
-    instructions: "Revise o resultado em relação ao pedido original, identifique regressões e resuma o que foi verificado.",
-    limits: "Não aprovar trabalho com pendências críticas sem destacá-las.", deliverable: "Parecer final, pendências e recomendações.",
-    handoff: "Diretor", handoffTo: ["director"], budget: 8000, tools: { ...baseTools },
-    look: { skin: "#f6d3b8", hair: "long", hairColor: "#6a4630", outfit: "labcoat", accessory: "cap", pants: "#4b3a33" },
-  },
+  { id: "director", name: "Diretor", role: "Orquestração", color: "#669adf", zone: "director", stationId: "dir-main", look: { skin: "#eab58f", hair: "slick", hairColor: "#c9ccd3", outfit: "blazer", accessory: "beard", pants: "#2b3246" } },
+  { id: "architect", name: "Arquiteto", role: "Arquitetura", color: "#ad95d9", zone: "dev", stationId: "dev2-a", look: { skin: "#8d5a36", hair: "curly", hairColor: "#1f1a1c", outfit: "sweater", accessory: "glasses", pants: "#3a3f4f" } },
+  { id: "developer", name: "Desenvolvedor", role: "Implementação", color: "#56c9bd", zone: "dev", stationId: "dev2-b", look: { skin: "#f6d3b8", hair: "spiky", hairColor: "#3b2a22", outfit: "hoodie", accessory: "headphones", pants: "#26394a" } },
+  { id: "qa", name: "QA", role: "Qualidade", color: "#e6a07f", zone: "qa", stationId: "qa1-a", look: { skin: "#d49a6a", hair: "bun", hairColor: "#a3663a", outfit: "vest", accessory: "headset", pants: "#33403a" } },
+  { id: "reviewer", name: "Revisor", role: "Revisão final", color: "#d0b26f", zone: "qa", stationId: "qa1-b", look: { skin: "#f6d3b8", hair: "long", hairColor: "#6a4630", outfit: "labcoat", accessory: "cap", pants: "#4b3a33" } },
 ];
 
-export const DEFAULT_AGENTS: Agent[] = seeds.map(s => ({ ...s, modelName: "", handoffTo: s.handoffTo ?? [], custom: false }));
+/** Fresh installs get the complete, current profiles (see lib/office/presets.ts). */
+export const DEFAULT_AGENTS: Agent[] = seeds.map(s => {
+  const p = structuredClone(DEFAULT_PROFILES[s.id as keyof typeof DEFAULT_PROFILES]);
+  return { ...s, ...p, model: "A definir", modelName: "", custom: false, preset: { id: s.id, version: PRESET_VERSION } };
+});
 export const DEFAULT_IDS = new Set(DEFAULT_AGENTS.map(a => a.id));
 
 export function newId() {

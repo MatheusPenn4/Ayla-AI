@@ -13,8 +13,9 @@ import { DemandQueue, TeamScreen } from "@/components/office/panels/screens";
 import { TIER_LABEL, type Tier } from "@/components/office/scene/quality";
 import { useOffice } from "@/hooks/use-office";
 import { ZONE_LABEL } from "@/lib/office/defaults";
+import { presetUpdate } from "@/lib/office/profile";
 import { CAPACITY, STATION_BY_ID, ZONES } from "@/lib/office/layout";
-import { loadPrefs, savePrefs, type QualityPref } from "@/lib/office/storage";
+import { loadPrefs, savePrefs, serializeOffice, type QualityPref } from "@/lib/office/storage";
 import type { Agent, WorkZoneId, ZoneId } from "@/lib/office/types";
 
 const OfficeScene = dynamic(() => import("@/components/office/office-scene"), {
@@ -46,6 +47,7 @@ export default function Home() {
   const [railOpen, setRailOpen] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetTab, setSheetTab] = useState("profile");
+  const [compareOnOpen, setCompareOnOpen] = useState(false);
   const [hire, setHire] = useState<{ open: boolean; zone: WorkZoneId; station?: string }>({ open: false, zone: "dev" });
   const [demandOpen, setDemandOpen] = useState(false);
   const [recipient, setRecipient] = useState("director");
@@ -62,6 +64,15 @@ export default function Home() {
   // Preferences live in localStorage, which only exists after hydration.
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setQuality(loadPrefs().quality); }, []);
+  // One notice per session when newer default instructions exist for saved sheets.
+  const updateNotice = useRef(false);
+  useEffect(() => {
+    if (!office.hydrated || updateNotice.current) return;
+    const n = office.agents.filter(a => { const u = presetUpdate(a); return u && !u.dismissed; }).length;
+    if (!n) return;
+    updateNotice.current = true;
+    toast.info(`Há novas instruções padrão para ${n} ${n === 1 ? "colaborador" : "colaboradores"}. Nada foi alterado.`, { action: { label: "Revisar", onClick: () => setScreen("team") }, duration: 9000 });
+  }, [office.hydrated, office.agents]);
   useEffect(() => { if (office.migratedFrom === 1) toast.info("Configurações da versão anterior foram migradas. O registro antigo foi mantido como cópia de segurança."); }, [office.migratedFrom]);
 
   const demandCounts = useMemo(() => demands.reduce<Record<string, number>>((m, d) => ((m[d.recipient] = (m[d.recipient] ?? 0) + 1), m), {}), [demands]);
@@ -76,12 +87,12 @@ export default function Home() {
   const sceneAgents = useMemo(() => (preview ? agents.map(a => (a.id === preview.id ? { ...a, name: preview.name || a.name, role: preview.role || a.role, color: preview.color, look: preview.look } : a)) : agents), [agents, preview]);
   const mobile = vw < 760;
   const cardOpen = !!selected && screen === "office";
-  const sheetWidth = Math.min(600, vw);
+  const sheetWidth = vw >= 1280 ? 680 : Math.min(600, vw);
   const insets = sheetOpen && !mobile ? { right: sheetWidth, bottom: 0 } : cardOpen ? (mobile ? { right: 0, bottom: 236 } : { right: 360, bottom: 0 }) : { right: 0, bottom: 0 };
 
   const nav = (s: Screen) => { setScreen(s); setRailOpen(false); };
   const select = (id: string) => { setSelectedId(id); setScreen("office"); setRailOpen(false); };
-  const openSheet = (id: string, tab = "profile") => { setSelectedId(id); setSheetTab(tab); setSheetOpen(true); setRailOpen(false); };
+  const openSheet = (id: string, tab = "profile", compare = false) => { setSelectedId(id); setSheetTab(tab); setCompareOnOpen(compare); setSheetOpen(true); setRailOpen(false); };
   const openDemand = (id = "director") => { setRecipient(agents.some(a => a.id === id) ? id : "director"); setDemandOpen(true); setSheetOpen(false); setRailOpen(false); };
   const openHire = (zone: WorkZoneId = "dev", station?: string) => {
     if (agents.length >= CAPACITY) { toast.error(`O escritório comporta ${CAPACITY} funcionários. Dispense alguém para liberar uma estação.`); return; }
@@ -92,7 +103,7 @@ export default function Home() {
   const setQualityPref = (q: QualityPref) => { setQuality(q); savePrefs({ quality: q }); };
 
   const exportData = () => {
-    const blob = new Blob([JSON.stringify({ version: 2, agents, demands, exportedAt: new Date().toISOString() }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ ...serializeOffice({ agents, demands }), exportedAt: new Date().toISOString() }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob), a = document.createElement("a");
     a.href = url; a.download = "setor-ia-configuracoes.json"; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1500);
@@ -192,7 +203,7 @@ export default function Home() {
               />
             )}
           </div>
-          {screen === "team" && <TeamScreen agents={agents} onOpen={(a: Agent) => openSheet(a.id)} onHire={() => openHire()} />}
+          {screen === "team" && <TeamScreen agents={agents} onOpen={(a: Agent) => openSheet(a.id)} onReview={(a: Agent) => openSheet(a.id, "instructions", true)} onHire={() => openHire()} />}
           {screen === "demands" && <DemandQueue demands={demands} agents={agents} onNew={() => openDemand("director")} onRemove={id => { office.removeDemand(id); toast.success("Demanda removida da fila local."); }} onOpenAgent={id => openSheet(id)} />}
         </main>
 
@@ -210,7 +221,9 @@ export default function Home() {
         tab={sheetTab}
         onTab={setSheetTab}
         onDraft={setPreview}
-        onClose={() => setSheetOpen(false)}
+        compareOnOpen={compareOnOpen}
+        onDismissPreset={office.dismissPreset}
+        onClose={() => { setSheetOpen(false); setCompareOnOpen(false); }}
         onSave={draft => { const r = office.saveAgent(draft); if (r.ok) toast.success("Ficha salva neste navegador."); return r.ok ? null : r.error; }}
         onDemand={id => openDemand(id)}
         onRemove={id => { office.removeAgent(id); setSelectedId(null); toast.success("Funcionário dispensado. A estação ficou livre."); }}

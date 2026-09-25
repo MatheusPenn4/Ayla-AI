@@ -2,18 +2,57 @@
 // folder upload, delegation). Nothing in this file performs network calls.
 // The UI only builds payloads and shows them; `orchestrator` is intentionally
 // "not connected" so no demand can look executed in this phase.
-import type { Agent, Demand, FolderSummary } from "@/lib/office/types";
+import type { Agent, Demand, FolderSummary, Playbook } from "@/lib/office/types";
+import { USER_TARGET } from "@/lib/office/types";
+import { TOOL_INFO } from "@/lib/office/defaults";
 
-export const DEMAND_SCHEMA = "setor-ia.demand/v1" as const;
+export const DEMAND_SCHEMA = "setor-ia.demand/v2" as const;
+export const AGENT_SCHEMA = "setor-ia.agent/v2" as const;
 
-export type AgentProfilePayload = Pick<Agent, "id" | "name" | "role" | "description" | "instructions" | "limits" | "deliverable" | "budget" | "handoffTo"> & {
+/**
+ * Everything the engine needs to run one collaborator, taken verbatim from the
+ * saved sheet. The engine must build its prompts from these fields (or from
+ * `brief`, which is derived from them) and nothing else.
+ */
+export type AgentProfilePayload = {
+  schema: typeof AGENT_SCHEMA;
+  id: string;
+  name: string;
+  role: string;
+  /** Especialidade. */
+  specialty: string;
+  playbook: Playbook;
+  /** Instruções complementares (may be empty). */
+  instructions: string;
+  limits: string;
+  deliverable: string;
+  routing: {
+    /** Encaminha para (agent ids). */
+    handoffTo: string[];
+    /** Devolve pendências para (agent ids or "user"). */
+    returnTo: string[];
+    /** Maximum returns of the same demand by this collaborator; null = not defined. */
+    maxCycles: number | null;
+    /** Regras de encaminhamento, as written by the user. */
+    rules: string;
+  };
+  /** Planned permissions only. */
+  toolsPlanned: string[];
+  /** Tools actually connected. Always empty in this phase. */
+  toolsConnected: string[];
+  /** Planned token budget per task; not enforced yet. */
+  budget: { tokensPerTask: number; enforced: false };
   provider: string;
   modelName: string;
-  tools: string[];
+  preset: Agent["preset"];
+  /** Human-readable composition of the fields above, shown in the sheet ("Prévia"). */
+  brief: string;
 };
 
 export type DemandPayload = {
   schema: typeof DEMAND_SCHEMA;
+  status: "prepared";
+  engine: IntegrationStatus;
   demand: Pick<Demand, "id" | "title" | "description" | "acceptanceCriteria" | "project" | "priority" | "createdAt">;
   assignee: AgentProfilePayload;
   /** The whole team, so the engine can resolve hand-offs. */
@@ -24,11 +63,47 @@ export type DemandPayload = {
     | { kind: "none" };
 };
 
-export function agentProfile(a: Agent): AgentProfilePayload {
+const SECTIONS: [keyof Playbook, string][] = [
+  ["mission", "Missão"], ["inputs", "Insumos necessários"], ["method", "Método de trabalho"],
+  ["quality", "Critérios de qualidade"], ["clarify", "Quando pedir esclarecimento"], ["evidence", "Como apresentar evidências"],
+];
+
+const targetName = (id: string, team: Agent[]) => (id === USER_TARGET ? "Solicitante (usuário)" : team.find(a => a.id === id)?.name ?? id);
+
+/** Deterministic text built only from the saved sheet. Empty sections are omitted. */
+export function agentBrief(a: Agent, team: Agent[]): string {
+  const NL = "\n";
+  const section = (title: string, body: string) => `## ${title}${NL}${body}`;
+  const out: string[] = [`# ${a.name} — ${a.role}`];
+  if (a.description.trim()) out.push(`Especialidade: ${a.description.trim()}`);
+  for (const [k, label] of SECTIONS) if (a.playbook[k].trim()) out.push(section(label, a.playbook[k].trim()));
+  if (a.limits.trim()) out.push(section("Limites e restrições", a.limits.trim()));
+  if (a.deliverable.trim()) out.push(section("Formato de entrega", a.deliverable.trim()));
+  const routing = [
+    `Encaminha para: ${a.handoffTo.length ? a.handoffTo.map(id => targetName(id, team)).join(", ") : "ninguém definido"}.`,
+    `Devolve pendências para: ${a.returnTo.length ? a.returnTo.map(id => targetName(id, team)).join(", ") : "ninguém definido"}.`,
+    `Máximo de devoluções por demanda: ${a.maxCycles ?? "não definido"}.`,
+  ];
+  if (a.handoff.trim()) routing.push(a.handoff.trim());
+  out.push(section("Encaminhamento", routing.join(NL)));
+  if (a.instructions.trim()) out.push(section("Instruções complementares", a.instructions.trim()));
+  const planned = TOOL_INFO.filter(t => a.tools[t.key]).map(t => t.label);
+  out.push(section("Ferramentas", `Permissões planejadas: ${planned.length ? planned.join(", ") : "nenhuma"}. Nenhuma ferramenta está conectada nesta fase.`));
+  out.push(section("Orçamento", `${a.budget.toLocaleString("pt-BR")} tokens por tarefa (planejado, ainda não aplicado).`));
+  return out.join(NL + NL);
+}
+
+export function agentProfile(a: Agent, team: Agent[] = [a]): AgentProfilePayload {
   return {
-    id: a.id, name: a.name, role: a.role, description: a.description, instructions: a.instructions, limits: a.limits,
-    deliverable: a.deliverable, budget: a.budget, handoffTo: a.handoffTo, provider: String(a.model), modelName: a.modelName,
-    tools: Object.entries(a.tools).filter(([, on]) => on).map(([k]) => k),
+    schema: AGENT_SCHEMA,
+    id: a.id, name: a.name, role: a.role, specialty: a.description,
+    playbook: { ...a.playbook }, instructions: a.instructions, limits: a.limits, deliverable: a.deliverable,
+    routing: { handoffTo: [...a.handoffTo], returnTo: [...a.returnTo], maxCycles: a.maxCycles, rules: a.handoff },
+    toolsPlanned: Object.entries(a.tools).filter(([, on]) => on).map(([k]) => k),
+    toolsConnected: [],
+    budget: { tokensPerTask: a.budget, enforced: false },
+    provider: String(a.model), modelName: a.modelName, preset: { ...a.preset },
+    brief: agentBrief(a, team),
   };
 }
 
@@ -41,7 +116,11 @@ export function buildDemandPayload(demand: Demand, agents: Agent[]): DemandPaylo
         ? { kind: "folder", summary: demand.folder, note: "files-not-uploaded" }
         : { kind: "none" };
   const { id, title, description, acceptanceCriteria, project, priority, createdAt } = demand;
-  return { schema: DEMAND_SCHEMA, demand: { id, title, description, acceptanceCriteria, project, priority, createdAt }, assignee: agentProfile(assignee), team: agents.map(agentProfile), source };
+  return {
+    schema: DEMAND_SCHEMA, status: "prepared", engine: orchestrator.status,
+    demand: { id, title, description, acceptanceCriteria, project, priority, createdAt },
+    assignee: agentProfile(assignee, agents), team: agents.map(a => agentProfile(a, agents)), source,
+  };
 }
 
 export type IntegrationStatus = "not_connected" | "connected";

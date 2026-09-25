@@ -5,19 +5,13 @@ import { Plus } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AppearanceEditor } from "./appearance-editor";
 import { Field } from "./field";
-import { ZONE_LABEL, lookFromSeed, newId } from "@/lib/office/defaults";
+import { TOOL_INFO, ZONE_LABEL, lookFromSeed, newId } from "@/lib/office/defaults";
+import { HIRE_TEMPLATES } from "@/lib/office/presets";
 import { WORK_ZONES, zoneCapacity } from "@/lib/office/layout";
-import type { Agent, Appearance, WorkZoneId } from "@/lib/office/types";
+import type { Agent, WorkZoneId } from "@/lib/office/types";
 import type { NewWorkerInput } from "@/hooks/use-office";
 
-const TEMPLATES: { label: string; role: string; description: string; zone: WorkZoneId; color: string; look: Partial<Appearance> }[] = [
-  { label: "Front-end", role: "Interfaces e acessibilidade", description: "Implementa telas, estados e acessibilidade seguindo o design do projeto.", zone: "dev", color: "#e86f8f", look: { hair: "ponytail", outfit: "tee", accessory: "glasses" } },
-  { label: "Back-end", role: "APIs e dados", description: "Cuida de rotas, contratos, banco de dados e desempenho do servidor.", zone: "dev", color: "#5fb7d9", look: { hair: "short", outfit: "hoodie", accessory: "headphones" } },
-  { label: "DevOps", role: "Infraestrutura e CI", description: "Mantém pipelines, ambientes e observabilidade.", zone: "dev", color: "#7fcf6a", look: { hair: "mohawk", outfit: "vest", accessory: "beanie" } },
-  { label: "Testes E2E", role: "Automação de testes", description: "Escreve e mantém testes ponta a ponta com evidências.", zone: "qa", color: "#c07ce0", look: { hair: "curly", outfit: "labcoat", accessory: "none" } },
-];
-
-const blank = (zone: WorkZoneId) => ({ name: "", role: "", description: "", color: "#5fb7d9", zone, look: lookFromSeed(newId()) });
+const blank = (zone: WorkZoneId) => ({ name: "", role: "", description: "", color: "#5fb7d9", zone, look: lookFromSeed(newId()), templateId: null as string | null });
 
 function HireForm({ onOpenChange, agents, presetZone, presetStation, onCreate }: {
   open: boolean;
@@ -31,6 +25,7 @@ function HireForm({ onOpenChange, agents, presetZone, presetStation, onCreate }:
   const [error, setError] = useState("");
   const used = (z: WorkZoneId) => agents.filter(a => a.zone === z).length;
   const full = used(form.zone) >= zoneCapacity(form.zone);
+  const tpl = HIRE_TEMPLATES.find(t => t.id === form.templateId) ?? null;
 
   const submit = () => {
     if (!form.name.trim() || !form.role.trim()) { setError("Preencha nome e função."); return; }
@@ -46,18 +41,26 @@ function HireForm({ onOpenChange, agents, presetZone, presetStation, onCreate }:
           <DialogDescription>Crie um personagem, escolha a área e ele ocupará uma estação livre no escritório.</DialogDescription>
         </DialogHeader>
         <div className="dialog-scroll">
-          <div className="templates" aria-label="Modelos rápidos">
-            {TEMPLATES.map(t => (
-              <button key={t.label} type="button" className="template" onClick={() => setForm(f => ({ ...f, name: f.name || t.label, role: t.role, description: t.description, zone: t.zone, color: t.color, look: { ...f.look, ...t.look } }))}>
+          <div className="templates" role="radiogroup" aria-label="Modelos rápidos">
+            {HIRE_TEMPLATES.map(t => (
+              <button key={t.id} type="button" role="radio" aria-checked={form.templateId === t.id} className="template" onClick={() => setForm(f => ({ ...f, templateId: t.id, name: f.name || t.label, role: t.role, description: t.profile.description, zone: t.zone, color: t.color, look: { ...f.look, ...t.look } }))}>
                 <b>{t.label}</b><small>{ZONE_LABEL[t.zone]}</small>
               </button>
             ))}
+            <button type="button" role="radio" aria-checked={form.templateId === null} className="template" onClick={() => setForm(f => ({ ...f, templateId: null }))}>
+              <b>Sem modelo</b><small>ficha em branco</small>
+            </button>
           </div>
+          <p className="form-note">
+            {tpl
+              ? <>O modelo <b>{tpl.label}</b> inclui uma ficha inicial: missão, método, critérios, limites, entregável, permissões planejadas ({TOOL_INFO.filter(t => tpl.profile.tools[t.key]).map(t => t.label).join(", ")}), orçamento de {tpl.profile.budget.toLocaleString("pt-BR")} tokens e encaminhamentos. Tudo pode ser editado na ficha depois.</>
+              : <>Sem modelo, o colaborador começa com a ficha em branco (apenas leitura de arquivos planejada) e encaminha ao Diretor. Configure tudo na ficha depois da contratação.</>}
+          </p>
           <div className="form-row">
             <Field label="Nome"><input autoFocus value={form.name} maxLength={40} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Ex.: Ana, Analista de dados" /></Field>
             <Field label="Função"><input value={form.role} maxLength={50} onChange={e => setForm(f => ({ ...f, role: e.target.value }))} placeholder="Ex.: Banco de dados" /></Field>
           </div>
-          <Field label="O que faz"><textarea rows={2} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="Resumo das responsabilidades" /></Field>
+          <Field label="Especialidade"><textarea rows={2} value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="Resumo das responsabilidades" /></Field>
           <div className="field">
             <span>Área de trabalho</span>
             <div className="segmented" role="radiogroup" aria-label="Área de trabalho">
