@@ -47,3 +47,10 @@ next-env.d.ts
 
 # build caches
 *.tsbuildinfo
+
+# local secrets (Cloudflare/vinext dev)
+.dev.vars
+.dev.vars.*
+
+# local executor data (run records)
+.ayla/

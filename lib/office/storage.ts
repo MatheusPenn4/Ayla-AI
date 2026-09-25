@@ -4,6 +4,7 @@
 import { CAPACITY, STATION_BY_ID, freeStation } from "./layout";
 import { DEFAULT_AGENTS, DEFAULT_IDS, baseTools, lookFromSeed } from "./defaults";
 import { EMPTY_PLAYBOOK, HIRE_TEMPLATES, PRESET_VERSION } from "./presets";
+import { connectionFromLegacyProvider } from "@/lib/engine/connections";
 import { filterTargets } from "./profile";
 import type { Agent, Appearance, Demand, DemandPriority, FolderSummary, Playbook, PresetRef, RepoRef, ToolKey, WorkZoneId } from "./types";
 
@@ -87,7 +88,10 @@ function normalizeAgent(raw: Loose, fallback: Agent | undefined): Agent {
     color: HEX.test(str(raw.color)) ? str(raw.color) : fallback?.color ?? "#68a8e0",
     description: str(raw.description, fallback?.description),
     model: str(raw.model, fallback?.model ?? "A definir"),
-    modelName: str(raw.modelName, fallback?.modelName),
+    // Older sheets had only a planned provider: keep that choice by mapping it onto its official client.
+    connection: raw.connection === "claude_code" || raw.connection === "codex" || raw.connection === "none" ? raw.connection : connectionFromLegacyProvider(raw.model ?? fallback?.model),
+    modelName: str(raw.modelName, fallback?.modelName).slice(0, 80),
+    effort: /^[a-z]{0,12}$/.test(str(raw.effort)) ? str(raw.effort) : "",
     instructions: str(raw.instructions, fallback?.instructions),
     limits: str(raw.limits, fallback?.limits),
     deliverable: str(raw.deliverable, fallback?.deliverable),

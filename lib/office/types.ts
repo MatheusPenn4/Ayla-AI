@@ -1,5 +1,6 @@
-// Shared domain types for the office UI. Nothing here talks to a backend yet;
-// see lib/integration/contracts.ts for the shapes a future engine will receive.
+// Shared domain types for the office UI. The browser never talks to a model:
+// runs go through the local executor (see lib/engine and lib/executor).
+import type { SheetConnection } from "@/lib/engine/connections";
 
 export type ZoneId = "director" | "dev" | "qa" | "meeting" | "lounge";
 /** Zones that own workstations (the meeting room and lounge are shared spaces). */
@@ -62,10 +63,17 @@ export type Agent = {
   /** Primary colour: outfit, label accent and portrait ring. */
   color: string;
   description: string;
-  /** Planned provider. Historical field name kept for storage compatibility. */
+  /**
+   * Provider planned in older versions ("Claude", "OpenAI", …). Kept untouched
+   * for compatibility; the engine uses `connection`.
+   */
   model: Provider | string;
-  /** Planned model name (free text, e.g. "claude-sonnet-5"). Never used to call an API here. */
+  /** Official client this collaborator runs through (see lib/engine/connections.ts). */
+  connection: SheetConnection;
+  /** Model passed to the client ("" = the client's default). */
   modelName: string;
+  /** Reasoning effort passed to the client ("" = the client's default). */
+  effort: string;
   /** Structured operating procedure (see Playbook). */
   playbook: Playbook;
   /** Instruções complementares: free text kept from older versions or added by the user. */
@@ -80,7 +88,7 @@ export type Agent = {
   returnTo: string[];
   /** Maximum number of times this collaborator may send the same demand back (null = not defined). */
   maxCycles: number | null;
-  /** Planned token budget per task. Not enforced until the engine exists. */
+  /** Token budget per run: a Setor IA limit checked by estimate before and by reported usage after (not the subscription limit). */
   budget: number;
   tools: Record<ToolKey, boolean>;
   custom: boolean;

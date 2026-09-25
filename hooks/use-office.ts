@@ -76,7 +76,7 @@ export function useOffice() {
     const agent: Agent = {
       ...profile,
       id, name, role, color: input.color, description: input.description.trim() || profile.description || `Especialista em ${role}.`,
-      model: "A definir", modelName: "", custom: true, zone: input.zone, stationId, look: input.look,
+      model: "A definir", connection: "none", modelName: "", effort: "", custom: true, zone: input.zone, stationId, look: input.look,
     };
     setAgents(list => [...list, agent]);
     return { ok: true, id };

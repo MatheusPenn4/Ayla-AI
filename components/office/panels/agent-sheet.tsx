@@ -12,7 +12,9 @@ import { AppearanceEditor } from "./appearance-editor";
 import { AutoTextarea } from "./auto-textarea";
 import { Field } from "./field";
 import { PresetCompareDialog } from "./preset-compare-dialog";
-import { PROVIDERS, TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
+import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
+import { connectionLabel } from "@/lib/engine/connections";
+import { ConnectionPanel, type EngineControls } from "./connection-panel";
 import { WORK_ZONES, zoneCapacity } from "@/lib/office/layout";
 import { PRESET_VERSION } from "@/lib/office/presets";
 import { TARGET_LABEL_USER, applyPreset, dismissPreset, presetProfile, presetUpdate } from "@/lib/office/profile";
@@ -48,6 +50,8 @@ type Props = {
   compareOnOpen?: boolean;
   /** Live preview of unsaved edits in the 3D office (null when closed). */
   onDraft?: (draft: Agent | null) => void;
+  /** Connection status and actions from the local executor. */
+  engine?: EngineControls;
 };
 
 export function AgentSheet(props: Props) {
@@ -117,7 +121,7 @@ function TargetPicker({ label, hint, value, options, onChange, includeUser }: {
   );
 }
 
-function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTab, compareOnOpen, onDraft, dirtyRef, onSaved, requestClose, onAskRemove }: Props & {
+function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTab, compareOnOpen, onDraft, engine, dirtyRef, onSaved, requestClose, onAskRemove }: Props & {
   agent: Agent;
   dirtyRef: React.RefObject<boolean>;
   onSaved: () => void;
@@ -159,11 +163,11 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
         <div className="sheet-id">
           <span className="eyebrow">FICHA DO COLABORADOR · {ZONE_LABEL[draft.zone].toUpperCase()}</span>
           <SheetTitle className="sheet-title">{draft.name || "Sem nome"}</SheetTitle>
-          <SheetDescription className="sheet-sub">{draft.role || "Sem função"} · {String(draft.model)}{draft.modelName ? ` / ${draft.modelName}` : ""}</SheetDescription>
+          <SheetDescription className="sheet-sub">{draft.role || "Sem função"} · {connectionLabel(draft.connection)}{draft.modelName ? ` / ${draft.modelName}` : ""}</SheetDescription>
         </div>
         <dl className="sheet-stats">
           <div><dt>Permissões planejadas</dt><dd>{plannedTools}/{TOOL_INFO.length}</dd></div>
-          <div><dt>Orçamento planejado</dt><dd>{fmt(draft.budget)}</dd></div>
+          <div><dt>Orçamento (tokens)</dt><dd>{fmt(draft.budget)}</dd></div>
           <div><dt>Encaminha</dt><dd>{draft.handoffTo.length}</dd></div>
           <div><dt>Devolve</dt><dd>{draft.returnTo.length}</dd></div>
         </dl>
@@ -204,16 +208,12 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
               </div>
               {draft.zone !== agent.zone && <small>Ao salvar, o personagem muda para uma estação livre em {ZONE_LABEL[draft.zone]}.</small>}
             </div>
-            <div className="form-row">
-              <Field label="Provedor planejado">
-                <select value={String(draft.model)} onChange={e => update({ model: e.target.value })}>
-                  {PROVIDERS.map(p => <option key={p}>{p}</option>)}
-                  {!PROVIDERS.includes(draft.model as (typeof PROVIDERS)[number]) && <option>{String(draft.model)}</option>}
-                </select>
-              </Field>
-              <Field label="Modelo planejado"><input value={draft.modelName} maxLength={60} placeholder="Deixe em branco até escolher" onChange={e => update({ modelName: e.target.value })} /></Field>
-            </div>
-            <p className="form-note">Provedor e modelo são apenas planejamento. O motor usará chaves de API configuradas no servidor; assinaturas de chat (como ChatGPT Plus ou Claude Pro) não incluem acesso à API. Nenhuma chamada é feita pelo navegador.</p>
+            <ConnectionPanel
+              connection={draft.connection} modelName={draft.modelName} effort={draft.effort} legacyProvider={String(draft.model)}
+              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id)}
+              engine={engine}
+              onChange={part => update(part)}
+            />
           </Tabs.Content>
 
           <Tabs.Content value="look" className="tab-pane">
@@ -222,7 +222,7 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
 
           <Tabs.Content value="instructions" className="tab-pane">
             <div className="pane-head">
-              <p className="pane-intro">Procedimento de trabalho. O futuro motor montará as instruções deste colaborador somente a partir destes campos (veja a aba Prévia).</p>
+              <p className="pane-intro">Procedimento de trabalho. As instruções deste colaborador são montadas somente a partir destes campos (veja a aba Prévia).</p>
               {hasPreset && <button type="button" className="btn-ghost" onClick={() => setComparing(true)}><GitCompare size={14} /> Comparar com padrão</button>}
             </div>
             {PLAYBOOK_FIELDS.map((f, i) => (
@@ -253,24 +253,24 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
           </Tabs.Content>
 
           <Tabs.Content value="tools" className="tab-pane">
-            <div className="notice">Permissões <b>planejadas</b>. Ligar um interruptor registra o que este colaborador poderá usar quando o motor existir; nesta fase nenhuma ferramenta está conectada e nenhum acesso é concedido.</div>
+            <div className="notice">Permissões <b>planejadas</b> para as próximas etapas. Nesta fase só uma tem efeito real: <b>GitHub</b> na ficha do Diretor autoriza a leitura limitada de repositórios <b>públicos</b> durante o planejamento. Nas execuções, as ferramentas dos clientes oficiais (terminal, edição, navegador, busca) ficam sempre desligadas.</div>
             <div className="tool-list">
               {TOOL_INFO.map(t => (
                 <label className="tool-row" key={t.key}>
                   <span><b>{t.label}</b><small>{t.description}</small></span>
-                  <em className="tool-state">{draft.tools[t.key] ? "planejada" : "não planejada"} · não conectada</em>
+                  <em className="tool-state">{draft.tools[t.key] ? "planejada" : "não planejada"} · {t.key === "github" && draft.id === "director" ? "aplicada ao planejamento (só leitura pública)" : "não conectada"}</em>
                   <Switch checked={draft.tools[t.key]} onCheckedChange={v => update({ tools: { ...draft.tools, [t.key]: v } })} aria-label={`Planejar permissão: ${t.label}`} />
                 </label>
               ))}
             </div>
             <div className="field">
-              <span>Orçamento planejado de tokens por tarefa</span>
+              <span>Orçamento de tokens por execução (limite do Setor IA)</span>
               <div className="budget">
                 <input type="range" min={1000} max={200000} step={1000} value={Math.min(200000, draft.budget)} onChange={e => update({ budget: Number(e.target.value) })} aria-label="Orçamento de tokens" />
                 <input type="number" min={1000} max={1000000} step={1000} value={draft.budget} onChange={e => update({ budget: Number(e.target.value) })} aria-label="Orçamento de tokens (número)" />
               </div>
               <div className="chips">{BUDGET_PRESETS.map(b => <button type="button" key={b} className="chip" aria-pressed={draft.budget === b} onClick={() => update({ budget: b })}>{fmt(b / 1000)}k</button>)}</div>
-              <small>Referência inicial proporcional ao papel. O motor ainda não aplica este limite (entre 1.000 e 1.000.000).</small>
+              <small>Não é o limite da sua assinatura. Antes de chamar o cliente, o executor estima o texto enviado e não chama se passar deste valor; depois compara com o uso que o cliente informar. O cliente não pode ser interrompido no meio de uma resposta, então o uso real pode passar um pouco, e isso fica registrado (entre 1.000 e 1.000.000).</small>
             </div>
           </Tabs.Content>
 
@@ -298,13 +298,13 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
                 {draft.returnTo.length ? draft.returnTo.map(id => <span key={id} className="flow-node ghost">{name(id)}</span>) : <span className="flow-empty">sem destino para pendências</span>}
                 {draft.maxCycles !== null && <span className="flow-empty">· até {draft.maxCycles}×</span>}
               </div>
-              <small>A delegação automática será implementada junto com o motor de agentes.</small>
+              <small>Nesta fase o Diretor apenas propõe tarefas para estes colaboradores; nada é delegado nem executado automaticamente.</small>
             </div>
           </Tabs.Content>
 
           <Tabs.Content value="brief" className="tab-pane">
             <div className="pane-head">
-              <p className="pane-intro">É isto que o futuro motor receberá desta ficha, montado apenas a partir dos campos salvos. Não existe outro prompt escondido.</p>
+              <p className="pane-intro">É isto que o executor envia desta ficha, montado apenas a partir dos campos salvos. Na execução do Diretor, ela vai junto do protocolo da fase, que aparece na aba “Entrada” da execução. Não existe outro prompt escondido.</p>
               <button type="button" className="btn-ghost" onClick={() => { navigator.clipboard?.writeText(brief).then(() => toast.success("Prévia copiada."), () => toast.error("Não foi possível copiar.")); }}><Copy size={14} /> Copiar</button>
             </div>
             <pre className="brief">{brief}</pre>

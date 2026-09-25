@@ -4,6 +4,7 @@ import { useRef } from "react";
 import { Send, Settings2, X } from "lucide-react";
 import { Avatar } from "../avatar";
 import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
+import { connectionLabel } from "@/lib/engine/connections";
 import type { Agent } from "@/lib/office/types";
 
 /** Team list outside the canvas: Tab enters, ↑/↓/Home/End move, Enter/Space selects. */
@@ -68,7 +69,7 @@ export function CharacterCard({ agent, demandCount, onClose, onConfigure, onDema
       </div>
       <p className="card-desc">{agent.description}</p>
       <dl className="card-stats">
-        <div><dt>Provedor</dt><dd>{String(agent.model)}</dd></div>
+        <div><dt>Conexão</dt><dd>{connectionLabel(agent.connection)}</dd></div>
         <div><dt>Tokens</dt><dd>{agent.budget.toLocaleString("pt-BR")}</dd></div>
         <div><dt>Na fila</dt><dd>{demandCount}</dd></div>
       </dl>

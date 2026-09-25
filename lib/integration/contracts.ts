@@ -42,8 +42,12 @@ export type AgentProfilePayload = {
   toolsConnected: string[];
   /** Planned token budget per task; not enforced yet. */
   budget: { tokensPerTask: number; enforced: false };
+  /** Planned provider from older versions (kept for compatibility). */
   provider: string;
+  /** Official client the collaborator runs through ("none" = not chosen). */
+  connection: Agent["connection"];
   modelName: string;
+  effort: string;
   preset: Agent["preset"];
   /** Human-readable composition of the fields above, shown in the sheet ("Prévia"). */
   brief: string;
@@ -89,7 +93,7 @@ export function agentBrief(a: Agent, team: Agent[]): string {
   if (a.instructions.trim()) out.push(section("Instruções complementares", a.instructions.trim()));
   const planned = TOOL_INFO.filter(t => a.tools[t.key]).map(t => t.label);
   out.push(section("Ferramentas", `Permissões planejadas: ${planned.length ? planned.join(", ") : "nenhuma"}. Nenhuma ferramenta está conectada nesta fase.`));
-  out.push(section("Orçamento", `${a.budget.toLocaleString("pt-BR")} tokens por tarefa (planejado, ainda não aplicado).`));
+  out.push(section("Orçamento", `${a.budget.toLocaleString("pt-BR")} tokens por execução (limite do Setor IA, não o limite da assinatura; conferido quando o colaborador executa).`));
   return out.join(NL + NL);
 }
 
@@ -102,7 +106,7 @@ export function agentProfile(a: Agent, team: Agent[] = [a]): AgentProfilePayload
     toolsPlanned: Object.entries(a.tools).filter(([, on]) => on).map(([k]) => k),
     toolsConnected: [],
     budget: { tokensPerTask: a.budget, enforced: false },
-    provider: String(a.model), modelName: a.modelName, preset: { ...a.preset },
+    provider: String(a.model), connection: a.connection, modelName: a.modelName, effort: a.effort, preset: { ...a.preset },
     brief: agentBrief(a, team),
   };
 }

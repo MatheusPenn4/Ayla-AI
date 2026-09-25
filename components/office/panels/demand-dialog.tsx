@@ -64,7 +64,7 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
           <DialogDescription id="demand-desc">Descreva o trabalho e associe o projeto. Ela entra na fila como <b>preparada</b>.</DialogDescription>
         </DialogHeader>
         <div className="dialog-scroll">
-          <div className="notice">Fase de interface: a demanda fica salva neste navegador. Ainda não há motor de agentes, clone do repositório, envio de arquivos ou delegação automática.</div>
+          <div className="notice">A demanda fica salva neste navegador. Na fila, “Planejar com o Diretor” gera um plano real pelo executor local. Nesta fase não há clone do repositório, envio de arquivos da pasta nem delegação automática aos especialistas.</div>
           <div className="recipient">
             <Avatar look={who.look} color={who.color} size={44} />
             <Field label="Responsável" className="grow">
@@ -116,7 +116,7 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
                 <Field label="URL do repositório"><input type="url" inputMode="url" value={f.url} aria-invalid={!!errors.url} onChange={e => set({ url: e.target.value })} placeholder="https://github.com/usuario/repositorio" /></Field>
                 <Field label="Branch (opcional)"><input value={f.branch} maxLength={120} onChange={e => set({ branch: e.target.value })} placeholder={repo?.branch || "main"} /></Field>
               </div>
-              {repo && <p className="source-preview"><GitBranch size={14} /> <b>{repo.owner}/{repo.repo}</b>{(f.branch || repo.branch) && <> · {f.branch || repo.branch}</>}<span>link apenas associado — sem acesso real nesta fase</span></p>}
+              {repo && <p className="source-preview"><GitBranch size={14} /> <b>{repo.owner}/{repo.repo}</b>{(f.branch || repo.branch) && <> · {f.branch || repo.branch}</>}<span>repositório público: o Diretor lê só alguns arquivos (leitura limitada); privado não é suportado ainda</span></p>}
               {errors.url && <p className="form-error" role="alert">{errors.url}</p>}
             </div>
           )}

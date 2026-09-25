@@ -52,7 +52,31 @@ describe("instalação nova", () => {
   });
 
   it("não fixa modelo específico nem conecta ferramentas", () => {
-    for (const a of agents) { expect(a.model).toBe("A definir"); expect(a.modelName).toBe(""); }
+    for (const a of agents) { expect(a.model).toBe("A definir"); expect(a.modelName).toBe(""); expect(a.connection).toBe("none"); expect(a.effort).toBe(""); }
+  });
+});
+
+describe("conexão de execução nas fichas salvas", () => {
+  it("fichas v1 ganham a conexão do provedor escolhido, sem perder as personalizações", () => {
+    const { agents } = normalizeData(legacyV1());
+    const ana = byId(agents, "director");
+    expect(ana).toMatchObject({ connection: "claude_code", model: "Claude", name: "Diretora Ana", instructions: "Sempre responda em tópicos.", limits: "Nunca publicar sexta-feira.", budget: 20000 });
+    expect(byId(agents, "qa").connection).toBe("none");
+    expect(byId(agents, "abc123")).toMatchObject({ connection: "none", instructions: "SQL primeiro." });
+  });
+  it("a conexão escolhida, o modelo e o esforço sobrevivem a salvar e recarregar", () => {
+    const { agents, demands } = normalizeData(null);
+    const edited = agents.map(a => (a.id === "director" ? { ...a, connection: "codex" as const, modelName: "gpt-5.5", effort: "high" } : a));
+    const again = normalizeData(JSON.parse(JSON.stringify(serializeOffice({ agents: edited, demands }))));
+    expect(byId(again.agents, "director")).toMatchObject({ connection: "codex", modelName: "gpt-5.5", effort: "high" });
+  });
+  it("valores inválidos gravados à mão não viram conexão nem esforço", () => {
+    const raw = JSON.parse(JSON.stringify(serializeOffice({ agents: normalizeData(null).agents, demands: [] })));
+    raw.agents[0].connection = "chatgpt-web";
+    raw.agents[0].effort = "--bare";
+    const a = normalizeData(raw).agents[0];
+    expect(a.connection).toBe("none");
+    expect(a.effort).toBe("");
   });
 });
 

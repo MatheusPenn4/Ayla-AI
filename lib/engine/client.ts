@@ -1,0 +1,54 @@
+// Browser-side calls to the engine API (Next routes that forward to the local
+// executor). No secrets here: the executor token stays on the server.
+import { agentBrief } from "@/lib/integration/contracts";
+import type { Agent, Demand } from "@/lib/office/types";
+import type { ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, StartRunRequest, TeamMemberInput } from "./types";
+
+const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
+
+export class EngineApiError extends Error {
+  constructor(public code: string, message: string, public status: number, public details?: string[]) { super(message); }
+}
+
+async function call<T>(url: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try { res = await fetch(url, { ...init, headers: { ...HEADERS, ...(init?.headers ?? {}) }, cache: "no-store" }); }
+  catch { throw new EngineApiError("network", "Não foi possível falar com o servidor local.", 0); }
+  const body = (await res.json().catch(() => ({}))) as { error?: { code: string; message: string; details?: string[] } } & T;
+  if (!res.ok && body.error) throw new EngineApiError(body.error.code, body.error.message, res.status, body.error.details);
+  if (!res.ok) throw new EngineApiError("http_" + res.status, `O servidor respondeu ${res.status}.`, res.status);
+  return body;
+}
+
+export function toTeamInput(a: Agent, team: Agent[]): TeamMemberInput {
+  return {
+    id: a.id, name: a.name, role: a.role, specialty: a.description, connection: a.connection, modelName: a.modelName.trim(), effort: a.effort,
+    budget: a.budget, handoffTo: a.handoffTo, returnTo: a.returnTo, maxCycles: a.maxCycles, tools: { ...a.tools },
+    brief: agentBrief(a, team), playbook: { ...a.playbook }, limits: a.limits, deliverable: a.deliverable, rules: a.handoff,
+  };
+}
+
+export function buildStartRequest(demand: Demand, agents: Agent[], directorId: string, idempotencyKey: string, followUp?: { previousRunId: string; answers: { question: string; answer: string }[] }): StartRunRequest {
+  return {
+    idempotencyKey,
+    directorId,
+    team: agents.map(a => toTeamInput(a, agents)),
+    demand: {
+      id: demand.id, title: demand.title, description: demand.description, acceptanceCriteria: demand.acceptanceCriteria, project: demand.project,
+      priority: demand.priority, source: demand.source,
+      ...(demand.source === "github" && demand.repo ? { repo: demand.repo } : {}),
+      ...(demand.source === "folder" && demand.folder ? { folder: demand.folder } : {}),
+    },
+    ...(followUp ? { previousRunId: followUp.previousRunId, answers: followUp.answers } : {}),
+  };
+}
+
+export const engineApi = {
+  status: (refresh = false) => call<EngineStatus>(`/api/engine/status${refresh ? "?refresh=1" : ""}`),
+  checkConnections: () => call<Omit<EngineStatus, "executionEnabled" | "disabledReason">>("/api/engine/connections", { method: "POST", body: "{}" }),
+  probe: (id: ConnectionId) => call<{ ok: boolean; status: ConnectionStatus; message: string; code?: string; detail?: string }>("/api/engine/connections", { method: "POST", body: JSON.stringify({ id, probe: true }) }),
+  start: (req: StartRunRequest) => call<{ run: RunRecord; created: boolean }>("/api/runs", { method: "POST", body: JSON.stringify(req) }),
+  list: (demandIds: string[]) => call<{ runs: RunRecord[] }>(`/api/runs?demands=${demandIds.map(encodeURIComponent).join(",")}`),
+  get: (id: string) => call<{ run: RunDetail }>(`/api/runs/${id}`),
+  cancel: (id: string) => call<{ run: RunRecord; canceled: boolean }>(`/api/runs/${id}/cancel`, { method: "POST" }),
+};

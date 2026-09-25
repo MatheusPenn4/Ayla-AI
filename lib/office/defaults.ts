@@ -15,7 +15,6 @@ export const TOOL_INFO: { key: ToolKey; label: string; description: string }[] =
   { key: "browser", label: "Navegador", description: "Abrir e verificar páginas e interfaces em um navegador de teste" },
 ];
 
-export const PROVIDERS = ["A definir", "OpenAI", "Claude", "Outro provedor"] as const;
 
 export const SKIN_TONES = ["#f6d3b8", "#eab58f", "#d49a6a", "#b87a4b", "#8d5a36", "#5f3b24"];
 export const HAIR_COLORS = ["#1f1a1c", "#3b2a22", "#6a4630", "#a3663a", "#d9a45b", "#c9ccd3", "#7d5bd6", "#e2687c"];
@@ -70,7 +69,7 @@ const seeds: Seed[] = [
 /** Fresh installs get the complete, current profiles (see lib/office/presets.ts). */
 export const DEFAULT_AGENTS: Agent[] = seeds.map(s => {
   const p = structuredClone(DEFAULT_PROFILES[s.id as keyof typeof DEFAULT_PROFILES]);
-  return { ...s, ...p, model: "A definir", modelName: "", custom: false, preset: { id: s.id, version: PRESET_VERSION } };
+  return { ...s, ...p, model: "A definir", connection: "none", modelName: "", effort: "", custom: false, preset: { id: s.id, version: PRESET_VERSION } };
 });
 export const DEFAULT_IDS = new Set(DEFAULT_AGENTS.map(a => a.id));
 

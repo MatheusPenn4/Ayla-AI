@@ -9,14 +9,17 @@ import { AgentSheet } from "@/components/office/panels/agent-sheet";
 import { DemandDialog } from "@/components/office/panels/demand-dialog";
 import { HireDialog } from "@/components/office/panels/hire-dialog";
 import { CharacterCard, Roster } from "@/components/office/panels/roster";
+import { RunDialog } from "@/components/office/panels/run-dialog";
 import { DemandQueue, TeamScreen } from "@/components/office/panels/screens";
 import { TIER_LABEL, type Tier } from "@/components/office/scene/quality";
 import { useOffice } from "@/hooks/use-office";
+import { useRuns } from "@/hooks/use-runs";
 import { ZONE_LABEL } from "@/lib/office/defaults";
 import { presetUpdate } from "@/lib/office/profile";
 import { CAPACITY, STATION_BY_ID, ZONES } from "@/lib/office/layout";
 import { loadPrefs, savePrefs, serializeOffice, type QualityPref } from "@/lib/office/storage";
-import type { Agent, WorkZoneId, ZoneId } from "@/lib/office/types";
+import type { RunDetail } from "@/lib/engine/types";
+import type { Agent, Demand, WorkZoneId, ZoneId } from "@/lib/office/types";
 
 const OfficeScene = dynamic(() => import("@/components/office/office-scene"), {
   ssr: false,
@@ -40,6 +43,8 @@ function useViewport() {
 export default function Home() {
   const office = useOffice();
   const { agents, demands } = office;
+  const runs = useRuns(demands, office.hydrated);
+  const [runId, setRunId] = useState<string | null>(null);
   const vw = useViewport();
   const [screen, setScreen] = useState<Screen>("office");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -75,6 +80,18 @@ export default function Home() {
   }, [office.hydrated, office.agents]);
   useEffect(() => { if (office.migratedFrom === 1) toast.info("Configurações da versão anterior foram migradas. O registro antigo foi mantido como cópia de segurança."); }, [office.migratedFrom]);
 
+  const plan = async (d: Demand) => {
+    const r = await runs.start(d, agents);
+    if (r.ok) toast.success("Planejamento enviado ao executor local.", { action: { label: "Ver", onClick: () => setRunId(r.run.id) } });
+    else toast.error(r.error);
+  };
+  const replan = async (run: RunDetail, answers?: { question: string; answer: string }[]) => {
+    const d = demands.find(x => x.id === run.demandId);
+    if (!d) { toast.error("A demanda desta execução não está mais na fila local."); return; }
+    const r = await runs.start(d, agents, answers ? { previousRunId: run.id, answers } : undefined);
+    if (r.ok) setRunId(r.run.id);
+    else toast.error(r.error);
+  };
   const demandCounts = useMemo(() => demands.reduce<Record<string, number>>((m, d) => ((m[d.recipient] = (m[d.recipient] ?? 0) + 1), m), {}), [demands]);
   const dashboard = useMemo(() => ({
     demandCount: demands.length,
@@ -131,7 +148,7 @@ export default function Home() {
         <Roster agents={agents} selectedId={selectedIdLive} demandCounts={demandCounts} onSelect={select} onHover={setHoveredId} />
         <button className="add-rail" onClick={() => openHire()} disabled={agents.length >= CAPACITY}><Plus size={15} /> Contratar funcionário</button>
         <div className="rail-spacer" />
-        <div className="phase-card"><b><span className="led amber" /> FASE 01 · INTERFACE</b><p>Configure a equipe e prepare demandas. O motor de agentes ainda não está conectado.</p></div>
+        <div className="phase-card"><b><span className={`led ${runs.status?.executor.reachable ? "green" : "amber"}`} /> FASE 01 · DIRETOR</b><p>O Diretor planeja de verdade pelo executor local (Claude Code ou Codex). Os especialistas ainda não executam.</p></div>
       </aside>
 
       <div className="stage-shell">
@@ -203,13 +220,13 @@ export default function Home() {
               />
             )}
           </div>
-          {screen === "team" && <TeamScreen agents={agents} onOpen={(a: Agent) => openSheet(a.id)} onReview={(a: Agent) => openSheet(a.id, "instructions", true)} onHire={() => openHire()} />}
-          {screen === "demands" && <DemandQueue demands={demands} agents={agents} onNew={() => openDemand("director")} onRemove={id => { office.removeDemand(id); toast.success("Demanda removida da fila local."); }} onOpenAgent={id => openSheet(id)} />}
+          {screen === "team" && <TeamScreen agents={agents} connections={runs.status?.connections} onOpen={(a: Agent) => openSheet(a.id)} onReview={(a: Agent) => openSheet(a.id, "instructions", true)} onHire={() => openHire()} />}
+          {screen === "demands" && <DemandQueue demands={demands} agents={agents} runs={runs} onNew={() => openDemand("director")} onRemove={id => { office.removeDemand(id); toast.success("Demanda removida da fila local."); }} onOpenAgent={id => openSheet(id)} onPlan={d => void plan(d)} onOpenRun={setRunId} />}
         </main>
 
         <footer className="stage-footer">
           <span>SETOR IA · v0.2 interface</span>
-          <span className="footer-mid"><span className="led green" /> Dados salvos neste navegador · IA ainda não conectada</span>
+          <span className="footer-mid"><span className={`led ${runs.status?.executor.reachable ? "green" : "amber"}`} /> Fichas e demandas neste navegador · {runs.status?.executor.reachable ? "executor local ativo" : "executor local indisponível"}</span>
           <button onClick={exportData}><Download size={13} /> Exportar dados locais</button>
         </footer>
       </div>
@@ -226,6 +243,7 @@ export default function Home() {
         onClose={() => { setSheetOpen(false); setCompareOnOpen(false); }}
         onSave={draft => { const r = office.saveAgent(draft); if (r.ok) toast.success("Ficha salva neste navegador."); return r.ok ? null : r.error; }}
         onDemand={id => openDemand(id)}
+        engine={{ status: runs.status, statusError: runs.statusError, verify: runs.verify, probe: runs.probe }}
         onRemove={id => { office.removeAgent(id); setSelectedId(null); toast.success("Funcionário dispensado. A estação ficou livre."); }}
       />
       <HireDialog
@@ -251,8 +269,9 @@ export default function Home() {
         agents={agents}
         recipient={recipient}
         onRecipient={setRecipient}
-        onSubmit={d => { office.addDemand(d); setDemandOpen(false); toast.success("Demanda adicionada à fila como preparada. A execução será conectada depois."); }}
+        onSubmit={d => { office.addDemand(d); setDemandOpen(false); toast.success("Demanda adicionada à fila como preparada. Use “Planejar com o Diretor” na fila para executá-la."); }}
       />
+      <RunDialog runId={runId} agents={agents} onClose={() => setRunId(null)} onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)} />
       <Toaster position="top-center" offset={78} theme="dark" toastOptions={{ className: "game-toast" }} />
     </div>
   );

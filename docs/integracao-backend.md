@@ -1,6 +1,10 @@
 # Pontos de integração para o backend
 
-Nesta fase o Setor IA é só frontend. Nada executa demandas, acessa o GitHub, envia arquivos ou delega tarefas. Este documento lista onde a próxima etapa se encaixa.
+> **Atualização (fase 1 do motor):** o Diretor já planeja de verdade pelo executor local, usando Claude Code (assinatura Claude) ou Codex CLI (conta ChatGPT), com leitura limitada de repositórios públicos do GitHub. Veja [executor-local.md](executor-local.md). O restante deste documento descreve o contrato completo da equipe (`DemandPayload`), que continua sem execução: os especialistas não executam e nada é delegado automaticamente.
+
+Nesta fase o Setor IA não executa demandas dos especialistas, não envia arquivos da pasta local e não delega tarefas. Este documento lista onde a próxima etapa se encaixa.
+
+- Cada ficha tem agora `connection` (`"claude_code"`, `"codex"` ou `"none"`), `modelName` e `effort`. Fichas antigas mantêm o campo `model` (provedor planejado) intacto; `"Claude"` vira `claude_code` e `"OpenAI"` vira `codex`.
 
 ## Dados locais
 
