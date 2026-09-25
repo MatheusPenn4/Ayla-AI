@@ -28,6 +28,8 @@ export function codexArgs(c: AgentCall, schemaFile: string): string[] {
     "--ephemeral",
     "--ignore-user-config",
     "-c", 'web_search="disabled"',
+    // Never ask and never escalate: anything outside the read-only sandbox simply fails.
+    "-c", 'approval_policy="never"',
   ];
   for (const f of DISABLED_FEATURES) args.push("--disable", f);
   if (c.model) { if (!MODEL_RE.test(c.model)) throw new AgentError("model_unavailable", "Nome de modelo inválido na ficha.", false); args.push("--model", c.model); }
@@ -41,6 +43,8 @@ export function codexPrompt(c: Pick<AgentCall, "system" | "user">) {
 }
 
 type Ev = { type?: string; message?: string; error?: { message?: string }; item?: { type?: string; text?: string; message?: string }; usage?: Record<string, number> };
+
+export const CODEX_USAGE_SOURCE = "Codex CLI · evento turn.completed.usage (--json)";
 
 export function parseCodexEvents(stdout: string, label: string) {
   let text: string | null = null;
@@ -57,12 +61,16 @@ export function parseCodexEvents(stdout: string, label: string) {
     else if (e.type === "error" && e.message) errors.push(e.message);
     else if (e.type === "turn.completed" && e.usage) {
       const u = e.usage;
-      usage ??= { label, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, model: null };
-      usage.inputTokens += Math.max(0, (u.input_tokens ?? 0) - (u.cached_input_tokens ?? 0));
-      usage.cacheReadTokens += u.cached_input_tokens ?? 0;
-      usage.cacheWriteTokens += u.cache_write_input_tokens ?? 0;
-      usage.outputTokens += u.output_tokens ?? 0;
-      usage.reasoningTokens += u.reasoning_output_tokens ?? 0;
+      const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+      const add = (acc: number | null, v: number | null) => (v === null ? acc : (acc ?? 0) + v);
+      const input = num(u.input_tokens), cached = num(u.cached_input_tokens);
+      usage ??= { label, inputTokens: null, outputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, reasoningTokens: null, model: null, source: CODEX_USAGE_SOURCE };
+      // Codex's input_tokens includes the cached part: split it so nothing is counted twice.
+      usage.inputTokens = add(usage.inputTokens, input === null ? null : Math.max(0, input - (cached ?? 0)));
+      usage.cacheReadTokens = add(usage.cacheReadTokens, cached);
+      usage.cacheWriteTokens = add(usage.cacheWriteTokens, num(u.cache_write_input_tokens));
+      usage.outputTokens = add(usage.outputTokens, num(u.output_tokens));
+      usage.reasoningTokens = add(usage.reasoningTokens, num(u.reasoning_output_tokens));
     }
   }
   return { text, failure, errors, usage };

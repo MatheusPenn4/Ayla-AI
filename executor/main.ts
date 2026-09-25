@@ -12,7 +12,7 @@ import { createExecutorServer } from "@/lib/executor/http";
 import { runProcess } from "@/lib/executor/proc";
 import { ExecutorService } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
-import { RunStore } from "@/lib/executor/store";
+import { RunStore, SCHEMA_VERSION } from "@/lib/executor/store";
 
 const VERSION = "0.1.0";
 const root = process.cwd();
@@ -51,6 +51,12 @@ const dataDir = path.join(root, ".ayla");
 const storePath = path.join(dataDir, "runs.sqlite");
 const driver = sqliteDriver(storePath);
 const store = new RunStore(driver);
+// Schema upgrade keeps every existing row; a full copy is taken first anyway.
+if (await store.needsMigration()) {
+  const backup = path.join(dataDir, `runs.backup-before-v${SCHEMA_VERSION}-${new Date().toISOString().replace(/[:.]/g, "-")}.sqlite`);
+  await store.backupTo(backup);
+  console.log(`[executor] registro atualizado para a versão ${SCHEMA_VERSION}; cópia de segurança da versão anterior: ${backup}`);
+}
 const service = new ExecutorService(
   {
     version: VERSION, dataDir, storePath,

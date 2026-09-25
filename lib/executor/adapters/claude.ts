@@ -32,6 +32,9 @@ export function claudeArgs(c: AgentCall, systemFile: string): string[] {
     "--safe-mode",
     "--disable-slash-commands",
     "--no-session-persistence",
+    // Second layer: even if a tool appeared, anything that would need permission is denied.
+    "--permission-mode", "dontAsk",
+    "--disallowedTools", "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch,WebSearch",
   ];
   if (c.model) { if (!MODEL_RE.test(c.model)) throw new AgentError("model_unavailable", "Nome de modelo inválido na ficha.", false); args.push("--model", c.model); }
   if (c.effort) { if (!EFFORT_RE.test(c.effort)) throw new AgentError("client_error", "Nível de esforço inválido na ficha.", false); args.push("--effort", c.effort); }
@@ -48,15 +51,28 @@ export function parseClaudeOutput(stdout: string): ClaudeResult | null {
   try { const j = JSON.parse(stdout) as ClaudeResult; return j.type === "result" ? j : null; } catch { return null; }
 }
 
+/** Sum of one field over the models; null when no model reported that field. */
+const sumField = <T,>(items: T[], get: (x: T) => number | undefined) => {
+  const vals = items.map(get).filter((n): n is number => typeof n === "number" && Number.isFinite(n));
+  return vals.length ? vals.reduce((x, y) => x + y, 0) : null;
+};
+
+export const CLAUDE_USAGE_SOURCE = "Claude Code · campo modelUsage da saída JSON (--output-format json)";
+
 export function claudeUsage(r: ClaudeResult, label: string): CallUsage | null {
   const entries = Object.entries(r.modelUsage ?? {});
   if (!entries.length) return null;
-  const u: CallUsage = { label, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, model: entries.map(([m]) => m).join(", ") };
-  for (const [, m] of entries) {
-    u.inputTokens += m.inputTokens ?? 0; u.outputTokens += m.outputTokens ?? 0;
-    u.cacheReadTokens += m.cacheReadInputTokens ?? 0; u.cacheWriteTokens += m.cacheCreationInputTokens ?? 0; u.reasoningTokens += m.thinkingTokens ?? 0;
-  }
-  return u;
+  const models = entries.map(([, m]) => m);
+  return {
+    label,
+    inputTokens: sumField(models, m => m.inputTokens),
+    outputTokens: sumField(models, m => m.outputTokens),
+    cacheReadTokens: sumField(models, m => m.cacheReadInputTokens),
+    cacheWriteTokens: sumField(models, m => m.cacheCreationInputTokens),
+    reasoningTokens: sumField(models, m => m.thinkingTokens),
+    model: entries.map(([m]) => m).join(", "),
+    source: CLAUDE_USAGE_SOURCE,
+  };
 }
 
 export function claudeAdapter(inv: Invocation, runner: Runner, env: EnvVars = process.env): AgentAdapter {

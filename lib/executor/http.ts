@@ -77,6 +77,9 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "GET" && r) return await service.get(r[1]);
     r = /^\/v1\/runs\/([0-9a-f-]{36})\/cancel$/.exec(p);
     if (m === "POST" && r) return await service.cancel(r[1]);
+    r = /^\/v1\/runs\/([0-9a-f-]{36})\/approve$/.exec(p);
+    if (m === "POST" && r) return await service.approve(r[1], await readJson(req));
+    if (m === "POST" && p === "/v1/handoffs") return await service.prepare(await readJson(req));
     return { status: 404, body: { error: { code: "not_found", message: "Rota inexistente." } } };
   } catch (e) {
     const status = (e as { status?: number }).status ?? 500;

@@ -4,11 +4,12 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { CONNECTION_IDS } from "@/lib/engine/connections";
-import type { ConnectionId, ConnectionStatus, EngineStatus, RunRecord } from "@/lib/engine/types";
+import { HANDOFF_TARGETS, type ConnectionId, type ConnectionStatus, type DirectorSnapshot, type EngineStatus, type RunRecord } from "@/lib/engine/types";
 import { claudeAdapter } from "./adapters/claude";
 import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
 import { detect, LOGIN_STEPS, resolveClient, type ClientDeps } from "./clients";
+import { HandoffRefused, HandoffZ, prepareHandoff } from "./handoff";
 import { processRun } from "./planner";
 import type { Runner } from "./proc";
 import { EXECUTABLE_AGENTS, buildNewRun, parseStartRequest } from "./runs-service";
@@ -38,6 +39,15 @@ export type ServiceDeps = {
 };
 
 export type Reply = { status: number; body: unknown };
+
+/**
+ * Read-only guarantee per adapter, required before the Architect may use it.
+ * Verified with a real write attempt (scripts/check-readonly.ts); see docs/executor-local.md.
+ */
+export const READ_ONLY: Record<ConnectionId, { safe: boolean; how: string }> = {
+  claude_code: { safe: true, how: "Claude Code sem nenhuma ferramenta (--tools \"\"), permissões negadas (--permission-mode dontAsk, --disallowedTools), sem MCP, sem personalizações e em pasta vazia." },
+  codex: { safe: true, how: "Codex CLI em sandbox somente leitura (--sandbox read-only, approval_policy never), shell e ferramentas extras desligadas, sem busca na web e em pasta vazia." },
+};
 const err = (status: number, code: string, message: string, details?: string[]): Reply => ({ status, body: { error: { code, message, ...(details ? { details } : {}) } } });
 
 export class ExecutorService {
@@ -140,6 +150,8 @@ export class ExecutorService {
       github: { mode: "public-only", tokenConfigured: !!this.cfg.github.token },
       limits: { maxRunsPerHour: this.cfg.limits.maxRunsPerHour, maxConcurrentRuns: this.cfg.limits.maxConcurrentRuns, callTimeoutMs: this.cfg.limits.callTimeoutMs },
       executableAgents: EXECUTABLE_AGENTS,
+      handoffTargets: [...HANDOFF_TARGETS],
+      readOnly: READ_ONLY,
     };
   }
 
@@ -168,6 +180,44 @@ export class ExecutorService {
     return { status: created ? 202 : 200, body: { run, created } };
   }
 
+  // ---- hand-off to the Architect -----------------------------------------
+
+  /** Step 1: validate against the executor's own records and freeze what will be sent. Nothing runs. */
+  async prepare(body: unknown): Promise<Reply> {
+    const parsed = HandoffZ.safeParse(body);
+    if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
+    const req = parsed.data;
+    if (req.agent.connection !== "none" && !READ_ONLY[req.agent.connection].safe) {
+      return err(409, "adapter_not_read_only", "Esta conexão não pode ser restrita a somente leitura e está bloqueada para o Arquiteto. Escolha a outra conexão na ficha dele.");
+    }
+    if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
+      return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
+    }
+    try {
+      const { run, created } = await prepareHandoff(req, { store: this.store, github: this.cfg.github });
+      return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
+    } catch (e) {
+      if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
+      throw e;
+    }
+  }
+
+  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). */
+  async approve(id: string, body: unknown): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
+    const hash = (body as { snapshotHash?: unknown } | null)?.snapshotHash;
+    const run = await this.store.get(id);
+    if (!run || run.kind !== "architect_task") return err(404, "not_found", "Encaminhamento não encontrado.");
+    if (run.status !== "awaiting_approval") return { status: 200, body: { run, approved: false } };
+    if (typeof hash !== "string" || hash !== run.snapshotHash) return err(409, "content_changed", "O conteúdo confirmado não corresponde ao encaminhamento preparado. Abra a revisão de novo.");
+    const parent = run.parentRunId ? await this.store.get(run.parentRunId) : null;
+    if (!parent || parent.status !== "plan_ready") return err(409, "plan_not_ready", "O plano do Diretor desta tarefa não está mais disponível.");
+    if (!(await this.store.approve(id))) return { status: 200, body: { run: await this.store.get(id), approved: false } };
+    await this.store.event(id, "approved", "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
+    this.enqueue(id);
+    return { status: 202, body: { run: await this.store.get(id), approved: true } };
+  }
+
   private enqueue(id: string) {
     if (this.running.has(id) || this.waiting.includes(id)) return;
     this.waiting.push(id);
@@ -193,7 +243,7 @@ export class ExecutorService {
       connection: () => this.connection(conn, true),
       adapter: this.adapterFor(conn),
       limits: { callTimeoutMs: this.cfg.limits.callTimeoutMs, leaseMs: this.cfg.limits.leaseMs },
-      github: { ...this.cfg.github, permitted: snap.director.tools.github !== false },
+      github: { ...this.cfg.github, permitted: (snap as DirectorSnapshot).director?.tools.github !== false },
       workRoot: this.cfg.workRoot,
       signal: ac.signal,
     });
@@ -217,12 +267,15 @@ export class ExecutorService {
 
   async cancel(id: string): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
-    const changed = await this.store.update(id, { status: "canceled", finishedAt: new Date().toISOString(), leaseUntil: null }, ["queued", "planning"]);
+    const before = await this.store.get(id);
+    const changed = await this.store.update(id, { status: "canceled", finishedAt: new Date().toISOString(), leaseUntil: null }, ["awaiting_approval", "queued", "planning"]);
     if (changed) {
       this.waiting = this.waiting.filter(w => w !== id);
       const ac = this.running.get(id);
       ac?.abort();
-      await this.store.event(id, "canceled", ac ? "Execução cancelada pelo usuário: o processo do cliente oficial foi encerrado. O uso já consumido até esse ponto pode contar na assinatura." : "Execução cancelada pelo usuário antes de começar.");
+      await this.store.event(id, "canceled", before?.status === "awaiting_approval"
+        ? "Envio descartado por você antes da confirmação. Nada foi executado."
+        : ac ? "Execução cancelada pelo usuário: o processo do cliente oficial foi encerrado. O uso já consumido até esse ponto pode contar na assinatura." : "Execução cancelada pelo usuário antes de começar.");
     }
     const run: RunRecord | null = await this.store.get(id);
     if (!run) return err(404, "not_found", "Execução não encontrada.");

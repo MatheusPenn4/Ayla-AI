@@ -21,6 +21,8 @@ export async function GET(request: Request) {
     github: fromExecutor?.github ?? { mode: "public-only", tokenConfigured: false },
     limits: fromExecutor?.limits ?? { maxRunsPerHour: 0, maxConcurrentRuns: 0, callTimeoutMs: 0 },
     executableAgents: fromExecutor?.executableAgents ?? ["director"],
+    handoffTargets: fromExecutor?.handoffTargets ?? [],
+    readOnly: fromExecutor?.readOnly ?? {},
   };
   return json(body);
 }

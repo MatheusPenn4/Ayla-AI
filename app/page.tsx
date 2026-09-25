@@ -9,6 +9,7 @@ import { AgentSheet } from "@/components/office/panels/agent-sheet";
 import { DemandDialog } from "@/components/office/panels/demand-dialog";
 import { HireDialog } from "@/components/office/panels/hire-dialog";
 import { CharacterCard, Roster } from "@/components/office/panels/roster";
+import { HandoffDialog } from "@/components/office/panels/handoff-dialog";
 import { RunDialog } from "@/components/office/panels/run-dialog";
 import { DemandQueue, TeamScreen } from "@/components/office/panels/screens";
 import { TIER_LABEL, type Tier } from "@/components/office/scene/quality";
@@ -45,6 +46,8 @@ export default function Home() {
   const { agents, demands } = office;
   const runs = useRuns(demands, office.hydrated);
   const [runId, setRunId] = useState<string | null>(null);
+  // Prepared hand-off being reviewed (status awaiting_approval).
+  const [handoffId, setHandoffId] = useState<string | null>(null);
   const vw = useViewport();
   const [screen, setScreen] = useState<Screen>("office");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -84,6 +87,12 @@ export default function Home() {
     const r = await runs.start(d, agents);
     if (r.ok) toast.success("Planejamento enviado ao executor local.", { action: { label: "Ver", onClick: () => setRunId(r.run.id) } });
     else toast.error(r.error);
+  };
+  const openReview = (id: string) => { setRunId(null); setHandoffId(id); };
+  const handoff = async (planRunId: string, taskId: string, followUp?: { previousRunId: string; answers: { question: string; answer: string }[] }) => {
+    const r = await runs.prepareHandoff(planRunId, taskId, agents, followUp);
+    if (r.ok) openReview(r.run.id);
+    else toast.error(r.error, { duration: 9000 });
   };
   const replan = async (run: RunDetail, answers?: { question: string; answer: string }[]) => {
     const d = demands.find(x => x.id === run.demandId);
@@ -148,7 +157,7 @@ export default function Home() {
         <Roster agents={agents} selectedId={selectedIdLive} demandCounts={demandCounts} onSelect={select} onHover={setHoveredId} />
         <button className="add-rail" onClick={() => openHire()} disabled={agents.length >= CAPACITY}><Plus size={15} /> Contratar funcionário</button>
         <div className="rail-spacer" />
-        <div className="phase-card"><b><span className={`led ${runs.status?.executor.reachable ? "green" : "amber"}`} /> FASE 01 · DIRETOR</b><p>O Diretor planeja de verdade pelo executor local (Claude Code ou Codex). Os especialistas ainda não executam.</p></div>
+        <div className="phase-card"><b><span className={`led ${runs.status?.executor.reachable ? "green" : "amber"}`} /> FASE 01 · DIRETOR</b><p>O Diretor planeja de verdade pelo executor local (Claude Code ou Codex). O Arquiteto analisa só as tarefas que você aprovar; os demais ainda não executam.</p></div>
       </aside>
 
       <div className="stage-shell">
@@ -271,7 +280,16 @@ export default function Home() {
         onRecipient={setRecipient}
         onSubmit={d => { office.addDemand(d); setDemandOpen(false); toast.success("Demanda adicionada à fila como preparada. Use “Planejar com o Diretor” na fila para executá-la."); }}
       />
-      <RunDialog runId={runId} agents={agents} onClose={() => setRunId(null)} onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)} />
+      <RunDialog
+        runId={runId} agents={agents} runs={runs} onClose={() => setRunId(null)} onOpenRun={setRunId}
+        onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)}
+        onHandoff={(planRunId, taskId) => void handoff(planRunId, taskId)} onReview={openReview}
+        onAnswerArchitect={(run, answers) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { previousRunId: run.id, answers }); }}
+      />
+      <HandoffDialog
+        runId={handoffId} agents={agents} runs={runs} onClose={() => setHandoffId(null)}
+        onApproved={id => { setHandoffId(null); setRunId(id); toast.success("Envio confirmado. O Arquiteto entrou na fila do executor local."); }}
+      />
       <Toaster position="top-center" offset={78} theme="dark" toastOptions={{ className: "game-toast" }} />
     </div>
   );

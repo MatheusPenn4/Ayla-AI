@@ -34,10 +34,11 @@ const SCHEMA = [
     error_json TEXT,
     budget_json TEXT NOT NULL,
     raw_output TEXT,
-    previous_run_id TEXT
+    previous_run_id TEXT,
+    kind TEXT NOT NULL DEFAULT 'director_plan',
+    parent_run_id TEXT,
+    task_id TEXT
   )`,
-  // At most one active run per demand, enforced by the database (no duplicate runs on double click / refresh).
-  `CREATE UNIQUE INDEX IF NOT EXISTS director_runs_one_active ON director_runs (demand_id) WHERE status IN ('queued', 'planning')`,
   `CREATE INDEX IF NOT EXISTS director_runs_by_demand ON director_runs (demand_id, created_at)`,
   `CREATE TABLE IF NOT EXISTS director_run_events (
     run_id TEXT NOT NULL,
@@ -55,21 +56,46 @@ const SCHEMA = [
     ok INTEGER NOT NULL,
     code TEXT
   )`,
+  `CREATE TABLE IF NOT EXISTS ayla_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 ];
+
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links. */
+export const SCHEMA_VERSION = 2;
+
+/** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
+const ADDED_COLUMNS: [string, string][] = [
+  ["kind", "TEXT NOT NULL DEFAULT 'director_plan'"],
+  ["parent_run_id", "TEXT"],
+  ["task_id", "TEXT"],
+];
+
+const INDEXES = [
+  // At most one active Director plan per demand (no duplicate runs on double click / refresh).
+  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_plan ON director_runs (demand_id) WHERE kind = 'director_plan' AND status IN ('queued', 'planning')`,
+  // At most one pending/active hand-off per task of a plan.
+  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind = 'architect_task' AND status IN ('awaiting_approval', 'queued', 'planning')`,
+  `CREATE INDEX IF NOT EXISTS runs_by_parent ON director_runs (parent_run_id, task_id, created_at)`,
+];
+
+const TASK_OPEN = `('awaiting_approval', 'queued', 'planning')`;
 
 type Row = Record<string, unknown>;
 const parse = <T>(v: unknown): T | null => (typeof v === "string" && v ? (JSON.parse(v) as T) : null);
 const nowIso = () => new Date().toISOString();
 
 function toRecord(r: Row): RunRecord {
+  const kind = (r.kind === "architect_task" ? "architect_task" : "director_plan") as RunRecord["kind"];
   return {
-    id: String(r.id), demandId: String(r.demand_id), agentId: String(r.agent_id), status: r.status as RunStatus,
+    id: String(r.id), kind, demandId: String(r.demand_id), agentId: String(r.agent_id), status: r.status as RunStatus,
+    parentRunId: (r.parent_run_id as string) ?? null, taskId: (r.task_id as string) ?? null,
     connection: r.connection as RunRecord["connection"], model: String(r.model), effort: String(r.effort ?? ""),
     createdAt: String(r.created_at), updatedAt: String(r.updated_at),
     startedAt: (r.started_at as string) ?? null, finishedAt: (r.finished_at as string) ?? null, leaseUntil: (r.lease_until as string) ?? null,
     attempt: Number(r.attempt ?? 0), snapshotHash: String(r.snapshot_hash),
     budget: parse<RunBudget>(r.budget_json)!, context: parse<SourceContext>(r.context_json),
-    result: parse<RunRecord["result"]>(r.result_json), error: parse<RunError>(r.error_json),
+    result: kind === "director_plan" ? parse<RunRecord["result"]>(r.result_json) : null,
+    analysis: kind === "architect_task" ? parse<RunRecord["analysis"]>(r.result_json) : null,
+    error: parse<RunError>(r.error_json),
     previousRunId: (r.previous_run_id as string) ?? null,
   };
 }
@@ -77,11 +103,18 @@ function toRecord(r: Row): RunRecord {
 export type NewRun = {
   id: string; demandId: string; agentId: string; idempotencyKey: string; connection: RunRecord["connection"]; model: string;
   effort: string; snapshotHash: string; snapshot: RunDetail["snapshot"]; budget: RunBudget; previousRunId: string | null;
+  /** Defaults: director_plan, created as queued. */
+  kind?: RunRecord["kind"];
+  parentRunId?: string | null;
+  taskId?: string | null;
+  initialStatus?: "queued" | "awaiting_approval";
+  prompt?: RunDetail["prompt"];
+  context?: SourceContext | null;
 };
 
 export type RunPatch = Partial<{
   status: RunStatus; startedAt: string | null; finishedAt: string | null; leaseUntil: string | null; attempt: number;
-  prompt: RunDetail["prompt"]; context: SourceContext | null; result: RunRecord["result"]; error: RunError | null; budget: RunBudget; rawOutput: string | null;
+  prompt: RunDetail["prompt"]; context: SourceContext | null; result: RunRecord["result"] | RunRecord["analysis"]; error: RunError | null; budget: RunBudget; rawOutput: string | null;
 }>;
 
 const COLUMN: Record<keyof RunPatch, [string, (v: unknown) => unknown]> = {
@@ -98,8 +131,37 @@ export class RunStore {
   get kind() { return this.db.kind; }
 
   ensureSchema() {
-    this.ready ??= (async () => { for (const s of SCHEMA) await this.db.exec(s); })();
+    this.ready ??= (async () => {
+      for (const s of SCHEMA) await this.db.exec(s);
+      await this.migrate();
+    })();
     return this.ready;
+  }
+
+  /** True when the file was written by an older schema (used to take a backup before migrating). */
+  async needsMigration() {
+    const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'director_runs'`);
+    if (!tables.length) return false;
+    const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
+    return ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c));
+  }
+
+  /** Consistent copy of the whole database (SQLite VACUUM INTO). */
+  async backupTo(file: string) {
+    await this.db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  }
+
+  /**
+   * v1 → v2: adds the new columns (existing rows keep their data; kind becomes
+   * 'director_plan'), replaces the v1 "one active run per demand" index by the
+   * kind-aware ones. Idempotent.
+   */
+  private async migrate() {
+    const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
+    for (const [c, def] of ADDED_COLUMNS) if (!cols.some(x => x.name === c)) await this.db.exec(`ALTER TABLE director_runs ADD COLUMN ${c} ${def}`);
+    await this.db.exec(`DROP INDEX IF EXISTS director_runs_one_active`);
+    for (const s of INDEXES) await this.db.exec(s);
+    await this.db.run(`INSERT INTO ayla_meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [String(SCHEMA_VERSION)]);
   }
 
   /**
@@ -108,31 +170,55 @@ export class RunStore {
    */
   async create(input: NewRun): Promise<{ run: RunRecord; created: boolean }> {
     await this.ensureSchema();
+    const kind = input.kind ?? "director_plan";
     const byKey = await this.db.all(`SELECT * FROM director_runs WHERE idempotency_key = ?`, [input.idempotencyKey]);
     if (byKey[0]) return { run: toRecord(byKey[0]), created: false };
-    const active = await this.activeForDemand(input.demandId);
+    const openRun = () => (kind === "architect_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
+    const active = await openRun();
     if (active) return { run: active, created: false };
     const t = nowIso();
     try {
       await this.db.run(
-        `INSERT INTO director_runs (id, demand_id, agent_id, idempotency_key, status, connection, model, effort, created_at, updated_at, attempt, snapshot_hash, snapshot_json, budget_json, previous_run_id)
-         VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
-        [input.id, input.demandId, input.agentId, input.idempotencyKey, input.connection, input.model, input.effort, t, t, input.snapshotHash, JSON.stringify(input.snapshot), JSON.stringify(input.budget), input.previousRunId],
+        `INSERT INTO director_runs (id, demand_id, agent_id, idempotency_key, status, connection, model, effort, created_at, updated_at, attempt, snapshot_hash, snapshot_json, budget_json, previous_run_id, kind, parent_run_id, task_id, prompt_json, context_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [input.id, input.demandId, input.agentId, input.idempotencyKey, input.initialStatus ?? "queued", input.connection, input.model, input.effort, t, t, input.snapshotHash, JSON.stringify(input.snapshot), JSON.stringify(input.budget), input.previousRunId,
+          kind, input.parentRunId ?? null, input.taskId ?? null, input.prompt ? JSON.stringify(input.prompt) : null, input.context ? JSON.stringify(input.context) : null],
       );
     } catch (err) {
       // Lost a race against a concurrent click: return the winner.
       const winner = (await this.db.all(`SELECT * FROM director_runs WHERE idempotency_key = ?`, [input.idempotencyKey]))[0] ?? null;
-      const act = winner ? toRecord(winner) : await this.activeForDemand(input.demandId);
+      const act = winner ? toRecord(winner) : await openRun();
       if (act) return { run: act, created: false };
       throw err;
     }
-    await this.event(input.id, "created", "Execução criada e colocada na fila do executor local.");
+    await this.event(input.id, "created", kind === "architect_task"
+      ? "Encaminhamento preparado para o Arquiteto. Nada será executado antes da sua confirmação."
+      : "Execução criada e colocada na fila do executor local.");
     return { run: (await this.get(input.id))!, created: true };
+  }
+
+  /** Hand-off of a task that is waiting for approval, queued or running. */
+  async openForTask(parentRunId: string, taskId: string) {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM director_runs WHERE kind = 'architect_task' AND parent_run_id = ? AND task_id = ? AND status IN ${TASK_OPEN} LIMIT 1`, [parentRunId, taskId]);
+    return rows[0] ? toRecord(rows[0]) : null;
+  }
+
+  /** Every hand-off of a task, newest first. */
+  async runsForTask(parentRunId: string, taskId: string) {
+    await this.ensureSchema();
+    return (await this.db.all(`SELECT * FROM director_runs WHERE kind = 'architect_task' AND parent_run_id = ? AND task_id = ? ORDER BY created_at DESC`, [parentRunId, taskId])).map(toRecord);
+  }
+
+  /** The user's confirmation: awaiting_approval → queued, atomically (a repeated click changes nothing). */
+  async approve(id: string) {
+    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind = 'architect_task' AND status = 'awaiting_approval'`, [nowIso(), id]);
+    return changes === 1;
   }
 
   async activeForDemand(demandId: string) {
     await this.ensureSchema();
-    const rows = await this.db.all(`SELECT * FROM director_runs WHERE demand_id = ? AND status IN ('queued', 'planning') LIMIT 1`, [demandId]);
+    const rows = await this.db.all(`SELECT * FROM director_runs WHERE kind = 'director_plan' AND demand_id = ? AND status IN ('queued', 'planning') LIMIT 1`, [demandId]);
     return rows[0] ? toRecord(rows[0]) : null;
   }
 

@@ -14,7 +14,8 @@
     "db:generate": "drizzle-kit generate",
     "test": "vitest run",
     "executor": "tsx executor/main.ts",
-    "check:clients": "tsx scripts/check-clients.ts"
+    "check:clients": "tsx scripts/check-clients.ts",
+    "check:readonly": "tsx scripts/check-readonly.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

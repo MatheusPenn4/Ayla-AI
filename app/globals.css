@@ -584,3 +584,38 @@ svg { flex: none; }
   .events li { grid-template-columns: 1fr; gap: 2px; }
   .engine-head .muted { min-width: 0; flex-basis: 100%; }
 }
+
+/* ---- Hand-off Director → Architect ---- */
+.run-badge.st-awaiting_approval { border-color: #7a5a2a; color: #ffe0a8; background: #2a2012; }
+.run-badge.st-analysis_ready { border-color: #2a6a4c; color: #b5f0cf; background: #0f261d; }
+.task-state { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line-2); background: #181c44; color: #c5ccff; font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap; }
+.task-state.ts-not_executable { color: var(--dim); border-style: dashed; background: transparent; }
+.task-state.ts-awaiting_approval, .task-state.ts-awaiting_clarification { border-color: #7a5a2a; color: #ffe0a8; background: #2a2012; }
+.task-state.ts-queued, .task-state.ts-working { border-color: #2f5f8a; color: #bfe3ff; background: #10223a; }
+.task-state.ts-analysis_ready { border-color: #2a6a4c; color: #b5f0cf; background: #0f261d; }
+.task-state.ts-failed { border-color: #6d2839; color: #ffc2cc; background: #2a1520; }
+.task-state.ts-canceled { color: var(--dim); }
+.task-card.is-handoff { border-color: #3d4a8c; }
+.task-card header .task-state { margin-left: auto; }
+.task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.run-origin { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; padding: 8px 10px; border-radius: 10px; background: #10132c; border: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
+.run-origin button { margin-left: auto; }
+.tool-grants { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.tool-grants li { padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: #10132c; display: grid; gap: 2px; font-size: 12.5px; }
+.tool-grants li.ok { border-color: #2a6a4c; }
+.tool-grants li.no b { color: #ffd6dd; }
+.tool-grants small { color: var(--muted); }
+.basis { font-family: var(--font-mono); font-size: 10.5px; padding: 2px 6px; border-radius: 5px; white-space: nowrap; }
+.basis.b-read { color: #b5f0cf; background: #0f261d; border: 1px solid #2a6a4c; }
+.basis.b-inferred { color: #ffe0a8; background: #2a2012; border: 1px solid #7a5a2a; }
+.kv { margin: 0; display: grid; grid-template-columns: 150px 1fr; gap: 6px 12px; font-size: 12.5px; }
+.kv dt { color: var(--dim); }
+.kv dd { margin: 0; color: #d7def8; }
+.kv dd ul { margin: 0; padding-left: 16px; }
+.clamp { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+details.raw summary { cursor: pointer; color: var(--sky); font-size: 12.5px; margin: 6px 0; }
+.form-note.warn { border-color: #7a5a2a; background: #2a2012; color: #ffe0a8 !important; }
+.arch-chip { border-color: #3d4a8c; }
+.handoff-dialog .run-sec { padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: #0f1230; display: grid; gap: 6px; }
+.handoff-dialog .run-sec ol, .handoff-dialog .run-sec ul { margin: 0; padding-left: 18px; }
+@media (max-width: 760px) { .kv { grid-template-columns: 1fr; } .run-origin button { margin-left: 0; } }

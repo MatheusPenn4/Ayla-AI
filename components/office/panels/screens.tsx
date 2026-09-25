@@ -11,6 +11,7 @@ import { CONNECTION_STATE_LABEL, connectionLabel } from "@/lib/engine/connection
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type EngineStatus } from "@/lib/engine/types";
 import type { useRuns } from "@/hooks/use-runs";
 import { StatusBadge } from "./run-dialog";
+import { isHandoffTarget, taskState } from "@/lib/engine/handoff-state";
 
 type RunsApi = ReturnType<typeof useRuns>;
 import { presetUpdate } from "@/lib/office/profile";
@@ -181,6 +182,24 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
                 {latest?.status === "awaiting_clarification" && <span className="run-hint">O Diretor fez perguntas: abra a execução para responder.</span>}
                 {latest?.status === "failed" && latest.error && <span className="run-hint bad">{latest.error.message}</span>}
                 {latest?.status === "plan_ready" && latest.result && <span className="run-hint ok">{latest.result.tasks.length} tarefa(s) proposta(s) · {connectionLabel(latest.connection)}{latest.budget.reportedTotalTokens !== null ? ` · ${latest.budget.reportedTotalTokens.toLocaleString("pt-BR")} tokens informados pelo cliente` : " · uso não informado pelo cliente"}</span>}
+                {(() => {
+                  // Hand-offs belong to the most recent finished plan (a later canceled/failed run does not hide them).
+                  const lp = history.find(r => r.status === "plan_ready" && r.result);
+                  if (!lp?.result) return null;
+                  const archTasks = lp.result.tasks.filter(t => isHandoffTarget(t.assignee));
+                  if (!archTasks.length) return <span className="run-hint">Sem tarefa para o Arquiteto no último plano.</span>;
+                  const states = archTasks.map(t => taskState(t, runs.taskRunsFor(lp.id, t.id)).key);
+                  const count = (k: string) => states.filter(x => x === k).length;
+                  const parts = [
+                    count("analysis_ready") && `${count("analysis_ready")} análise(s) concluída(s)`,
+                    count("awaiting_approval") && `${count("awaiting_approval")} aguardando sua aprovação`,
+                    (count("working") + count("queued")) && `${count("working") + count("queued")} em execução`,
+                    count("awaiting_clarification") && `${count("awaiting_clarification")} aguardando esclarecimento`,
+                    (count("failed") + count("canceled")) && `${count("failed") + count("canceled")} com falha/cancelada`,
+                    count("proposed") && `${count("proposed")} proposta(s) para enviar`,
+                  ].filter(Boolean);
+                  return <button className="chip arch-chip" onClick={() => onOpenRun(lp.id)} title="Abrir as tarefas do último plano pronto">Arquiteto: {parts.join(" · ")}</button>;
+                })()}
                 {history.length > 1 && (
                   <span className="run-history">Histórico: {history.slice(0, 5).map(r => <button key={r.id} className="chip" onClick={() => onOpenRun(r.id)} title={new Date(r.createdAt).toLocaleString("pt-BR")}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>
                 )}

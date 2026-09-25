@@ -32,8 +32,8 @@ export function ConnectionPanel({ connection, modelName, effort, legacyProvider,
   modelName: string;
   effort: string;
   legacyProvider: string;
-  /** Whether this collaborator actually runs in this phase. */
-  executable: boolean;
+  /** How this collaborator runs in this phase: by itself (Director), only through an approved hand-off (Architect), or not yet. */
+  executable: "starts" | "handoff" | "none";
   engine: EngineControls | undefined;
   onChange: (part: { connection?: SheetConnection; modelName?: string; effort?: string }) => void;
 }) {
@@ -103,9 +103,9 @@ export function ConnectionPanel({ connection, modelName, effort, legacyProvider,
       )}
 
       <p className="form-note">
-        {executable
-          ? <>Este colaborador executa nesta fase (somente planejamento). {DISCONNECTED_BEHAVIOUR} Os limites de uso da assinatura são controlados pelo Claude/ChatGPT e não são informados ao Setor IA; o orçamento de tokens da ficha é outro limite, do próprio Setor IA.</>
-          : <>Nesta fase este colaborador <b>não executa</b>: aparece apenas como responsável proposto nos planos do Diretor. A conexão escolhida fica registrada para as próximas etapas.</>}
+        {executable === "starts" && <>Este colaborador executa nesta fase (somente planejamento). {DISCONNECTED_BEHAVIOUR} Os limites de uso da assinatura são controlados pelo Claude/ChatGPT e não são informados ao Setor IA; o orçamento de tokens da ficha é outro limite, do próprio Setor IA.</>}
+        {executable === "handoff" && <>Este colaborador executa <b>somente</b> quando você revisa e confirma uma tarefa do Diretor atribuída a ele, e apenas para análise: sem editar arquivos, sem comandos, sem rede. {DISCONNECTED_BEHAVIOUR} O orçamento de tokens da ficha é referência/alerta, não o limite da assinatura.</>}
+        {executable === "none" && <>Nesta fase este colaborador <b>não executa</b>: aparece apenas como responsável proposto nos planos do Diretor. A conexão escolhida fica registrada para as próximas etapas.</>}
       </p>
     </div>
   );

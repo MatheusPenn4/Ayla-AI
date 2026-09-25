@@ -1,6 +1,6 @@
 # Executor local do Setor IA
 
-O Diretor planeja de verdade usando **as suas assinaturas**, por meio dos clientes oficiais instalados e autenticados neste computador:
+O Diretor planeja de verdade, e o Arquiteto analisa tarefas que você aprovar, usando **as suas assinaturas** por meio dos clientes oficiais instalados e autenticados neste computador:
 
 | Conexão na ficha | Cliente oficial | Conta usada | Como o login é feito |
 |---|---|---|---|
@@ -16,7 +16,8 @@ Navegador (interface)                 Servidor web (pnpm dev)                Exe
 ────────────────────                  ────────────────────────               ──────────────────────────────          ─────────────────
 /api/engine/status  ── mesma origem ─▶ proxy + portões (localhost,       ──▶  127.0.0.1:4317, token Bearer,   ──▶  claude -p … (stdin)
 /api/runs, /cancel     cabeçalho       origem, x-ayla-client)                 recusa Origin/Sec-Fetch,               codex exec - … (stdin)
-/api/engine/connections                 token só no servidor (.dev.vars)       Host fixo, JSON ≤ 1 MB                 (sessão do próprio cliente)
+/api/handoffs, /approve                 token só no servidor (.dev.vars)       Host fixo, JSON ≤ 1 MB                 (sessão do próprio cliente)
+/api/engine/connections
                                                                                SQLite: .ayla/runs.sqlite
 ```
 
@@ -24,8 +25,8 @@ Camadas separadas no código:
 
 - **Interface**: `components/office/panels/*`, `hooks/use-runs.ts`, `lib/engine/client.ts`. Não fala com modelos e não vê o token.
 - **Rotas web (proxy)**: `app/api/**`, `lib/server/*`. Só funcionam no servidor local de desenvolvimento acessado por `localhost`.
-- **Executor**: `executor/main.ts` (entrada), `lib/executor/service.ts` (fila, concorrência, cancelamento), `lib/executor/http.ts` (proteção HTTP), `lib/executor/planner.ts` (pipeline do Diretor), `lib/executor/store.ts` + `sqlite.ts` (registro durável), `lib/executor/github.ts` (leitura pública limitada), `lib/executor/proc.ts` (execução controlada de processos), `lib/executor/clients.ts` (detecção).
-- **Adaptadores**: `lib/executor/adapters/claude.ts` e `lib/executor/adapters/codex.ts`, com a mesma interface (`AgentAdapter`). Os cinco colaboradores podem escolher qualquer um dos dois; nesta fase só o Diretor executa.
+- **Executor**: `executor/main.ts` (entrada), `lib/executor/service.ts` (fila, concorrência, cancelamento), `lib/executor/http.ts` (proteção HTTP), `lib/executor/planner.ts` (núcleo único de execução, usado pelo Diretor e pelo Arquiteto), `lib/executor/handoff.ts` (preparação e validação do encaminhamento ao Arquiteto), `lib/executor/store.ts` + `sqlite.ts` (registro durável), `lib/executor/github.ts` (leitura pública limitada), `lib/executor/proc.ts` (execução controlada de processos), `lib/executor/clients.ts` (detecção).
+- **Adaptadores**: `lib/executor/adapters/claude.ts` e `lib/executor/adapters/codex.ts`, com a mesma interface (`AgentAdapter`). Os cinco colaboradores podem escolher qualquer um dos dois. Nesta fase o Diretor executa por conta própria e o Arquiteto só executa tarefas aprovadas por você; Desenvolvedor, QA e Revisor não executam.
 
 ## Como iniciar localmente
 
@@ -48,6 +49,47 @@ Pré-requisitos: Node.js 22.13 ou mais novo, `pnpm install` já feito, e pelo me
 
 Variáveis opcionais (em `.dev.vars` ou no ambiente do executor): `AYLA_EXECUTOR_PORT` (padrão 4317), `AYLA_MAX_CONCURRENT_RUNS` (padrão 1), `AYLA_MAX_RUNS_PER_HOUR` (padrão 20), `AYLA_CALL_TIMEOUT_MS` (padrão 300000), `AYLA_CLAUDE_PATH` / `AYLA_CODEX_PATH` (caminho absoluto do executável, se não estiver no PATH), `GITHUB_TOKEN` (apenas aumenta o limite de consultas da API pública do GitHub).
 
+## Encaminhamento Diretor → Arquiteto
+
+Fluxo: **plano do Diretor → você escolhe uma tarefa do Arquiteto → revisa o que será enviado → confirma → o Arquiteto analisa → a análise fica registrada**. Nada acontece automaticamente depois disso.
+
+1. **Abrir o plano.** Na tela Demandas, o cartão mostra o resumo (“Arquiteto: 1 análise concluída · 1 proposta(s) para enviar”). Na aba **Tarefas** do plano, cada tarefa mostra seu estado real, lido do executor:
+
+   | Estado | Significado |
+   |---|---|
+   | Proposta pelo Diretor | tarefa do Arquiteto ainda não enviada |
+   | Proposta pelo Diretor · responsável ainda não executa | tarefa do Desenvolvedor, QA ou Revisor (sem botão) |
+   | Aguardando sua aprovação | envio preparado e congelado; nada rodou |
+   | Na fila do executor / Arquiteto trabalhando | aprovado; o cliente oficial está em execução |
+   | Análise concluída | resultado validado e registrado |
+   | Arquiteto aguardando esclarecimento | ele fez perguntas e não inventou uma decisão |
+   | Falha / Cancelada | com motivo e caminho de recuperação; pode ser enviada de novo |
+
+   Se o plano não tem tarefa do Arquiteto, a aba diz isso e não oferece botão. Uma tarefa que depende de outra só pode ser enviada depois que a outra tiver análise concluída do Arquiteto; se depender de alguém que não executa nesta fase, fica bloqueada com o motivo.
+2. **Enviar ao Arquiteto** (preparar). O navegador manda só o ID do plano, o ID da tarefa e a ficha salva do Arquiteto. O executor confere, **no próprio registro**, que o plano existe e está pronto, que a tarefa pertence a ele, que o responsável é o Arquiteto, que a ficha é a do Arquiteto e que a tarefa não tem análise concluída nem envio em aberto. Em seguida lê as fontes, monta a entrada exata e grava tudo congelado com o estado “aguardando aprovação”. Nenhum cliente é chamado.
+3. **Revisar.** A janela de revisão mostra a demanda e os critérios, o que o Diretor pediu (escopo, insumos, entregável, critérios), os arquivos que o Diretor realmente consultou (com commit), o contexto que vai para o Arquiteto (e o que não vai), a conexão, o modelo e o esforço da ficha do Arquiteto com o estado real do cliente, as ferramentas autorizadas e bloqueadas, a estimativa de texto contra o orçamento e o texto exato. Se a ficha do Arquiteto mudar depois de preparado, a confirmação é bloqueada até preparar de novo.
+4. **Confirmar.** A confirmação envia o hash do conteúdo revisado; o executor só aceita se for idêntico ao preparado e muda o estado de forma atômica (cliques repetidos criam uma única execução e um único processo). “Descartar envio” registra o descarte; nada é executado.
+5. **Análise.** O Arquiteto recebe o protocolo da execução + a ficha salva dele (playbook, limites, regras de encaminhamento) e a mensagem congelada. A resposta estruturada é validada: entendimento técnico e suposições; arquivos/símbolos/contratos examinados, separando **lido** (conteúdo enviado) de **inferido**; solução recomendada e justificativa; alternativas só quando há decisão real; dependências e compatibilidade; riscos e regressões; orientação ao Desenvolvedor; checagens recomendadas ao QA (não executadas); dúvidas. Uma referência marcada como “lida” que não foi enviada é rejeitada (uma correção é pedida). Se houver dúvidas bloqueantes, o estado vira “aguardando esclarecimento”; responder prepara um novo envio, que passa de novo por revisão e confirmação.
+
+A análise fica vinculada à demanda, ao plano do Diretor (`parent_run_id`) e à tarefa (`task_id`), com o instantâneo da ficha usada, eventos, uso informado e resposta bruta. Ela fica disponível para a futura etapa do Desenvolvedor e para o Diretor consolidar; nenhum colaborador é acionado a partir dela.
+
+### Contexto do Arquiteto e suas reduções
+
+- **Mesmo repositório e mesmo commit** que o Diretor leu (o executor não relê a branch; o commit fica registrado).
+- **O que vai com conteúdo**: arquivos e pastas citados na tarefa, o manifesto (`package.json` etc.) e arquivos cujo nome combina com termos da tarefa. Os termos em português são ligados às palavras que o código costuma usar em inglês por um dicionário pequeno e fixo (`janela → dialog`, `tipos → types`, `contrato → contract`…); o nome do arquivo pesa mais que a pasta, pastas genéricas (`components`, `lib`, `src`…) não contam e primitivas `components/ui/` perdem prioridade. É uma heurística por caminho: ela não lê conteúdo para decidir.
+- **O que vai só como caminho**: a lista dos arquivos de texto do repositório (até 300) e os arquivos que o Diretor leu mas que não foram escolhidos, para o Arquiteto saber o que existe e o que não leu.
+- **O que não vai**: as demais tarefas em detalhe, a resposta completa do Diretor e a conversa. Vai um resumo verificável do plano (objetivo, fluxo, etapa, riscos, suposições, não verificado) e, para tarefas dependentes, o resumo da recomendação da análise anterior.
+- **Limites** (`ARCHITECT_GITHUB_LIMITS`): até 10 arquivos, 16.000 caracteres por arquivo, 56.000 no total, 20 s de leitura. Se a estimativa passar de 60% do orçamento da ficha, o executor retira primeiro os arquivos **menos relevantes** (fim da ordem de seleção) e registra cada remoção. Limite dessa redução: um arquivo retirado não chega ao Arquiteto, e ele só sabe o caminho.
+
+### Somente leitura, garantido pela configuração
+
+O Arquiteto não recebe o repositório: o executor lê os arquivos pela API pública do GitHub, em memória, e entrega apenas texto. O cliente roda numa pasta temporária vazia, sem credencial do GitHub. Além disso:
+
+- **Claude Code**: `--tools ""` (nenhuma ferramenta), `--permission-mode dontAsk`, `--disallowedTools Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch,WebSearch`, `--strict-mcp-config`, `--safe-mode`, `--setting-sources ""`, `--no-session-persistence`.
+- **Codex CLI**: `--sandbox read-only`, `-c approval_policy="never"`, `--disable shell_tool unified_exec apps plugins browser_use computer_use image_generation multi_agent hooks`, busca na web desligada, `--ignore-user-config`, `--ephemeral`.
+
+Verificação real (`pnpm check:readonly`, uma chamada pequena por cliente): o prompt pede explicitamente para sobrescrever um arquivo dentro da pasta de trabalho, outro fora dela, criar um arquivo novo e rodar um comando. Resultado em 25/09/2026: **nenhum arquivo alterado ou criado nos dois clientes**. O Claude Code informou que só tinha a ferramenta de saída estruturada. O Codex informou que `apply_patch` continua visível ao modelo, mas foi **bloqueado pela sandbox somente leitura**. Esse é o limite conhecido: no Codex, a proteção contra escrita vem da sandbox, e não da ausência total de ferramentas. Se algum adaptador deixar de garantir leitura segura, `READ_ONLY` em `lib/executor/service.ts` bloqueia esse adaptador para o Arquiteto e a revisão explica o motivo.
+
 ## Segurança
 
 - **Nenhuma credencial de conta passa pelo Setor IA.** Senha, cookie, token OAuth e arquivos de autenticação ficam com o cliente oficial (`~/.claude`, `~/.codex`). O Setor IA não abre, copia nem registra esses arquivos; usa apenas os comandos de status dos clientes (`claude auth status`, `codex login status`).
@@ -62,13 +104,15 @@ Variáveis opcionais (em `.dev.vars` ou no ambiente do executor): `AYLA_EXECUTOR
 
 Arquivo `.ayla/runs.sqlite` (ignorado pelo Git), mantido pelo executor:
 
-- execução: ID, demanda, colaborador, estado, conexão usada, modelo e esforço pedidos, datas (criação, início, fim), prazo de processamento, tentativa, hash e instantâneo congelado da ficha e da demanda, entrada exata enviada (instruções e mensagem), contexto consultado, resultado validado, erro com passos de recuperação, uso informado pelo cliente e resposta bruta;
+- execução: ID, tipo (`director_plan` ou `architect_task`), demanda, colaborador, plano e tarefa de origem (no Arquiteto), estado, conexão usada, modelo e esforço pedidos, datas (criação, início, fim), prazo de processamento, tentativa, hash e instantâneo congelado da ficha e da demanda, entrada exata enviada (instruções e mensagem), contexto consultado, resultado validado, erro com passos de recuperação, uso informado pelo cliente e resposta bruta;
 - eventos com data e hora;
 - resultado das chamadas reais por conexão (para detectar sessão expirada).
 
 Execuções sobrevivem ao recarregar a página e ao reiniciar o executor. Uma execução que estava em planejamento quando o executor foi encerrado é marcada como **interrompida** no próximo início; as que estavam na fila continuam.
 
-Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada pedido leva uma chave de idempotência e o banco só permite uma execução ativa por demanda.
+Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada pedido leva uma chave de idempotência, e o banco só permite um plano ativo por demanda e um encaminhamento em aberto por tarefa.
+
+**Migração do registro.** A versão 2 do esquema acrescenta as colunas `kind`, `parent_run_id` e `task_id` com `ALTER TABLE … ADD COLUMN` (as linhas existentes não mudam; as antigas viram `director_plan`) e troca o índice “uma execução ativa por demanda” por índices que distinguem plano e tarefa. Antes de migrar, o executor grava uma cópia completa (`.ayla/runs.backup-before-v2-<data>.sqlite`, via `VACUUM INTO`). Não existe rotina que apague registros.
 
 ## Estados da conexão
 
@@ -84,9 +128,9 @@ Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada ped
 
 ## Uso e limites
 
-- O **orçamento de tokens da ficha** é um limite do Setor IA. Antes da chamada, o executor estima o texto que vai enviar (caracteres ÷ 3,5) e não chama se passar do orçamento. Depois compara com o uso **informado pelo cliente**. O cliente não pode ser interrompido no meio da resposta; se passar, a execução fica marcada como “excedeu”.
+- O **orçamento de tokens da ficha** é **referência e alerta** do Setor IA, não um limite rígido: o cliente não pode ser interrompido no meio da resposta. Antes da chamada, o executor estima o texto que vai enviar (caracteres ÷ 3,5); para o Diretor, não chama se só esse texto já passar do orçamento; para o Arquiteto, mostra o alerta na revisão e você decide. Depois compara com o uso **informado pelo cliente** e marca “acima da referência” quando passar. Nas execuções reais, o uso informado passou do orçamento: 39.328 contra 16.000 no Diretor (Claude) e 65.467 contra 24.000 no Arquiteto. A maior parte é cache de entrada e raciocínio do próprio cliente. O orçamento padrão do Diretor (16.000) **não** foi alterado.
 - Os **limites da assinatura** (janelas de uso do Claude, limites do ChatGPT Business compartilhados com o ChatGPT Work) são controlados por Anthropic e OpenAI. Os clientes não informam o saldo restante ao Setor IA, que por isso não mostra saldo nem promete teto. Quando o limite é atingido, o cliente avisa e a execução mostra o erro “limite de uso da assinatura”.
-- Uso exibido: Claude Code informa entrada, cache e saída por modelo (`modelUsage`); Codex informa entrada, cache, saída e raciocínio (`turn.completed.usage`), mas não o nome do modelo usado. O `total_cost_usd` do Claude Code é uma estimativa de preço de API e **não** é mostrado como cobrança.
+- Uso exibido (aba Tokens): entrada sem cache, cache lido, cache gravado, saída (com o raciocínio incluído) e total, por chamada, com a **fonte da medição** (Claude Code: `modelUsage` da saída JSON; Codex: `turn.completed.usage` do `--json`). Categoria que o cliente não informou aparece como **indisponível**, nunca como 0 nem como estimativa. No Codex, `input_tokens` inclui o cache; o executor separa as duas partes para não contar em dobro. Registros anteriores a esta versão aparecem como foram gravados e marcados como “registro anterior à identificação da fonte”. O Codex não informa o modelo usado. O `total_cost_usd` do Claude Code é uma estimativa de preço de API e **não** é mostrado como cobrança.
 
 ## Modelos e esforço
 
@@ -111,5 +155,15 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 
 ## Testes
 
-- `pnpm test`: pipeline do Diretor, validação do plano, composição da entrada, GitHub, registro durável (inclusive reabrindo o arquivo), cliques repetidos, cancelamento, limites, estados de conexão, adaptadores com saídas reais gravadas dos clientes, detecção, execução de processos (real, com `node`) e proteção HTTP (servidor real em 127.0.0.1). Nesses testes, os clientes oficiais são **simulados**.
+- `pnpm test`: encaminhamento ao Arquiteto (tarefa elegível, sem Arquiteto, adulterada, sem aprovação, hash diferente, cliques repetidos, dependências, esclarecimento, cliente desconectado, erro, cancelamento, “lido” só para arquivos enviados, pasta de trabalho vazia, argumentos de somente leitura, migração com linhas antigas intactas, persistência e reinício, categorias de uso indisponíveis, seleção e redução de contexto), pipeline do Diretor, validação do plano, composição da entrada, GitHub, registro durável (inclusive reabrindo o arquivo), cliques repetidos, cancelamento, limites, estados de conexão, adaptadores com saídas reais gravadas dos clientes, detecção, execução de processos (real, com `node`) e proteção HTTP (servidor real em 127.0.0.1). Nesses testes, os clientes oficiais são **simulados**.
 - A execução real com cada cliente é feita pela interface ou pela API local, com o executor em execução; os resultados ficam no registro com o cliente e o uso informados.
+- `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente).
+
+## Próximo passo: Desenvolvedor
+
+O Desenvolvedor precisa **escrever**, e isso não cabe no modelo de somente leitura do Arquiteto. Desenho proposto, a implementar na próxima etapa:
+
+1. **Entrada**: tarefa do Desenvolvedor no plano + análises concluídas do Arquiteto das quais ela depende (já registradas e vinculadas por `parent_run_id`/`task_id`), com a mesma revisão e aprovação explícitas.
+2. **Cópia de trabalho isolada**: clone raso do repositório no commit registrado, numa pasta temporária do executor, em branch própria e sem credencial de push. O projeto original do usuário não é tocado.
+3. **Permissões por execução**: Claude Code com `Read,Edit,Write` e um conjunto fechado de comandos (`--allowedTools`), ou Codex com `--sandbox workspace-write` restrito à cópia, sem rede; timeout e limite de saída.
+4. **Resultado**: diff, lista de arquivos alterados e saída real dos comandos de verificação, para o QA; nada é publicado, enviado por push nem mesclado sem uma aprovação separada sua.

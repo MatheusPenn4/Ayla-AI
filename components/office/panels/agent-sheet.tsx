@@ -210,7 +210,7 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
             </div>
             <ConnectionPanel
               connection={draft.connection} modelName={draft.modelName} effort={draft.effort} legacyProvider={String(draft.model)}
-              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id)}
+              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id) ? "starts" : (engine?.status?.handoffTargets ?? ["architect"]).includes(draft.id) ? "handoff" : "none"}
               engine={engine}
               onChange={part => update(part)}
             />

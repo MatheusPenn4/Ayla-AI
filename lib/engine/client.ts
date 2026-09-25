@@ -51,4 +51,9 @@ export const engineApi = {
   list: (demandIds: string[]) => call<{ runs: RunRecord[] }>(`/api/runs?demands=${demandIds.map(encodeURIComponent).join(",")}`),
   get: (id: string) => call<{ run: RunDetail }>(`/api/runs/${id}`),
   cancel: (id: string) => call<{ run: RunRecord; canceled: boolean }>(`/api/runs/${id}/cancel`, { method: "POST" }),
+  /** Hand-off step 1: the executor validates the task and returns the frozen content for review (status awaiting_approval). */
+  prepareHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; previousRunId?: string; answers?: { question: string; answer: string }[] }) =>
+    call<{ run: RunDetail; created: boolean }>("/api/handoffs", { method: "POST", body: JSON.stringify(req) }),
+  /** Hand-off step 2: the user's confirmation of exactly that content. */
+  approve: (id: string, snapshotHash: string) => call<{ run: RunRecord; approved: boolean }>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify({ snapshotHash }) }),
 };

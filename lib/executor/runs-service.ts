@@ -11,7 +11,7 @@ import type { NewRun } from "./store";
 const s = (max: number) => z.string().max(max);
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 
-const Member = z.object({
+export const MemberZ = z.object({
   id, name: s(40), role: s(50), specialty: s(2000),
   connection: z.enum(["claude_code", "codex", "none"]),
   modelName: z.string().max(80).regex(/^[A-Za-z0-9._\-[\]]*$/, "nome de modelo com caracteres inválidos"),
@@ -26,7 +26,7 @@ const StartZ = z.object({
   directorId: id,
   previousRunId: z.string().uuid().optional(),
   answers: z.array(z.object({ question: s(2000), answer: s(4000) })).max(10).optional(),
-  team: z.array(Member).min(1).max(16),
+  team: z.array(MemberZ).min(1).max(16),
   demand: z.object({
     id, title: s(200).min(1), description: s(20000), acceptanceCriteria: z.array(s(2000)).max(30), project: s(120),
     priority: z.enum(["baixa", "normal", "alta"]), source: z.enum(["github", "folder", "none"]),
@@ -45,13 +45,13 @@ export function parseStartRequest(body: unknown): Validated {
   if (!v.demand.title.trim()) return { ok: false, errors: ["A demanda precisa de um título."] };
   const director = v.team.find(m => m.id === v.directorId)!;
   if (director.connection === "none") return { ok: false, errors: ["Escolha a conexão do Diretor na ficha (aba Perfil): Claude via Claude Code ou ChatGPT Business via Codex."] };
-  if (!EXECUTABLE_AGENTS.includes(v.directorId)) return { ok: false, errors: ["Nesta fase só o Diretor executa. Arquiteto, Desenvolvedor, QA e Revisor aparecem apenas como responsáveis propostos."] };
+  if (!EXECUTABLE_AGENTS.includes(v.directorId)) return { ok: false, errors: ["Nesta fase só o Diretor inicia execuções. O Arquiteto executa apenas uma tarefa do Diretor aprovada por você; Desenvolvedor, QA e Revisor aparecem apenas como responsáveis propostos."] };
   return { ok: true, value: v };
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-/** Collaborators that may actually run in this phase. The others only appear as proposed assignees. */
+/** Collaborators that start runs by themselves in this phase (the Architect runs only through an approved hand-off). */
 export const EXECUTABLE_AGENTS = ["director"];
 
 /** Freezes what the Director will receive; later sheet edits never change this run. */

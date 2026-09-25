@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { validatePlan } from "@/lib/engine/plan-schema";
 import { PHASE_PROTOCOL, buildSystemPrompt, buildUserMessage, neutralizeEnvelope } from "@/lib/engine/prompt";
 import { connectionFromLegacyProvider } from "@/lib/engine/connections";
-import type { ConnectionStatus } from "@/lib/engine/types";
+import type { ConnectionStatus, DirectorSnapshot } from "@/lib/engine/types";
 import { AgentError } from "@/lib/executor/adapters/types";
 import { GITHUB_LIMITS, GithubError, readGithubContext, validateRepoRef } from "@/lib/executor/github";
 import { processRun, type PlannerDeps } from "@/lib/executor/planner";
@@ -92,10 +92,10 @@ describe("seleção de conexão na ficha", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.errors.join(" ")).toContain("Escolha a conexão do Diretor");
   });
-  it("só o Diretor executa nesta fase", () => {
+  it("só o Diretor inicia execuções nesta fase", () => {
     const r = parseStartRequest(request({ directorId: "developer" }));
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.errors.join(" ")).toContain("só o Diretor executa");
+    if (!r.ok) expect(r.errors.join(" ")).toContain("só o Diretor inicia execuções");
   });
   it("modelo e esforço com caracteres perigosos são recusados antes de chegar ao cliente", () => {
     expect(parseStartRequest(request({ team: [member("director", { modelName: "sonnet; rm -rf /" })] })).ok).toBe(false);
@@ -172,7 +172,7 @@ describe("registro de execuções", () => {
     const req = request();
     const { run } = await store.create(buildNewRun(req));
     req.team[0].brief = "ficha alterada depois";
-    expect((await store.snapshot(run.id))!.director.brief).toContain("Missão do director");
+    expect(((await store.snapshot(run.id)) as DirectorSnapshot).director.brief).toContain("Missão do director");
   });
   it("persiste em arquivo: reabrir o banco mantém execuções, eventos e resultado", async () => {
     const file = path.join(work, "runs.sqlite");
