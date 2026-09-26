@@ -10,6 +10,7 @@ import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
 import { detect, LOGIN_STEPS, resolveClient, type ClientDeps } from "./clients";
 import { HandoffRefused, HandoffZ, prepareHandoff } from "./handoff";
+import { listLocalRepos } from "./local-git";
 import { processRun } from "./planner";
 import type { Runner } from "./proc";
 import { EXECUTABLE_AGENTS, buildNewRun, parseStartRequest } from "./runs-service";
@@ -23,6 +24,8 @@ export type ExecutorConfig = {
   workRoot: string;
   limits: { maxRunsPerHour: number; maxConcurrentRuns: number; callTimeoutMs: number; leaseMs: number; statusCacheMs: number };
   github: { token?: string; apiBase?: string; rawBase?: string; fetch?: typeof fetch };
+  /** Local Git clones the user authorized for read-only reading (AYLA_LOCAL_REPOS, absolute paths). */
+  localRepos?: string[];
 };
 
 export type ServiceDeps = {
@@ -69,6 +72,10 @@ export class ExecutorService {
   }
 
   get store() { return this.deps.store; }
+
+  private gitDeps() {
+    return { runner: this.deps.runner, env: this.deps.env, platform: this.clientDeps.platform, exists: this.clientDeps.exists };
+  }
 
   /** Called once at start: runs left "planning" by a previous process are interrupted; queued ones resume. */
   async boot() {
@@ -152,6 +159,7 @@ export class ExecutorService {
       executableAgents: EXECUTABLE_AGENTS,
       handoffTargets: [...HANDOFF_TARGETS],
       readOnly: READ_ONLY,
+      localRepos: (await listLocalRepos(this.cfg.localRepos ?? [], this.gitDeps())).map(r => ({ dirName: r.dirName, owner: r.owner, repo: r.repo, head: r.head, headSubject: r.headSubject })),
     };
   }
 
@@ -194,7 +202,7 @@ export class ExecutorService {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
     try {
-      const { run, created } = await prepareHandoff(req, { store: this.store, github: this.cfg.github });
+      const { run, created } = await prepareHandoff(req, { store: this.store, github: this.cfg.github, local: { dirs: this.cfg.localRepos ?? [], git: this.gitDeps() } });
       return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
     } catch (e) {
       if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);

@@ -64,10 +64,13 @@ const service = new ExecutorService(
     limits: {
       maxRunsPerHour: num(vars.AYLA_MAX_RUNS_PER_HOUR, 20, 1, 500),
       maxConcurrentRuns: num(vars.AYLA_MAX_CONCURRENT_RUNS, 1, 1, 4),
-      callTimeoutMs: num(vars.AYLA_CALL_TIMEOUT_MS, 300_000, 30_000, 900_000),
+      // 10 minutes: a structured analysis with a large context took more than 5 minutes in a real run (26/09/2026).
+      callTimeoutMs: num(vars.AYLA_CALL_TIMEOUT_MS, 600_000, 30_000, 1_800_000),
       leaseMs: 90_000,
       statusCacheMs: 20_000,
     },
+    // Read-only access to local clones must be granted explicitly, one absolute folder per entry (";"-separated).
+    localRepos: (vars.AYLA_LOCAL_REPOS ?? "").split(";").map(x => x.trim()).filter(x => path.isAbsolute(x)),
     github: {
       token: process.env.GITHUB_TOKEN?.trim() || vars.GITHUB_TOKEN || undefined,
       apiBase: vars.AYLA_GITHUB_API_BASE || undefined,

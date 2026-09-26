@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { EngineApiError, buildStartRequest, engineApi, toTeamInput } from "@/lib/engine/client";
+import { EngineApiError, buildStartRequest, engineApi, toTeamInput, type HandoffFollowUp } from "@/lib/engine/client";
 import { ACTIVE_STATUSES, type ConnectionId, type EngineStatus, type RunRecord } from "@/lib/engine/types";
 import type { Agent, Demand } from "@/lib/office/types";
 
@@ -103,7 +103,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
    * A repeated click while the request is in flight is ignored; the executor also dedups per task.
    */
   const preparing = useRef(new Set<string>());
-  const prepareHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], followUp?: { previousRunId: string; answers: { question: string; answer: string }[] }) => {
+  const prepareHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], followUp?: HandoffFollowUp) => {
     const key = `${planRunId}:${taskId}`;
     if (preparing.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
     const architect = agents.find(a => a.id === "architect");

@@ -2,6 +2,7 @@
 // Supported in this version: PUBLIC repositories only. A private or missing
 // repository is reported as an understandable error; a link grants no access.
 // Everything read here is untrusted data (see lib/engine/prompt.ts).
+import { createHash } from "node:crypto";
 import type { ConsultedFile, SourceContext } from "@/lib/engine/types";
 
 export const GITHUB_LIMITS = { maxFiles: 8, maxFileBytes: 24_000, maxTotalChars: 48_000, timeoutMs: 15_000, perRequestMs: 7_000, maxTreeSample: 160 };
@@ -126,6 +127,7 @@ export async function readGithubContext(
     /** "director" (default): docs, manifests, then keyword matches. "architect": paths cited in the task, manifests, keyword matches. */
     selection?: "director" | "architect";
     mentions?: string[];
+    requested?: RequestedFile[];
   },
   deps: { fetch?: Fetcher; token?: string; apiBase?: string; rawBase?: string } = {},
 ): Promise<{ context: Extract<SourceContext, { kind: "github" }>; text: string }> {
@@ -180,71 +182,12 @@ export async function readGithubContext(
   const treeRes = await get(`${api}/repos/${enc(owner)}/${enc(repo)}/git/trees/${commit}?recursive=1`);
   if (treeRes.status === 404 || treeRes.status === 422) throw new GithubError("branch_not_found", `O commit ${commit.slice(0, 12)} não está mais disponível em ${owner}/${repo}.`);
   if (!treeRes.ok) throw new GithubError("github_unavailable", `O GitHub respondeu ${treeRes.status} ao listar os arquivos.`);
-  const tree = (await treeRes.json()) as { tree?: { path: string; type: string; size?: number }[]; truncated?: boolean };
-  const entries = (tree.tree ?? []).filter(e => typeof e.path === "string");
-  const blobs = entries.filter(e => e.type === "blob" && !SKIP_DIRS.test(e.path));
+  const tree = (await treeRes.json()) as { tree?: { path: string; type: string; size?: number; sha?: string }[]; truncated?: boolean };
+  const entries = (tree.tree ?? []).filter(e => typeof e.path === "string").map(e => ({ path: e.path, type: e.type, size: e.size ?? 0, blob: e.sha ?? null }));
 
-  // Structure. Director: top-level entries first, then shallow paths.
-  // Architect: names of the text files at any depth (paths only, contents not read), so it can say precisely what it did not see.
-  const structureSample = opts.selection === "architect"
-    ? blobs.filter(b => TEXT_EXT.test(b.path)).map(b => b.path).sort((a, b) => a.localeCompare(b)).slice(0, LIM.maxTreeSample)
-    : entries
-      .filter(e => !SKIP_DIRS.test(e.path) && e.path.split("/").length <= 2)
-      .map(e => (e.type === "tree" ? `${e.path}/` : e.path))
-      .sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b))
-      .slice(0, LIM.maxTreeSample);
-
-  // File selection: documentation and manifests first, then files whose path matches the demand's words.
-  const chosen: { path: string; size: number; reason: string }[] = [];
-  const skipped: { path: string; reason: string }[] = [];
-  const pick = (path: string, size: number, reason: string) => {
-    if (chosen.some(c => c.path === path)) return;
-    if (chosen.length >= LIM.maxFiles) { skipped.push({ path, reason: "limite de arquivos" }); return; }
-    chosen.push({ path, size, reason });
-  };
-  if (opts.selection === "architect") {
-    // 1. Files and folders the Director's task cites explicitly.
-    for (const m of opts.mentions ?? []) {
-      const exact = blobs.find(b => b.path === m || b.path.endsWith(`/${m}`) && !m.includes("/"));
-      if (exact) { pick(exact.path, exact.size ?? 0, "citado na tarefa do Diretor"); continue; }
-      const dir = m.replace(/\/$/, "") + "/";
-      const inside = blobs.filter(b => b.path.startsWith(dir) && TEXT_EXT.test(b.path)).sort((a, b) => (a.size ?? 0) - (b.size ?? 0)).slice(0, 4);
-      for (const b of inside) pick(b.path, b.size ?? 0, `dentro de ${dir}, citado na tarefa do Diretor`);
-    }
-    // 2. Project manifest (dependencies and scripts).
-    for (const b of blobs) if (/^(package\.json|pyproject\.toml|go\.mod|cargo\.toml|composer\.json)$/i.test(b.path)) pick(b.path, b.size ?? 0, "manifesto do projeto");
-  } else {
-    for (const [re, reason] of DOC_PRIORITY) for (const b of blobs) if (re.test(b.path)) pick(b.path, b.size ?? 0, reason);
-  }
-  const architect = opts.selection === "architect";
-  if (architect) {
-    const groups = termGroups(opts.keywords);
-    const scored = blobs
-      .filter(b => TEXT_EXT.test(b.path) && !/(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$/.test(b.path))
-      .map(b => ({ b, score: scorePath(b.path, groups) }))
-      .filter(x => x.score >= 2)
-      .sort((a, b) => b.score - a.score || (a.b.size ?? 0) - (b.b.size ?? 0));
-    for (const { b } of scored.slice(0, 8)) pick(b.path, b.size ?? 0, "relacionado a termos da tarefa");
-  } else {
-    const words = opts.keywords.map(w => w.toLowerCase()).filter(w => w.length >= 4).slice(0, 12);
-    if (words.length) {
-      const scored = blobs
-        .filter(b => TEXT_EXT.test(b.path))
-        .map(b => ({ b, score: words.filter(w => b.path.toLowerCase().includes(w)).length }))
-        .filter(x => x.score > 0)
-        .sort((a, b) => b.score - a.score || (a.b.size ?? 0) - (b.b.size ?? 0));
-      for (const { b } of scored.slice(0, 6)) pick(b.path, b.size ?? 0, "relacionado a termos da demanda");
-    }
-  }
-
-  const files: ConsultedFile[] = [];
-  const parts: string[] = [];
-  let total = 0;
-  // Downloads run 4 at a time; results are applied in the chosen order, so limits and order stay deterministic.
-  const fetchOne = async (c: { path: string; size: number }): Promise<{ body: string } | { skip: string }> => {
-    if (c.size > LIM.maxFileBytes * 4) return { skip: `arquivo grande (${c.size} bytes)` };
+  const readFile = async (path: string): Promise<{ body: string } | { skip: string }> => {
     try {
-      const res = await get(`${raw}/${enc(owner)}/${enc(repo)}/${commit}/${c.path.split("/").map(enc).join("/")}`, "text/plain");
+      const res = await get(`${raw}/${enc(owner)}/${enc(repo)}/${commit}/${path.split("/").map(enc).join("/")}`, "text/plain");
       if (!res.ok) return { skip: `GitHub respondeu ${res.status}` };
       return { body: await res.text() };
     } catch (err) {
@@ -252,31 +195,201 @@ export async function readGithubContext(
       throw err;
     }
   };
-  const fetched: ({ body: string } | { skip: string })[] = [];
-  for (let i = 0; i < chosen.length; i += 4) fetched.push(...(await Promise.all(chosen.slice(i, i + 4).map(fetchOne))));
+  return assembleContext({
+    owner, repo, branch, commit, description: info.description ?? null, defaultBranch: info.default_branch ?? branch,
+    entries, treeTruncated: !!tree.truncated, readFile, limits: LIM, selection: opts.selection ?? "director",
+    keywords: opts.keywords, mentions: opts.mentions ?? [], requested: opts.requested ?? [], started, via: "github",
+  });
+}
+
+export type TreeEntry = { path: string; type: string; size: number; blob: string | null };
+/** A file the user (or a resolution by reading) asked for: "path" or "path#Symbol". */
+export type RequestedFile = { ref: string; reason: string };
+
+/** Large files are sent as an outline of declarations + the relevant blocks, above this size. */
+export const EXCERPT_THRESHOLD = 7_000;
+
+/**
+ * Outline of top-level declarations with line numbers and the blocks whose
+ * names (or bodies) match the wanted terms. A verifiable excerpt: every block
+ * says which lines of the committed file it contains.
+ */
+export function excerptFile(body: string, symbols: string[], terms: string[], maxChars: number) {
+  const lines = body.split(/\r?\n/);
+  const decl = /^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|class|interface|type|enum)\s+([A-Za-z0-9_$]+)/;
+  const marks: { name: string; line: number }[] = [];
+  lines.forEach((l, i) => { const m = decl.exec(l); if (m) marks.push({ name: m[1], line: i }); });
+  const importsEnd = lines.findIndex(l => l.trim() && !/^(import|export \* from|export \{[^}]*\} from|"use |'use |\/\/)/.test(l.trim()));
+  const blocks = marks.map((m, k) => ({ name: m.name, from: m.line, to: (marks[k + 1]?.line ?? lines.length) - 1 }));
+  const syms = symbols.filter(x => /^[A-Za-z_$][\w$]*$/.test(x));
+  const t = terms.map(x => x.toLowerCase()).filter(x => x.length >= 4);
+  // Requested symbols: exact declaration name, plus the top-level declarations they reference (one level).
+  // Task terms: only the declaration name, never the body, and only when no symbol was requested.
+  const byName = blocks.filter(b => syms.includes(b.name));
+  const refText = byName.map(b => lines.slice(b.from, b.to + 1).join("\n")).join("\n");
+  // Only type-like declarations or small helpers: a large referenced component would just repeat the file.
+  const isTypeLike = (b: { from: number }) => /^(?:export\s+)?(?:type|interface|enum)\s/.test(lines[b.from]);
+  const blockChars = (b: { from: number; to: number }) => lines.slice(b.from, b.to + 1).join("\n").length;
+  const referenced = blocks.filter(b => !syms.includes(b.name) && byName.length > 0 && isTypeLike(b) && blockChars(b) <= 2500 && new RegExp(`\\b${b.name.replace(/\$/g, "\\$")}\\b`).test(refText));
+  const byTerm = syms.length ? [] : blocks.filter(b => t.some(x => b.name.toLowerCase().includes(x)));
+  // A requested symbol that is not a top-level declaration (e.g. a function inside a component):
+  // a window of lines around where it appears, instead of the whole enclosing block.
+  const rawWindows = syms.filter(x => !marks.some(m => m.name === x)).flatMap(x => {
+    const at = lines.findIndex(l => new RegExp(`\\b${x.replace(/\$/g, "\\$")}\\b`).test(l));
+    return at >= 0 ? [{ name: x, from: Math.max(0, at - 3), to: Math.min(lines.length - 1, at + 25) }] : [];
+  }).sort((a, b) => a.from - b.from);
+  // Overlapping windows are merged, so no line is sent twice.
+  const windows: { name: string; from: number; to: number }[] = [];
+  for (const w of rawWindows) {
+    if (byName.some(b => w.from >= b.from && w.to <= b.to)) continue; // already inside a requested block
+    const last = windows[windows.length - 1];
+    if (last && w.from <= last.to + 1) { last.to = Math.max(last.to, w.to); last.name = `${last.name}, ${w.name}`; } else windows.push({ ...w });
+  }
+  // Test files: the titles of describe/it/test blocks say what is covered.
+  const tests = lines.flatMap((l, i) => { const m = /^\s*(describe|it|test)(?:\.each\([^)]*\))?\(\s*(["'`])(.+?)\2/.exec(l); return m ? [`${m[1] === "describe" ? "▸" : "  ·"} ${m[3]} (l.${i + 1})`] : []; });
+  const outline = `Declarações de nível superior (${marks.length}): ${marks.map(m => `${m.name} (l.${m.line + 1})`).join(", ") || "nenhuma"}${tests.length ? `\nCasos de teste (${tests.filter(x => !x.startsWith("▸")).length}):\n${tests.join("\n")}` : ""}`;
+  const out: string[] = [outline];
+  const ranges: [number, number][] = [];
+  const sent: string[] = [];
+  let used = outline.length;
+  // Imports show dependencies; capped so a long import list does not crowd out the requested blocks.
+  const head: string[] = [];
+  for (const l of importsEnd > 0 ? lines.slice(0, importsEnd) : []) { if (head.join("\n").length + l.length > 1200) break; head.push(l); }
+  if (head.length) { const h = `[linhas 1-${head.length}]\n${head.join("\n")}`; if (used + h.length <= maxChars) { out.push(h); ranges.push([1, head.length]); used += h.length; } }
+  for (const b of [...byName, ...windows, ...referenced, ...byTerm]) {
+    const text = `[linhas ${b.from + 1}-${b.to + 1} · ${b.name}]\n${lines.slice(b.from, b.to + 1).join("\n")}`;
+    if (used + text.length > maxChars) {
+      const room = maxChars - used - 60;
+      if (room > 400) { out.push(`${text.slice(0, room)}\n[… bloco ${b.name} cortado]`); ranges.push([b.from + 1, b.to + 1]); sent.push(b.name); }
+      break;
+    }
+    out.push(text); ranges.push([b.from + 1, b.to + 1]); sent.push(b.name); used += text.length;
+  }
+  return { text: out.join("\n\n"), ranges, totalLines: lines.length, symbols: sent };
+}
+
+/** Compact list of paths grouped by folder (names only; contents not read). */
+function groupPaths(paths: string[]) {
+  const byDir = new Map<string, string[]>();
+  for (const p of paths) { const i = p.lastIndexOf("/"); const d = i < 0 ? "." : p.slice(0, i); byDir.set(d, [...(byDir.get(d) ?? []), p.slice(i + 1)]); }
+  return [...byDir.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([d, f]) => `${d}/: ${f.join(", ")}`).join("\n");
+}
+
+const sha256hex = async (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** Shared selection, limits and text assembly for every repository source (GitHub or local Git). */
+export async function assembleContext(a: {
+  owner: string; repo: string; branch: string; commit: string; description: string | null; defaultBranch: string;
+  entries: TreeEntry[]; treeTruncated: boolean;
+  readFile: (path: string) => Promise<{ body: string } | { skip: string }>;
+  limits: GithubLimits; selection: "director" | "architect"; keywords: string[]; mentions: string[]; requested: RequestedFile[];
+  started: number; via: "github" | "local_git";
+  local?: Extract<SourceContext, { kind: "github" }>["local"];
+}): Promise<{ context: Extract<SourceContext, { kind: "github" }>; text: string }> {
+  const LIM = a.limits;
+  const architect = a.selection === "architect";
+  const entries = a.entries;
+  const blobs = entries.filter(e => e.type === "blob" && !SKIP_DIRS.test(e.path));
+  const textBlobs = blobs.filter(b => TEXT_EXT.test(b.path));
+
+  // Structure. Director: top-level entries first, then shallow paths.
+  // Architect: names of the text files at any depth, grouped by folder (paths only, contents not read).
+  const structureSample = architect
+    ? textBlobs.map(b => b.path).sort((x, y) => x.localeCompare(y)).slice(0, LIM.maxTreeSample)
+    : entries
+      .filter(e => !SKIP_DIRS.test(e.path) && e.path.split("/").length <= 2)
+      .map(e => (e.type === "tree" ? `${e.path}/` : e.path))
+      .sort((x, y) => x.split("/").length - y.split("/").length || x.localeCompare(y))
+      .slice(0, LIM.maxTreeSample);
+
+  const chosen: { path: string; size: number; reason: string; blob: string | null; symbols: string[] }[] = [];
+  const skipped: { path: string; reason: string }[] = [];
+  const pick = (b: TreeEntry, reason: string, symbols: string[] = []) => {
+    const have = chosen.find(c => c.path === b.path);
+    if (have) { for (const x of symbols) if (!have.symbols.includes(x)) have.symbols.push(x); return; }
+    if (chosen.length >= LIM.maxFiles) { skipped.push({ path: b.path, reason: "limite de arquivos" }); return; }
+    chosen.push({ path: b.path, size: b.size, reason, blob: b.blob, symbols: [...symbols] });
+  };
+  if (architect) {
+    // 0. Files requested to resolve a question by reading (exact paths only, optionally #Symbol).
+    for (const r of a.requested) {
+      const [path, symbol] = r.ref.split("#");
+      const b = blobs.find(x => x.path === path);
+      if (!b) { skipped.push({ path, reason: `pedido (${r.reason}), mas não existe neste commit` }); continue; }
+      pick(b, r.reason, symbol ? [symbol] : []);
+    }
+    // 1. Files and folders the Director's task cites explicitly.
+    for (const m of a.mentions) {
+      const exact = blobs.find(b => b.path === m || (b.path.endsWith(`/${m}`) && !m.includes("/")));
+      if (exact) { pick(exact, "citado na tarefa do Diretor"); continue; }
+      const dir = m.replace(/\/$/, "") + "/";
+      for (const b of textBlobs.filter(x => x.path.startsWith(dir)).sort((x, y) => x.size - y.size).slice(0, 4)) pick(b, `dentro de ${dir}, citado na tarefa do Diretor`);
+    }
+    // When files were requested explicitly (a follow-up), only those and the task's citations are read:
+    // the path heuristic below would only add noise and duplicate what the user already chose.
+    const explicit = a.requested.length > 0;
+    // 2. Project manifest (dependencies and scripts).
+    if (!explicit) for (const b of blobs) if (/^(package\.json|pyproject\.toml|go\.mod|cargo\.toml|composer\.json)$/i.test(b.path)) pick(b, "manifesto do projeto");
+    // 3. File names related to the task's terms.
+    const groups = explicit ? [] : termGroups(a.keywords);
+    const scored = textBlobs
+      .filter(b => !/(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock)$/.test(b.path))
+      .map(b => ({ b, score: scorePath(b.path, groups) }))
+      .filter(x => x.score >= 2)
+      .sort((x, y) => y.score - x.score || x.b.size - y.b.size);
+    for (const { b } of scored.slice(0, 8)) pick(b, "relacionado a termos da tarefa");
+  } else {
+    for (const [re, reason] of DOC_PRIORITY) for (const b of blobs) if (re.test(b.path)) pick(b, reason);
+    const words = a.keywords.map(w => w.toLowerCase()).filter(w => w.length >= 4).slice(0, 12);
+    if (words.length) {
+      const scored = textBlobs
+        .map(b => ({ b, score: words.filter(w => b.path.toLowerCase().includes(w)).length }))
+        .filter(x => x.score > 0)
+        .sort((x, y) => y.score - x.score || x.b.size - y.b.size);
+      for (const { b } of scored.slice(0, 6)) pick(b, "relacionado a termos da demanda");
+    }
+  }
+
+  // Reading runs 4 at a time; results are applied in the chosen order, so limits and order stay deterministic.
+  const readOne = async (c: { path: string; size: number }) => (c.size > LIM.maxFileBytes * (architect ? 8 : 4) ? { skip: `arquivo grande (${c.size} bytes)` } : a.readFile(c.path));
+  const got: ({ body: string } | { skip: string })[] = [];
+  for (let i = 0; i < chosen.length; i += 4) got.push(...(await Promise.all(chosen.slice(i, i + 4).map(readOne))));
+  const wantedBase = [...termGroups(a.keywords).flat()];
+  const files: ConsultedFile[] = [];
+  const parts: string[] = [];
+  let total = 0;
   for (const [i, c] of chosen.entries()) {
-    const got = fetched[i];
-    if ("skip" in got) { skipped.push({ path: c.path, reason: got.skip }); continue; }
+    const g = got[i];
+    if ("skip" in g) { skipped.push({ path: c.path, reason: g.skip }); continue; }
     if (total >= LIM.maxTotalChars) { skipped.push({ path: c.path, reason: "limite de texto enviado ao modelo" }); continue; }
-    const body = got.body;
+    const body = g.body;
     const bytes = new TextEncoder().encode(body).length;
     const room = Math.min(LIM.maxFileBytes, LIM.maxTotalChars - total);
-    const sent = body.slice(0, room);
+    let sent: string, header: string, excerpt: ConsultedFile["excerpt"];
+    if (architect && body.length > EXCERPT_THRESHOLD) {
+      const ex = excerptFile(body, c.symbols, wantedBase, room);
+      sent = ex.text;
+      excerpt = { ranges: ex.ranges, totalLines: ex.totalLines, symbols: ex.symbols };
+      header = `--- arquivo: ${c.path} (trecho verificável: ${ex.ranges.map(([x, y]) => `l.${x}-${y}`).join(", ") || "só a lista de declarações"} de ${ex.totalLines} linhas; commit ${a.commit.slice(0, 12)}) ---`;
+    } else {
+      sent = body.slice(0, room);
+      header = `--- arquivo: ${c.path}${sent.length < body.length ? ` (truncado: ${sent.length} de ${body.length} caracteres)` : ""} ---`;
+    }
     total += sent.length;
-    files.push({ path: c.path, bytes, sentChars: sent.length, truncated: sent.length < body.length, reason: c.reason });
-    parts.push(`--- arquivo: ${c.path}${sent.length < body.length ? ` (truncado: ${sent.length} de ${body.length} caracteres)` : ""} ---\n${sent}`);
+    files.push({ path: c.path, bytes, sentChars: sent.length, truncated: !!excerpt || sent.length < body.length, reason: c.reason, blob: c.blob, sha256: await sha256hex(body), ...(excerpt ? { excerpt } : {}) });
+    parts.push(`${header}\n${sent}`);
   }
 
   const context: Extract<SourceContext, { kind: "github" }> = {
-    kind: "github", owner, repo, branch, commit, visibility: "public", description: info.description ?? null, defaultBranch: info.default_branch ?? branch,
-    treeEntries: entries.length, treeTruncated: !!tree.truncated, structureSample, files, skipped,
+    kind: "github", owner: a.owner, repo: a.repo, branch: a.branch, commit: a.commit, visibility: "public", description: a.description, defaultBranch: a.defaultBranch,
+    treeEntries: entries.length, treeTruncated: a.treeTruncated, structureSample, files, skipped,
     limits: { maxFiles: LIM.maxFiles, maxFileBytes: LIM.maxFileBytes, maxTotalChars: LIM.maxTotalChars, timeoutMs: LIM.timeoutMs },
-    elapsedMs: Date.now() - started,
+    elapsedMs: Date.now() - a.started, via: a.via, ...(a.local ? { local: a.local } : {}),
   };
   const text = [
-    `Descrição do repositório: ${info.description ?? "(sem descrição)"}`,
-    opts.selection === "architect"
-      ? `Lista de arquivos de texto do repositório (${structureSample.length} de ${blobs.filter(b => TEXT_EXT.test(b.path)).length}; apenas os caminhos — o conteúdo só foi lido nos arquivos abaixo):\n${structureSample.join("\n")}`
+    `Descrição do repositório: ${a.description ?? "(sem descrição)"}`,
+    architect
+      ? `Arquivos de texto do repositório no commit ${a.commit.slice(0, 12)} (${structureSample.length} de ${textBlobs.length}; apenas os nomes — o conteúdo só foi lido nos arquivos abaixo):\n${groupPaths(structureSample)}`
       : `Estrutura (amostra de até ${LIM.maxTreeSample} caminhos rasos):\n${structureSample.join("\n")}`,
     ...parts,
   ].join("\n\n");
@@ -286,22 +399,26 @@ export async function readGithubContext(
 /**
  * Drops consulted files until the text fits (used when the token budget is tight).
  * "size" (Director): largest first. "priority" (Architect): least relevant first,
- * i.e. from the end of the selection order, so files cited by the task stay.
+ * i.e. from the end of the selection order. Files in `protect` (requested to
+ * resolve a question) are never dropped. The text and ctx.files always change
+ * together, so a file is listed as read only if its content is in the text.
  */
-export function shrinkGithubText(ctx: Extract<SourceContext, { kind: "github" }>, text: string, targetChars: number, order: "size" | "priority" = "size") {
+export function shrinkGithubText(ctx: Extract<SourceContext, { kind: "github" }>, text: string, targetChars: number, order: "size" | "priority" = "size", protect: Set<string> = new Set()) {
   if (text.length <= targetChars) return { ctx, text };
   const sections = text.split(/\n\n(?=--- arquivo: )/);
   const head = sections.shift() ?? "";
-  const items = sections.map(s => ({ s, path: /^--- arquivo: (.+?)( \(truncado|\s---)/.exec(s)?.[1] ?? "" }));
-  const bySize = order === "priority" ? [...items].reverse() : items.sort((a, b) => b.s.length - a.s.length);
+  const known = [...ctx.files.map(f => f.path)].sort((a, b) => b.length - a.length);
+  const pathOf = (sec: string) => known.find(p => sec.startsWith(`--- arquivo: ${p} `)) ?? "";
+  const items = sections.map(sec => ({ sec, path: pathOf(sec) }));
+  const candidates = (order === "priority" ? [...items].reverse() : [...items].sort((a, b) => b.sec.length - a.sec.length)).filter(i => i.path && !protect.has(i.path));
   const dropped = new Set<string>();
   let cur = text.length;
-  for (const item of bySize) {
+  for (const item of candidates) {
     if (cur <= targetChars) break;
     dropped.add(item.path);
-    cur -= item.s.length;
+    cur -= item.sec.length + 2;
   }
-  const keep = sections.filter(s => !dropped.has(/^--- arquivo: (.+?)( \(truncado|\s---)/.exec(s)?.[1] ?? ""));
+  const keep = items.filter(i => !dropped.has(i.path)).map(i => i.sec);
   const nextCtx = { ...ctx, files: ctx.files.filter(f => !dropped.has(f.path)), skipped: [...ctx.skipped, ...[...dropped].map(path => ({ path, reason: order === "priority" ? "removido (menos relevante) para caber no orçamento de referência da ficha" : "removido para caber no orçamento de tokens" }))] };
-  return { ctx: nextCtx, text: [head.slice(0, targetChars), ...keep].join("\n\n") };
+  return { ctx: nextCtx, text: [head, ...keep].join("\n\n") };
 }

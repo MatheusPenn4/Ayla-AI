@@ -5,7 +5,7 @@
 // task needs: the demand, the task, a verifiable excerpt of the Director's
 // plan (not the whole plan or conversation) and the files the executor read.
 import { neutralizeEnvelope } from "./prompt";
-import type { HandoffTask, PlanExcerpt, SourceContext, StartRunRequest, TeamMemberInput } from "./types";
+import type { ArchitectSnapshot, HandoffTask, PlanExcerpt, SourceContext, StartRunRequest, TeamMemberInput } from "./types";
 
 export const ARCHITECT_PROTOCOL = [
   "PROTOCOLO DE EXECUÇÃO DO SETOR IA — ARQUITETO (SOMENTE ANÁLISE)",
@@ -19,6 +19,9 @@ export const ARCHITECT_PROTOCOL = [
   "7. Se uma dúvida impedir uma recomendação segura, responda com outcome = needs_clarification e perguntas objetivas, sem inventar uma decisão.",
   "8. Nenhum outro colaborador será acionado automaticamente: sua análise fica registrada para o Desenvolvedor e para o Diretor consolidar depois.",
   "9. Responda somente no formato JSON solicitado, em português.",
+  "10. Perguntas listadas em <esclarecimentos> já foram resolvidas (pelo solicitante ou por leitura de arquivos). Não as repita. Só pergunte de novo se houver uma contradição nova e identificável; nesse caso comece why_it_blocks com \"Contradição:\" e cite o que contradiz o quê.",
+  "11. Respostas marcadas como \"resposta do solicitante\" são decisões do usuário e valem sobre suposições; o que foi resolvido por leitura deve ser conferido no conteúdo de <dados_da_fonte>.",
+  "12. Seja conciso: frases curtas, sem repetir o enunciado; no máximo 12 itens em examined e 8 em cada outra lista. Referencie arquivo e símbolo em vez de copiar código.",
 ].join("\n");
 
 export function buildArchitectSystem(agent: TeamMemberInput) {
@@ -33,8 +36,13 @@ export function buildArchitectMessage(input: {
   context: SourceContext;
   sourceText: string;
   answers?: { question: string; answer: string }[] | null;
+  revision?: ArchitectSnapshot["revision"];
+  clarifications?: ArchitectSnapshot["clarifications"];
+  decisions?: ArchitectSnapshot["decisions"];
+  previousAnalysis?: ArchitectSnapshot["previousAnalysis"];
+  scope?: ArchitectSnapshot["scope"];
 }) {
-  const { demand, task, plan, team, context, sourceText, answers } = input;
+  const { demand, task, plan, team, context, sourceText, answers, revision, clarifications, decisions, previousAnalysis, scope } = input;
   const who = (id: string) => { const m = team.find(t => t.id === id); return m ? `${m.name} (${id})` : id; };
   const L: string[] = [];
   L.push("<demanda>");
@@ -62,17 +70,60 @@ export function buildArchitectMessage(input: {
     for (const d of plan.dependsOn) L.push(`- ${d.id} · ${d.title} → ${who(d.assignee)}${d.analysisSummary ? `\n  Análise registrada do Arquiteto: ${d.analysisSummary}` : ""}`);
   }
   if (plan.dependents.length) L.push(`Quem usa o resultado desta tarefa: ${plan.dependents.map(d => `${d.id} · ${d.title} → ${who(d.assignee)}`).join("; ")}`);
-  if (plan.risks.length) L.push(`Riscos apontados pelo Diretor:\n${plan.risks.map(r => `- ${r}`).join("\n")}`);
-  if (plan.assumptions.length) L.push(`Suposições do Diretor:\n${plan.assumptions.map(r => `- ${r}`).join("\n")}`);
-  if (plan.not_verified.length) L.push(`Não verificado pelo Diretor:\n${plan.not_verified.map(r => `- ${r}`).join("\n")}`);
+  const more = (n: number | undefined) => (n ? ` (+${n} omitido(s); ver plano ${plan.directorRunId.slice(0, 8)})` : "");
+  if (plan.risks.length) L.push(`Riscos apontados pelo Diretor${more(plan.omitted?.risks)}:\n${plan.risks.map(r => `- ${r}`).join("\n")}`);
+  if (plan.assumptions.length) L.push(`Suposições do Diretor${more(plan.omitted?.assumptions)}:\n${plan.assumptions.map(r => `- ${r}`).join("\n")}`);
+  if (plan.not_verified.length) L.push(`Não verificado pelo Diretor${more(plan.omitted?.not_verified)}:\n${plan.not_verified.map(r => `- ${r}`).join("\n")}`);
   L.push("(Resumo do plano. As demais tarefas e a conversa completa do Diretor não foram enviadas.)");
   L.push("</plano_do_diretor_resumo>");
   L.push("");
+  if (revision && revision.number > 1) {
+    L.push("<revisao_do_contexto>");
+    L.push(`Revisão ${revision.number} deste envio (anterior: execução ${revision.previousRunId?.slice(0, 8) ?? "—"}, commit ${revision.previousCommit?.slice(0, 12) ?? "—"}${revision.previousVia === "local_git" ? " da cópia local" : ""}).`);
+    L.push(revision.changedCommit ? `Commit atualizado para ${revision.commit?.slice(0, 12)}${revision.via === "local_git" ? " (cópia local autorizada, não publicado no GitHub)" : ""}. Motivo: ${revision.reason}` : `Mesmo commit do envio anterior. Motivo: ${revision.reason}`);
+    L.push("O que a análise anterior disse sobre o commit antigo pode não valer para este commit.");
+    L.push("</revisao_do_contexto>");
+    L.push("");
+  }
+  if (previousAnalysis) {
+    L.push("<analise_anterior_resumo>");
+    L.push(`Execução ${previousAnalysis.runId.slice(0, 8)} (commit ${previousAnalysis.commit?.slice(0, 12) ?? "—"}), que terminou pedindo esclarecimento.`);
+    L.push(`Entendimento: ${previousAnalysis.understanding}`);
+    if (previousAnalysis.provisional) L.push(`Recomendação provisória (condicionada às dúvidas): ${previousAnalysis.provisional}`);
+    else L.push("A recomendação provisória anterior não é reenviada: foi feita sobre outro commit.");
+    L.push("</analise_anterior_resumo>");
+    L.push("");
+  }
+  if (clarifications?.length) {
+    L.push("<esclarecimentos>");
+    clarifications.forEach((c, i) => {
+      L.push(`P${i + 1} (pergunta do Arquiteto na execução ${c.askedIn.slice(0, 8)}): ${c.question.length > 240 ? `${c.question.slice(0, 239)}…` : c.question}`);
+      if (c.resolution.by === "user") L.push(`   → Resposta do solicitante (usuário): ${c.resolution.answer}`);
+      else L.push(`   → Resolvida por leitura no commit ${c.resolution.commit.slice(0, 12)}: ${c.resolution.readFiles.join(", ") || "nenhum arquivo encontrado"} (conteúdo em <dados_da_fonte>)${c.resolution.missing.length ? `; não encontrados: ${c.resolution.missing.join(", ")}` : ""}. Responda você mesmo a partir desse conteúdo.`);
+    });
+    L.push("</esclarecimentos>");
+    L.push("");
+  }
+  if (decisions?.length) {
+    L.push("<decisoes_do_solicitante>");
+    for (const d of decisions) L.push(`- ${d.topic}: ${d.answer}`);
+    L.push("</decisoes_do_solicitante>");
+    L.push("");
+  }
+  if (scope) {
+    L.push("<escopo>");
+    L.push(`Pedido nesta execução:\n${scope.asked.map(x => `- ${x}`).join("\n")}`);
+    L.push(`Fora do escopo:\n${scope.outOfScope.map(x => `- ${x}`).join("\n")}`);
+    L.push("</escopo>");
+    L.push("");
+  }
   L.push("<fonte>");
   if (context.kind === "none") L.push(context.note);
   if (context.kind === "folder") L.push(`${context.note} Nenhum arquivo da pasta foi enviado.`);
   if (context.kind === "github") {
-    L.push(`Repositório público ${context.owner}/${context.repo}, commit ${context.commit} (o mesmo que o Diretor consultou).`);
+    L.push(context.via === "local_git"
+      ? `Repositório ${context.owner}/${context.repo}, commit ${context.commit}, lido da cópia local autorizada (${context.local?.published ? "publicado no GitHub" : "não publicado no GitHub"}; ${context.local?.isDescendant ? `descende do commit ${context.local.descendantOf?.slice(0, 12)} que o Diretor leu` : "relação com o commit do Diretor não confirmada"}).`
+      : `Repositório público ${context.owner}/${context.repo}, commit ${context.commit}${plan.directorCommit === context.commit ? " (o mesmo que o Diretor consultou)" : ""}.`);
     L.push(`Arquivos que o Diretor leu: ${plan.directorFiles.map(f => f.path).join(", ") || "nenhum"}.`);
     L.push(`Arquivos com conteúdo nesta mensagem (${context.files.length}): ${context.files.map(f => `${f.path}${f.truncated ? " (truncado)" : ""}`).join(", ") || "nenhum"}. Qualquer outro arquivo NÃO foi lido.`);
   }

@@ -47,7 +47,7 @@ Pré-requisitos: Node.js 22.13 ou mais novo, `pnpm install` já feito, e pelo me
    Se o `pnpm dev` já estava aberto antes do passo 2, reinicie-o para ele ler o token.
 4. Abra `http://localhost:5173`, escolha a **Conexão de execução** na ficha do Diretor (aba Perfil), salve, crie uma demanda e clique em **Planejar com o Diretor** na tela Demandas.
 
-Variáveis opcionais (em `.dev.vars` ou no ambiente do executor): `AYLA_EXECUTOR_PORT` (padrão 4317), `AYLA_MAX_CONCURRENT_RUNS` (padrão 1), `AYLA_MAX_RUNS_PER_HOUR` (padrão 20), `AYLA_CALL_TIMEOUT_MS` (padrão 300000), `AYLA_CLAUDE_PATH` / `AYLA_CODEX_PATH` (caminho absoluto do executável, se não estiver no PATH), `GITHUB_TOKEN` (apenas aumenta o limite de consultas da API pública do GitHub).
+Variáveis opcionais (em `.dev.vars` ou no ambiente do executor): `AYLA_EXECUTOR_PORT` (padrão 4317), `AYLA_MAX_CONCURRENT_RUNS` (padrão 1), `AYLA_MAX_RUNS_PER_HOUR` (padrão 20), `AYLA_CALL_TIMEOUT_MS` (padrão 600000, 10 min; até 30 min), `AYLA_LOCAL_REPOS` (pastas de cópias locais autorizadas para leitura, separadas por `;`; veja abaixo), `AYLA_CLAUDE_PATH` / `AYLA_CODEX_PATH` (caminho absoluto do executável, se não estiver no PATH), `GITHUB_TOKEN` (apenas aumenta o limite de consultas da API pública do GitHub).
 
 ## Encaminhamento Diretor → Arquiteto
 
@@ -73,13 +73,54 @@ Fluxo: **plano do Diretor → você escolhe uma tarefa do Arquiteto → revisa o
 
 A análise fica vinculada à demanda, ao plano do Diretor (`parent_run_id`) e à tarefa (`task_id`), com o instantâneo da ficha usada, eventos, uso informado e resposta bruta. Ela fica disponível para a futura etapa do Desenvolvedor e para o Diretor consolidar; nenhum colaborador é acionado a partir dela.
 
+### Esclarecimento e revisão de contexto
+
+Quando o Arquiteto pede esclarecimento, a aba **Dúvidas** da execução dele permite resolver **cada pergunta de um único jeito**:
+
+- **Eu respondo**: vira “resposta do solicitante (usuário)”, uma decisão sua;
+- **Resolver lendo arquivos**: você indica `caminho` ou `caminho#Símbolo`; o executor lê esses arquivos no commit escolhido e o Arquiteto responde a partir do conteúdo (fica registrado quais foram lidos e quais não existiam).
+
+Também é possível registrar **decisões adicionais** (pontos que o Arquiteto não perguntou) e escolher **a fonte e o commit** do novo envio. Submeter só prepara um novo envio, que passa pela mesma revisão e confirmação.
+
+Regras aplicadas pelo executor:
+
+- as respostas precisam corresponder, **pelo texto exato**, às perguntas da execução que as fez (`previous_run_id`); cada pergunta é resolvida uma vez; nenhuma pode ficar sem resolução;
+- trocar commit ou fonte exige **motivo** e vira uma **revisão** numerada (`revisão 2`, `3`…), com commit anterior, commit novo, fonte e motivo, e o evento `context_revision`. O envio anterior **não é alterado** (nem o que ele recebeu, nem seu estado);
+- a numeração conta todas as tentativas da tarefa: uma revisão que falhou ou foi descartada mantém seu número;
+- o Arquiteto recebe `<esclarecimentos>` com a origem de cada resposta e não pode repetir uma pergunta já resolvida: a validação recusa (e pede uma correção) uma pergunta parecida com uma resolvida, salvo se `why_it_blocks` começar com “Contradição:”.
+
+A revisão do envio mostra: suas respostas marcadas como suas; as dúvidas resolvidas por leitura, com arquivos e commit; o que é **reaproveitado** e o que é **novo** em relação ao envio anterior (comparação por blob do Git ou hash do conteúdo; quando o envio anterior não registrou hash, isso é dito); o commit exato; a conexão e o modelo; e o escopo (o que é pedido e o que fica fora).
+
+### Cópia local autorizada (commits não publicados)
+
+O leitor público só vê o que está no GitHub. Se a tarefa fala de código que existe apenas em commits locais não enviados, o executor pode ler **uma cópia local autorizada**, com estas garantias:
+
+- só pastas listadas em `AYLA_LOCAL_REPOS` (caminho absoluto, em `.dev.vars`), autorizadas por você;
+- o `origin` da cópia precisa ser o mesmo repositório da demanda;
+- o commit precisa **descender** do commit que o Diretor leu (`git merge-base --is-ancestor`);
+- só objetos commitados são lidos (`git ls-tree`, `git show`, `git merge-base`, `git branch -r --contains`), com argumentos estruturados e sem shell; sem checkout, sem `status`, sem `fetch`, sem escrita, e **alterações não commitadas nunca entram**;
+- o registro guarda o nome da pasta (não o caminho completo), se o commit está publicado no GitHub (segundo as referências locais `origin/*`) e a relação com o commit do Diretor.
+
+### Caso real da task-1 (26/09/2026)
+
+- **Execução 87768df8** (revisão 1): commit público `0f6cdf6`, que o Diretor tinha lido. O Arquiteto fez 5 perguntas: onde fica a janela de execução do Diretor, qual o tipo do plano, onde o plano fica em memória, o que `tests/profiles.test.ts` cobre, se há utilitário de download. **As cinco eram técnicas**, mas não podiam ser resolvidas em `0f6cdf6`: a janela (`run-dialog.tsx`, `DirectorPlan`, `use-runs.ts`) só existe nos commits locais `ae8e896`/`c878f7b`, **não publicados** (o GitHub continua em `0f6cdf6`).
+- **Decisões que eram suas**: qual commit ler e se a cópia local poderia ser lida (você escolheu `c878f7b` local); e uma decisão de produto nova que o código de `c878f7b` criou (o `.md` deve mostrar o estado real de cada tarefa e o resumo da análise do Arquiteto).
+- **Revisão 2** (d4ffb0d7): commit `c878f7b` local, as 5 perguntas resolvidas por leitura de 7 arquivos, sua decisão. **Falhou por tempo esgotado**: o executor encerrou o cliente aos 5 min. Não havia progresso registrado nem uso informado (o formato `json` só escreve no fim).
+- **Revisão 3** (3678137a): mesmo conteúdo, preparada e **descartada** por você antes de executar, para investigar a falha.
+- **Revisão 4** (7ddd04b5): contexto reduzido (abaixo), limite de 10 min, progresso em fluxo. **Análise concluída em 206 s**, sem novas perguntas, com recomendação, 12 referências examinadas (11 lidas, 1 inferida), riscos, orientação ao Desenvolvedor e checagens para o QA. Repositório conferido idêntico antes e depois (HEAD, `status` e hash de cada arquivo); nenhuma execução de Desenvolvedor, QA ou Revisor.
+
 ### Contexto do Arquiteto e suas reduções
 
 - **Mesmo repositório e mesmo commit** que o Diretor leu (o executor não relê a branch; o commit fica registrado).
 - **O que vai com conteúdo**: arquivos e pastas citados na tarefa, o manifesto (`package.json` etc.) e arquivos cujo nome combina com termos da tarefa. Os termos em português são ligados às palavras que o código costuma usar em inglês por um dicionário pequeno e fixo (`janela → dialog`, `tipos → types`, `contrato → contract`…); o nome do arquivo pesa mais que a pasta, pastas genéricas (`components`, `lib`, `src`…) não contam e primitivas `components/ui/` perdem prioridade. É uma heurística por caminho: ela não lê conteúdo para decidir.
 - **O que vai só como caminho**: a lista dos arquivos de texto do repositório (até 300) e os arquivos que o Diretor leu mas que não foram escolhidos, para o Arquiteto saber o que existe e o que não leu.
 - **O que não vai**: as demais tarefas em detalhe, a resposta completa do Diretor e a conversa. Vai um resumo verificável do plano (objetivo, fluxo, etapa, riscos, suposições, não verificado) e, para tarefas dependentes, o resumo da recomendação da análise anterior.
-- **Limites** (`ARCHITECT_GITHUB_LIMITS`): até 10 arquivos, 16.000 caracteres por arquivo, 56.000 no total, 20 s de leitura. Se a estimativa passar de 60% do orçamento da ficha, o executor retira primeiro os arquivos **menos relevantes** (fim da ordem de seleção) e registra cada remoção. Limite dessa redução: um arquivo retirado não chega ao Arquiteto, e ele só sabe o caminho.
+- **Limites** (`ARCHITECT_GITHUB_LIMITS`): até 10 arquivos, 16.000 caracteres por arquivo, 56.000 no total, 20 s de leitura. Se a estimativa passar de 60% do orçamento da ficha, o executor retira primeiro os arquivos **menos relevantes** (fim da ordem de seleção) e registra cada remoção; arquivos pedidos para resolver uma pergunta **nunca** são retirados. O texto e a lista de arquivos lidos mudam sempre juntos. Limite dessa redução: um arquivo retirado não chega ao Arquiteto, e ele só sabe o caminho.
+- **Trechos verificáveis** (arquivos acima de 7.000 caracteres): lista das declarações de nível superior com linhas; imports (até 1.200 caracteres); os blocos dos símbolos pedidos (`#Símbolo`) e os tipos que eles referenciam (um nível); para um símbolo que não é declaração de nível superior (por exemplo, uma função dentro de um componente), uma janela de linhas ao redor dele, com janelas sobrepostas fundidas; em arquivos de teste, os títulos de `describe`/`it` com a linha. Cada trecho diz as linhas e o commit. Sem símbolos pedidos, os termos da tarefa só casam com o **nome** das declarações.
+- **Em um novo envio com arquivos pedidos**, a heurística por nome de arquivo e o manifesto não entram: só os arquivos pedidos e os citados na tarefa.
+- **Resumo do plano**: até 4 itens por lista (riscos, suposições, não verificado), cada um cortado em 220 caracteres, com a contagem do que ficou de fora e o ID do plano.
+- **Análise anterior**: só uma referência e o entendimento resumido; a recomendação provisória só é reenviada se o commit não mudou (feita sobre outro commit, levaria a uma conclusão desatualizada).
+- **Resposta**: o protocolo pede concisão (até 12 itens em `examined`, 8 nas demais listas; referenciar em vez de copiar código).
 
 ### Somente leitura, garantido pela configuração
 
@@ -130,7 +171,34 @@ Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada ped
 
 - O **orçamento de tokens da ficha** é **referência e alerta** do Setor IA, não um limite rígido: o cliente não pode ser interrompido no meio da resposta. Antes da chamada, o executor estima o texto que vai enviar (caracteres ÷ 3,5); para o Diretor, não chama se só esse texto já passar do orçamento; para o Arquiteto, mostra o alerta na revisão e você decide. Depois compara com o uso **informado pelo cliente** e marca “acima da referência” quando passar. Nas execuções reais, o uso informado passou do orçamento: 39.328 contra 16.000 no Diretor (Claude) e 65.467 contra 24.000 no Arquiteto. A maior parte é cache de entrada e raciocínio do próprio cliente. O orçamento padrão do Diretor (16.000) **não** foi alterado.
 - Os **limites da assinatura** (janelas de uso do Claude, limites do ChatGPT Business compartilhados com o ChatGPT Work) são controlados por Anthropic e OpenAI. Os clientes não informam o saldo restante ao Setor IA, que por isso não mostra saldo nem promete teto. Quando o limite é atingido, o cliente avisa e a execução mostra o erro “limite de uso da assinatura”.
-- Uso exibido (aba Tokens): entrada sem cache, cache lido, cache gravado, saída (com o raciocínio incluído) e total, por chamada, com a **fonte da medição** (Claude Code: `modelUsage` da saída JSON; Codex: `turn.completed.usage` do `--json`). Categoria que o cliente não informou aparece como **indisponível**, nunca como 0 nem como estimativa. No Codex, `input_tokens` inclui o cache; o executor separa as duas partes para não contar em dobro. Registros anteriores a esta versão aparecem como foram gravados e marcados como “registro anterior à identificação da fonte”. O Codex não informa o modelo usado. O `total_cost_usd` do Claude Code é uma estimativa de preço de API e **não** é mostrado como cobrança.
+- **Progresso em fluxo**: o Claude Code roda com `--output-format stream-json --verbose`. O executor registra como eventos o início da sessão (modelo), cada repetição de requisição feita pelo cliente (`system/api_retry`, com erro, tentativa e espera) e as mensagens do modelo (tipos de conteúdo, no máximo um evento a cada 20 s). Se a chamada for encerrada (tempo esgotado, cancelamento, saída grande demais), o erro guarda o último evento, o fim do stderr e o **uso parcial** das mensagens recebidas, marcado como **limite inferior**: na execução real, o uso dentro das mensagens em fluxo apareceu como 3 e 5 tokens de saída, e o valor final (20.701) só veio no resultado.
+- **Limites que os clientes oferecem** (verificado em `claude --help`, `codex exec --help` e na documentação do Claude Code): `--effort` (profundidade do raciocínio; não é teto); `--max-budget-usd` (teto em dólar **estimado**, só com `--print`, verificado entre turnos, não em tokens); `MAX_THINKING_TOKENS` (a documentação diz que é ignorado em modelos com raciocínio adaptativo). O Codex `exec` não expõe limite de tokens. **Nenhum desses é um teto rígido de tokens**, e o Setor IA não aplica nenhum deles. O único limite rígido aplicado é o tempo por chamada (`AYLA_CALL_TIMEOUT_MS`), que encerra o processo.
+- Uso exibido (aba Tokens): entrada sem cache, cache lido, cache gravado, saída (com o raciocínio incluído) e total, por chamada, com a **fonte da medição** (Claude Code: `modelUsage` do evento `result`; Codex: `turn.completed.usage` do `--json`), turnos informados e, quando o cliente informa, o detalhe por requisição (Claude Code: `usage.iterations`). Na execução real, o Claude Code informou 3 turnos e detalhou só 1 requisição; o painel diz isso e não soma o detalhe como total. Categoria que o cliente não informou aparece como **indisponível**, nunca como 0 nem como estimativa. No Codex, `input_tokens` inclui o cache; o executor separa as duas partes para não contar em dobro. Registros anteriores a esta versão aparecem como foram gravados e marcados como “registro anterior à identificação da fonte”. O Codex não informa o modelo usado. O `total_cost_usd` do Claude Code é uma estimativa de preço de API e **não** é mostrado como cobrança.
+
+### Diagnóstico de consumo da task-1 (medido)
+
+`pnpm diagnose:run <id>` mostra, para uma execução registrada, o texto montado pelo Setor IA por seção (em **caracteres**, a partir da entrada congelada) ao lado do que o cliente informou (em **tokens**, por categoria).
+
+| | Revisão 1 (87768df8) | Revisão 4 (7ddd04b5) |
+|---|---|---|
+| Commit / fonte | `0f6cdf6` · GitHub | `c878f7b` · cópia local |
+| Texto montado pelo Setor IA | 40.699 car. (4 arquivos inteiros: 27.094) | 48.012 car. (6 trechos: 27.961) |
+| Estimativa antes da chamada | ≈ 11.629 tokens | ≈ 13.718 tokens |
+| Entrada / cache lido / cache gravado | 4 / 18.251 / 29.436 | 4 / 21.850 / 37.578 |
+| Saída (raciocínio incluído) | 17.776 (4.184) | 20.701 (10.494) |
+| Turnos / detalhe por requisição | indisponível / indisponível | 3 / 1 de 3 |
+| Total informado | 65.467 | 80.133 |
+| Duração | 171 s | 206 s |
+| Resposta devolvida | 16.038 car. | 11.539 car. |
+
+O que **não** pode ser atribuído ao nosso texto:
+
+- o cliente acrescenta contexto próprio (a definição da ferramenta de saída estruturada com o esquema, instruções internas) e informa só totais por categoria;
+- **cache gravado e cache lido são a mesma entrada contada em requisições diferentes** (cada turno relê o prefixo); somá-los ao total não significa texto novo enviado;
+- a saída inclui o raciocínio e, pelo progresso em fluxo da revisão 4, **duas emissões da ferramenta de saída estruturada** (duas mensagens `tool_use`, com dois retornos): o JSON foi gerado mais de uma vez pelo mecanismo do cliente;
+- não existe tokenizador oficial local sem chave de API, então os caracteres de cada seção não viram tokens.
+
+Reduções feitas depois da falha da revisão 2 (de 61.461 para 48.012 caracteres, −22%): trechos por símbolo em vez de funções inteiras (`use-runs.ts` de 7.873 para 2.532 caracteres; `plan-schema.ts` saiu), janelas sobrepostas fundidas (antes as linhas 72–103 de `use-runs.ts` iam duas vezes), imports limitados, só tipos como referências automáticas, análise anterior como referência, resumo do plano mais curto. **O orçamento de referência de 24.000 do Arquiteto não foi alterado**; o uso informado continua acima dele, e isso aparece como alerta.
 
 ## Modelos e esforço
 
@@ -157,13 +225,14 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 
 - `pnpm test`: encaminhamento ao Arquiteto (tarefa elegível, sem Arquiteto, adulterada, sem aprovação, hash diferente, cliques repetidos, dependências, esclarecimento, cliente desconectado, erro, cancelamento, “lido” só para arquivos enviados, pasta de trabalho vazia, argumentos de somente leitura, migração com linhas antigas intactas, persistência e reinício, categorias de uso indisponíveis, seleção e redução de contexto), pipeline do Diretor, validação do plano, composição da entrada, GitHub, registro durável (inclusive reabrindo o arquivo), cliques repetidos, cancelamento, limites, estados de conexão, adaptadores com saídas reais gravadas dos clientes, detecção, execução de processos (real, com `node`) e proteção HTTP (servidor real em 127.0.0.1). Nesses testes, os clientes oficiais são **simulados**.
 - A execução real com cada cliente é feita pela interface ou pela API local, com o executor em execução; os resultados ficam no registro com o cliente e o uso informados.
-- `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente).
+- `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente). `pnpm diagnose:run <id>`: composição e uso de uma execução registrada (só leitura do banco).
+- Esclarecimento e revisão (simulados): respostas ligadas às perguntas certas, perguntas inventadas/duplicadas/sem resposta recusadas, resposta sua e leitura identificadas, envio anterior intacto (comparação byte a byte do registro), cliques repetidos no novo envio e na confirmação, repetição de pergunta recusada salvo contradição, troca de commit exige motivo e gera revisão, tempo esgotado com limite explícito e revisão seguinte, cópia local com **Git real** em pasta temporária (commit descendente, alteração não commitada ignorada, cópia não modificada, pasta não autorizada, commit fora da história e origem diferente recusados), trechos e janelas, composição que soma exatamente o texto montado, fluxo do Claude Code com repetição de API e uso parcial.
 
 ## Próximo passo: Desenvolvedor
 
 O Desenvolvedor precisa **escrever**, e isso não cabe no modelo de somente leitura do Arquiteto. Desenho proposto, a implementar na próxima etapa:
 
-1. **Entrada**: tarefa do Desenvolvedor no plano + análises concluídas do Arquiteto das quais ela depende (já registradas e vinculadas por `parent_run_id`/`task_id`), com a mesma revisão e aprovação explícitas.
+1. **Entrada**: tarefa do Desenvolvedor no plano + análises concluídas do Arquiteto das quais ela depende (já registradas e vinculadas por `parent_run_id`/`task_id`), com a mesma revisão e aprovação explícitas. No plano 92788815, a `task-3` do Desenvolvedor depende de `task-2` (Arquiteto, ainda proposta), que depende de `task-1` (análise concluída na revisão 4). A análise da `task-1` já está pronta para servir de insumo; a `task-2` precisa ser enviada ao Arquiteto antes. O commit de trabalho deve ser o mesmo da análise (`c878f7b`) ou um descendente registrado como nova revisão.
 2. **Cópia de trabalho isolada**: clone raso do repositório no commit registrado, numa pasta temporária do executor, em branch própria e sem credencial de push. O projeto original do usuário não é tocado.
 3. **Permissões por execução**: Claude Code com `Read,Edit,Write` e um conjunto fechado de comandos (`--allowedTools`), ou Codex com `--sandbox workspace-write` restrito à cópia, sem rede; timeout e limite de saída.
 4. **Resultado**: diff, lista de arquivos alterados e saída real dos comandos de verificação, para o QA; nada é publicado, enviado por push nem mesclado sem uma aprovação separada sua.

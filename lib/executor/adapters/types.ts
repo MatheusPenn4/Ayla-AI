@@ -16,7 +16,11 @@ export type AgentCall = {
   signal?: AbortSignal;
   /** Empty working directory owned by this call (no project files). */
   workDir: string;
+  /** Progress reported by the client while it runs (streaming clients only). */
+  onProgress?: (p: AgentProgress) => void;
 };
+
+export type AgentProgress = { kind: "started" | "api_retry" | "model_output" | "turn" | "client_error"; message: string; data?: unknown };
 
 export type AgentReply = {
   /** Parsed structured answer (null when the client returned no JSON). */
@@ -33,6 +37,8 @@ export type AgentErrorCode =
   | "timeout" | "canceled" | "connection_lost" | "client_error" | "invalid_output" | "output_too_large";
 
 export class AgentError extends Error {
+  /** Usage the client reported before failing (may be partial). */
+  usage?: CallUsage | null;
   constructor(public code: AgentErrorCode, message: string, public retryable: boolean, public detail?: string) { super(message); }
 }
 

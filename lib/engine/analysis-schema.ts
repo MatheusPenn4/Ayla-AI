@@ -54,10 +54,21 @@ export function refPath(ref: string) {
   return ref.trim().replace(/^`|`$/g, "").split(/[#\s(]|:(?=\d|[A-Za-z_]\w*$)/)[0].replace(/\/$/, "");
 }
 
+const words = (t: string) => new Set(t.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_./-]+/).filter(w => w.length >= 4));
+/** Word overlap (Jaccard) between two questions: 1 = same words. */
+export function questionSimilarity(a: string, b: string) {
+  const A = words(a), B = words(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
 /**
  * @param readPaths files whose content the executor actually sent to the Architect.
+ * @param answered questions already resolved (by the user or by reading); repeating one is refused unless a contradiction is stated.
  */
-export function validateAnalysis(raw: unknown, readPaths: string[]): AnalysisValidation {
+export function validateAnalysis(raw: unknown, readPaths: string[], answered: string[] = []): AnalysisValidation {
   const parsed = AnalysisZ.safeParse(raw);
   if (!parsed.success) return { ok: false, errors: parsed.error.issues.slice(0, 12).map(i => `${i.path.join(".") || "(raiz)"}: ${i.message}`) };
   const a = parsed.data as ArchitectAnalysis;
@@ -67,6 +78,10 @@ export function validateAnalysis(raw: unknown, readPaths: string[]): AnalysisVal
     if (e.basis !== "read") continue;
     const p = refPath(e.ref);
     if (!read.has(p)) errors.push(`examined "${e.ref}": marcado como lido, mas o conteúdo desse arquivo não foi enviado nesta execução. Use basis = "inferred" ou remova.`);
+  }
+  for (const q of a.questions) {
+    const same = answered.find(x => questionSimilarity(x, q.question) >= 0.5);
+    if (same && !/^contradi[cç][aã]o\s*:/i.test(q.why_it_blocks.trim())) errors.push(`A pergunta "${q.question.slice(0, 120)}" repete uma dúvida já resolvida em <esclarecimentos>. Use a resposta dada; só repita se houver contradição nova, começando why_it_blocks com "Contradição:".`);
   }
   if (a.outcome === "needs_clarification" && !a.questions.length) errors.push("outcome = needs_clarification exige pelo menos uma pergunta.");
   if (a.outcome === "analysis_ready") {

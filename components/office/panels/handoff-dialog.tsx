@@ -6,9 +6,9 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import type { useRuns } from "@/hooks/use-runs";
 import { toTeamInput } from "@/lib/engine/client";
 import { CONNECTION_STATE_LABEL, connectionLabel } from "@/lib/engine/connections";
-import type { ArchitectSnapshot } from "@/lib/engine/types";
+import type { ArchitectSnapshot, ConsultedFile, RunDetail } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
-import { useRunDetail } from "./run-dialog";
+import { RevisionInfo, useRunDetail } from "./run-dialog";
 
 type RunsApi = ReturnType<typeof useRuns>;
 const fmt = (n: number) => n.toLocaleString("pt-BR");
@@ -34,8 +34,22 @@ export function HandoffDialog({ runId, agents, runs, onClose, onApproved }: {
   );
 }
 
+/** Same content as in the previous hand-off? Compared by Git blob id, content hash, or same commit + path. */
+function compareFile(f: ConsultedFile, commit: string, prev: RunDetail | null): { label: string; cls: string } {
+  const pc = prev?.context?.kind === "github" ? prev.context : null;
+  if (!pc) return { label: "novo (sem envio anterior)", cls: "new" };
+  const old = pc.files.find(x => x.path === f.path);
+  if (!old) return { label: "novo neste envio", cls: "new" };
+  if (old.blob && f.blob) return old.blob === f.blob ? { label: "reaproveitado: mesmo conteúdo do envio anterior (mesmo blob)", cls: "same" } : { label: "atualizado: conteúdo diferente do envio anterior", cls: "changed" };
+  if (old.sha256 && f.sha256) return old.sha256 === f.sha256 ? { label: "reaproveitado: mesmo conteúdo do envio anterior", cls: "same" } : { label: "atualizado: conteúdo diferente do envio anterior", cls: "changed" };
+  if (pc.commit === commit) return { label: "reaproveitado: mesmo arquivo e commit do envio anterior", cls: "same" };
+  return { label: `enviado antes no commit ${pc.commit.slice(0, 12)}; relido no novo commit (o envio anterior não registrou hash para comparar)`, cls: "changed" };
+}
+
 function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; agents: Agent[]; runs: RunsApi; onClose: () => void; onApproved: (runId: string) => void }) {
   const { run, error } = useRunDetail(runId);
+  const prevId = run ? (run.snapshot as ArchitectSnapshot).revision?.previousRunId ?? null : null;
+  const { run: prev } = useRunDetail(prevId);
   const [busy, setBusy] = useState<"" | "approve" | "discard" | "verify">("");
   const [msg, setMsg] = useState<string | null>(null);
   if (!run) return <div className="run-loading">{error ?? <><Loader2 size={16} className="spin" /> Carregando o envio preparado…</>}</div>;
@@ -93,6 +107,13 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
           {snap.plan.directorFiles.length ? <><small>Commit <code>{snap.plan.directorCommit?.slice(0, 12)}</code></small><ul className="ctx-skip">{snap.plan.directorFiles.map(f => <li key={f.path}>{f.path} · {fmt(f.bytes)} B{f.truncated ? " (lido em parte)" : ""}</li>)}</ul></> : <p className="muted">O Diretor não leu arquivos do repositório nesta demanda.</p>}
         </section>
 
+        {(snap.revision?.number ?? 1) > 1 && (
+          <section className={`run-sec ${snap.revision?.changedCommit ? "rev-changed" : ""}`}><h4>Revisão {snap.revision?.number}: o que muda em relação ao envio anterior</h4>
+            <RevisionInfo snap={snap} />
+            {prev?.analysis && <small>Da análise anterior ({prev.id.slice(0, 8)}) vão só um resumo do entendimento e a recomendação provisória; a resposta completa não é reenviada.</small>}
+          </section>
+        )}
+
         <section className="run-sec"><h4>4. Contexto que será entregue ao Arquiteto</h4>
           <ul>
             <li>Demanda (título, descrição e critérios) e esta tarefa completa.</li>
@@ -104,9 +125,14 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
           </ul>
           {ctx?.kind === "github" && (
             <>
-              <small>Repositório público {ctx.owner}/{ctx.repo}, commit <code>{ctx.commit.slice(0, 12)}</code> (o mesmo do Diretor). Conteúdo enviado de {files.length} arquivo(s):</small>
-              <table className="ctx-table"><thead><tr><th>Arquivo</th><th>Motivo</th><th>Enviado</th></tr></thead>
-                <tbody>{files.map(f => <tr key={f.path}><td><FileText size={12} /> {f.path}</td><td>{f.reason}</td><td>{fmt(f.sentChars)} car.{f.truncated ? " (truncado)" : ""}</td></tr>)}</tbody>
+              <small>
+                {ctx.via === "local_git"
+                  ? <>Commit exato: <code>{ctx.commit}</code>, lido da <b>cópia local autorizada</b> “{ctx.local?.dirName}” ({ctx.local?.published ? "publicado no GitHub" : "não publicado no GitHub"}; {ctx.local?.isDescendant ? `descende do commit ${ctx.local.descendantOf?.slice(0, 12)} do Diretor` : "relação com o commit do Diretor não confirmada"}).</>
+                  : <>Commit exato: <code>{ctx.commit}</code> do repositório público {ctx.owner}/{ctx.repo}{snap.plan.directorCommit === ctx.commit ? " (o mesmo do Diretor)" : ""}.</>}
+                {" "}Conteúdo enviado de {files.length} arquivo(s):
+              </small>
+              <table className="ctx-table"><thead><tr><th>Arquivo</th><th>Motivo</th><th>Enviado</th><th>Em relação ao envio anterior</th></tr></thead>
+                <tbody>{files.map(f => { const c = compareFile(f, ctx.commit, prev); return <tr key={f.path}><td><FileText size={12} /> {f.path}</td><td>{f.reason}</td><td>{fmt(f.sentChars)} car.{f.excerpt ? ` (trecho: ${f.excerpt.ranges.map(([a, b]) => `l.${a}-${b}`).join(", ")} de ${f.excerpt.totalLines})` : f.truncated ? " (truncado)" : ""}</td><td><span className={`cmp-${c.cls}`}>{c.label}</span></td></tr>; })}</tbody>
               </table>
               {!!notResent.length && <small>Lidos pelo Diretor e não reenviados (só o caminho vai): {notResent.map(f => f.path).join(", ")}.</small>}
               {!!ctx.skipped.length && <small> Não lidos por limite: {ctx.skipped.map(s => s.path).join(", ")}.</small>}

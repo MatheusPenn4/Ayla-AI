@@ -79,7 +79,15 @@ export type TeamMemberInput = {
 
 export type RunEvent = { seq: number; at: string; kind: string; message: string; data?: unknown };
 
-export type ConsultedFile = { path: string; bytes: number; sentChars: number; truncated: boolean; reason: string };
+export type ConsultedFile = {
+  path: string; bytes: number; sentChars: number; truncated: boolean; reason: string;
+  /** Git blob id of the file at the commit (identical id = identical content). */
+  blob?: string | null;
+  /** SHA-256 of the full file content read (lets two runs be compared without storing the file). */
+  sha256?: string;
+  /** Large file sent as outline + blocks: which lines of the committed file were sent. */
+  excerpt?: { ranges: [number, number][]; totalLines: number; symbols: string[] };
+};
 
 export type SourceContext =
   | { kind: "none"; note: string }
@@ -100,6 +108,10 @@ export type SourceContext =
       skipped: { path: string; reason: string }[];
       limits: { maxFiles: number; maxFileBytes: number; maxTotalChars: number; timeoutMs: number };
       elapsedMs: number;
+      /** Where the content came from: the public GitHub API (default) or an authorized local Git clone. */
+      via?: "github" | "local_git";
+      /** Local Git reads only: folder name, whether the commit is published on GitHub (per local origin refs), ancestry. */
+      local?: { dirName: string; published: boolean; descendantOf: string | null; isDescendant: boolean | null };
     };
 
 export type PlanQuestion = { question: string; why_it_blocks: string };
@@ -148,6 +160,12 @@ export type CallUsage = {
   model: string | null;
   /** Where the numbers come from (client + field). */
   source?: string;
+  /** Per model request, when the client reports it (Claude Code: usage.iterations; Codex: one turn.completed per turn). */
+  apiCalls?: { inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null }[];
+  /** Agent turns the client says it used (Claude Code: num_turns). */
+  turns?: number | null;
+  /** Wall time reported by the client (Claude Code: duration_ms). */
+  durationMs?: number | null;
 };
 
 /** Sum of the categories the client reported (input + cache + output); null when none was reported. */
@@ -208,6 +226,30 @@ export type PlanExcerpt = {
   /** Files the Director really read (paths, sizes) at the pinned commit. */
   directorFiles: { path: string; bytes: number; truncated: boolean }[];
   directorCommit: string | null;
+  /** Items of the plan not repeated here (the full plan stays in the Director run). */
+  omitted?: { risks: number; assumptions: number; not_verified: number };
+};
+
+/** How one of the Architect's earlier questions was resolved before a new hand-off. */
+export type Clarification = {
+  question: string;
+  /** Hand-off run that asked it. */
+  askedIn: string;
+  resolution:
+    | { by: "user"; answer: string }
+    | { by: "reading"; requested: string[]; readFiles: string[]; missing: string[]; commit: string };
+};
+
+/** Why and how this hand-off differs from the previous one of the same task. */
+export type ContextRevision = {
+  number: number;
+  previousRunId: string | null;
+  previousCommit: string | null;
+  previousVia: "github" | "local_git" | null;
+  commit: string | null;
+  via: "github" | "local_git" | null;
+  changedCommit: boolean;
+  reason: string;
 };
 
 export type DirectorSnapshot = {
@@ -228,7 +270,18 @@ export type ArchitectSnapshot = {
   plan: PlanExcerpt;
   /** What this execution may do, as enforced by the executor (not a request to the model). */
   tools: { label: string; allowed: boolean; how: string }[];
+  /** Legacy (first release): answers without the question-by-question record. */
   answers: StartRunRequest["answers"] | null;
+  /** Revision of the context (commit/source), linked to the previous hand-off of the task. */
+  revision?: ContextRevision;
+  /** Earlier questions and how each was resolved (the user's answers are marked as the user's). */
+  clarifications?: Clarification[];
+  /** Extra decisions stated by the user for this hand-off. */
+  decisions?: { topic: string; answer: string }[];
+  /** Summary of the previous analysis of this task (reused, not re-derived). */
+  previousAnalysis?: { runId: string; commit: string | null; understanding: string; provisional: string } | null;
+  /** What is asked and what stays out of scope (shown before approval and sent to the Architect). */
+  scope?: { asked: string[]; outOfScope: string[] };
 };
 
 export type RunError = {
@@ -320,4 +373,6 @@ export type EngineStatus = {
   handoffTargets: string[];
   /** Whether each adapter can be restricted to read-only work (required for the Architect). */
   readOnly: Partial<Record<ConnectionId, { safe: boolean; how: string }>>;
+  /** Local Git clones the user authorized for read-only reading (AYLA_LOCAL_REPOS). No full paths. */
+  localRepos?: { dirName: string; owner: string; repo: string; head: string; headSubject: string }[];
 };

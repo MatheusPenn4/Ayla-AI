@@ -1,19 +1,26 @@
 // Hand-off of ONE task of a Director plan to the Architect, in two steps:
 // 1. prepare: the executor checks everything against its own records (the
-//    browser only names the plan run and the task id, and sends the
-//    Architect's saved sheet), reads the sources, builds the exact prompt and
-//    stores it frozen as a run in "awaiting_approval". Nothing runs.
+//    browser only names the plan run and the task id, sends the Architect's
+//    saved sheet and, for a follow-up, how each earlier question was resolved
+//    and which source/commit to read), reads the sources, builds the exact
+//    prompt and stores it frozen as a run in "awaiting_approval". Nothing runs.
 // 2. approve: the user confirms that exact prompt (by its hash); only then the
 //    run is queued. See service.ts.
+// Earlier hand-offs are never modified: a follow-up is a new run linked by
+// previous_run_id, with an explicit context revision (commit and source).
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { buildArchitectMessage, buildArchitectSystem } from "@/lib/engine/architect-prompt";
 import { ANALYSIS_JSON_SCHEMA } from "@/lib/engine/analysis-schema";
-import { HANDOFF_TARGETS, type ArchitectSnapshot, type DirectorSnapshot, type PlanExcerpt, type RunBudget, type RunRecord, type SourceContext, type TeamMemberInput } from "@/lib/engine/types";
-import { ARCHITECT_GITHUB_LIMITS, GithubError, extractPathMentions, readGithubContext, shrinkGithubText } from "./github";
+import { HANDOFF_TARGETS, type ArchitectSnapshot, type Clarification, type ContextRevision, type DirectorSnapshot, type PlanExcerpt, type RunBudget, type RunRecord, type SourceContext, type TeamMemberInput } from "@/lib/engine/types";
+import { ARCHITECT_GITHUB_LIMITS, GithubError, extractPathMentions, readGithubContext, shrinkGithubText, type RequestedFile } from "./github";
+import { listLocalRepos, readLocalGitContext, type GitDeps } from "./local-git";
 import { estimateTokens } from "./planner";
 import { MemberZ } from "./runs-service";
 import type { NewRun, RunStore } from "./store";
+
+const hex40 = z.string().regex(/^[0-9a-f]{40}$/, "commit deve ter 40 caracteres hexadecimais");
+const fileRef = z.string().max(240).regex(/^[A-Za-z0-9_.@\[\]/-]+(#[A-Za-z0-9_$]+)?$/, "use caminho ou caminho#Símbolo").refine(v => !v.includes(".."), "caminho inválido");
 
 export const HandoffZ = z.object({
   idempotencyKey: z.string().regex(/^[A-Za-z0-9:_-]{8,120}$/),
@@ -22,7 +29,16 @@ export const HandoffZ = z.object({
   /** The Architect's saved sheet (configuration only; it cannot change who runs or what task). */
   agent: MemberZ,
   previousRunId: z.string().uuid().optional(),
-  answers: z.array(z.object({ question: z.string().max(2000), answer: z.string().min(1).max(4000) })).max(10).optional(),
+  /** The user's own answers, question by question (question text must match the earlier run exactly). */
+  answers: z.array(z.object({ question: z.string().max(2000), answer: z.string().trim().min(1).max(4000) })).max(10).optional(),
+  /** Questions to resolve by reading files of the repository (the Architect answers from the content). */
+  technical: z.array(z.object({ question: z.string().max(2000), files: z.array(fileRef).min(1).max(4) })).max(10).optional(),
+  /** Extra decisions the user states for this hand-off. */
+  decisions: z.array(z.object({ topic: z.string().trim().min(1).max(300), answer: z.string().trim().min(1).max(2000) })).max(5).optional(),
+  /** Source to read. Default: the same GitHub commit the Director read. */
+  source: z.object({ via: z.enum(["github", "local_git"]), commit: hex40 }).optional(),
+  /** Required when the source/commit differs from the previous hand-off of the task. */
+  revisionReason: z.string().trim().max(500).optional(),
 });
 export type HandoffRequest = z.infer<typeof HandoffZ>;
 
@@ -39,21 +55,26 @@ export function handoffHash(x: { snapshot: ArchitectSnapshot; prompt: { system: 
 }
 
 /** What the executor lets this Architect run do (enforced by client flags and the empty working folder, not by the prompt). */
-export function architectTools(agent: TeamMemberInput, hasRepo: boolean, connection: string): ArchitectSnapshot["tools"] {
+export function architectTools(agent: TeamMemberInput, hasRepo: boolean, connection: string, via: "github" | "local_git" = "github"): ArchitectSnapshot["tools"] {
   const readsRepo = hasRepo && (agent.tools.read !== false || agent.tools.github === true);
   return [
-    { label: "Ler arquivos do repositório", allowed: readsRepo, how: readsRepo ? "Feita pelo executor antes da chamada, só em repositório público, no commit fixo, com limites; o modelo recebe o texto e não acessa o repositório." : hasRepo ? "Desligada: a permissão “Ler arquivos” está desligada na ficha do Arquiteto." : "Sem repositório GitHub na demanda." },
+    { label: "Ler arquivos do repositório", allowed: readsRepo, how: readsRepo ? (via === "local_git" ? "Feita pelo executor antes da chamada, na cópia local autorizada, só com leitura de objetos do Git (commit fixo, sem checkout, sem alterações não commitadas), com limites; o modelo recebe o texto e não acessa a pasta." : "Feita pelo executor antes da chamada, só em repositório público, no commit fixo, com limites; o modelo recebe o texto e não acessa o repositório.") : hasRepo ? "Desligada: a permissão “Ler arquivos” está desligada na ficha do Arquiteto." : "Sem repositório GitHub na demanda." },
     { label: "Editar arquivos", allowed: false, how: connection === "codex" ? "Bloqueada: Codex em sandbox somente leitura, ferramentas de shell desligadas, pasta de trabalho vazia." : "Bloqueada: Claude Code sem ferramentas (--tools \"\"), permissões negadas (dontAsk), pasta de trabalho vazia." },
     { label: "Terminal / comandos", allowed: false, how: "Bloqueado pelo executor, mesmo que esteja planejado na ficha." },
     { label: "Navegador e busca na web", allowed: false, how: "Bloqueados pelo executor." },
-    { label: "Publicar, fazer push ou abrir pull request", allowed: false, how: "Impossível: o repositório nunca é clonado e nenhuma credencial do GitHub é passada ao cliente." },
+    { label: "Publicar, fazer push ou abrir pull request", allowed: false, how: "Impossível: o cliente não recebe o repositório nem credencial do GitHub." },
   ];
 }
 
 export type PrepareDeps = {
   store: RunStore;
   github: { fetch?: typeof fetch; token?: string; apiBase?: string; rawBase?: string };
+  /** Local clones authorized for reading (AYLA_LOCAL_REPOS) and how to run git. */
+  local?: { dirs: string[]; git: GitDeps };
 };
+
+const cap = <T,>(items: T[], n: number) => ({ items: items.slice(0, n), omitted: Math.max(0, items.length - n) });
+const clip = (t: string, n: number) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
 
 /** Validates the hand-off against the executor's records and freezes what will be sent. */
 export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Promise<{ run: RunRecord; created: boolean }> {
@@ -74,8 +95,29 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
   if (open) return { run: open, created: false };
   if (existing.some(r => r.status === "analysis_ready")) refuse(409, "already_done", `A tarefa ${task!.id} já tem uma análise concluída do Arquiteto.`);
   const waiting = existing.find(r => r.status === "awaiting_clarification");
-  if (waiting && (req.previousRunId !== waiting.id || !req.answers?.length)) refuse(409, "awaiting_answers", "O Arquiteto está aguardando suas respostas nesta tarefa. Responda às perguntas da análise para reenviar.");
-  if (req.previousRunId && req.previousRunId !== waiting?.id) refuse(400, "invalid_previous_run", "As respostas não correspondem a uma análise desta tarefa aguardando esclarecimento.");
+  if (req.previousRunId && !existing.some(r => r.id === req.previousRunId)) refuse(400, "invalid_previous_run", "A execução anterior informada não é um envio desta tarefa.");
+  if (waiting && req.previousRunId !== waiting.id) refuse(409, "awaiting_answers", "O Arquiteto está aguardando esclarecimento nesta tarefa. Resolva as perguntas da análise para preparar um novo envio.");
+  const previous = req.previousRunId ? (await store.detail(req.previousRunId))! : existing[0] ? (await store.detail(existing[0].id)) : null;
+
+  // Clarifications: each earlier question resolved exactly once, by the user or by reading.
+  const clarifications: Clarification[] = [];
+  const requested: RequestedFile[] = [];
+  if (waiting) {
+    const asked = waiting.analysis?.questions.map(q => q.question) ?? [];
+    const answers = req.answers ?? [], technical = req.technical ?? [];
+    const unknown = [...answers.map(a => a.question), ...technical.map(t => t.question)].filter(q => !asked.includes(q));
+    if (unknown.length) refuse(400, "unknown_question", "Há respostas para perguntas que o Arquiteto não fez nesta execução.", unknown.map(q => clip(q, 160)));
+    const twice = asked.filter(q => answers.some(a => a.question === q) && technical.some(t => t.question === q));
+    if (twice.length) refuse(400, "question_twice", "Cada pergunta deve ser resolvida de um único jeito (sua resposta ou leitura).", twice.map(q => clip(q, 160)));
+    const missing = asked.filter(q => !answers.some(a => a.question === q) && !technical.some(t => t.question === q));
+    if (missing.length) refuse(400, "unanswered_questions", "Resolva todas as perguntas da análise anterior antes de reenviar.", missing.map(q => clip(q, 160)));
+    asked.forEach((q, i) => {
+      const t = technical.find(x => x.question === q);
+      if (t) for (const f of t.files) requested.push({ ref: f, reason: `pedido para resolver a pergunta ${i + 1} por leitura` });
+    });
+  } else if (req.answers?.length || req.technical?.length) {
+    refuse(400, "nothing_to_answer", "Não há perguntas pendentes do Arquiteto nesta tarefa.");
+  }
 
   // Dependencies: every task this one depends on must be done by someone who can run in this phase.
   const dependsOn: PlanExcerpt["dependsOn"] = [];
@@ -93,36 +135,54 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
   const pSnap = (await store.snapshot(parent!.id)) as DirectorSnapshot;
   const pDetail = (await store.detail(parent!.id))!;
   const directorCtx = pDetail.context;
+  // The plan is summarised, not repeated: at most 6 items per list, with a count of what was left in the Director run.
+  const risks = cap(plan.risks.map(r => clip(r, 220)), 4), assumptions = cap(plan.assumptions.map(r => clip(r, 220)), 4), notVerified = cap(plan.not_verified.map(r => clip(r, 220)), 4);
   const excerpt: PlanExcerpt = {
     directorRunId: parent!.id, directorConnection: parent!.connection,
     objective_summary: plan.objective_summary, flow: { type: plan.flow.type, rationale: plan.flow.rationale },
     step: plan.steps.find(s => s.id === task!.step_id) ?? null,
     dependsOn,
     dependents: plan.tasks.filter(t => t.depends_on.includes(task!.id)).map(t => ({ id: t.id, title: t.title, assignee: t.assignee })),
-    risks: plan.risks, assumptions: plan.assumptions, not_verified: plan.not_verified,
+    risks: risks.items, assumptions: assumptions.items, not_verified: notVerified.items,
+    omitted: { risks: risks.omitted, assumptions: assumptions.omitted, not_verified: notVerified.omitted },
     directorFiles: directorCtx?.kind === "github" ? directorCtx.files.map(f => ({ path: f.path, bytes: f.bytes, truncated: f.truncated })) : [],
     directorCommit: directorCtx?.kind === "github" ? directorCtx.commit : null,
   };
 
-  // Sources: same repository and commit the Director read, selection driven by the task.
+  // Source and commit: explicit. Default = what the Director read; any change is a recorded revision.
+  const prevCtx = previous?.context?.kind === "github" ? previous.context : null;
+  const prevCommit = prevCtx?.commit ?? excerpt.directorCommit;
+  const prevVia = prevCtx ? (prevCtx.via ?? "github") : directorCtx?.kind === "github" ? "github" : null;
+  const want = req.source ?? (prevCommit ? { via: (prevVia ?? "github") as "github" | "local_git", commit: prevCommit } : undefined);
+  const changedCommit = !!want && !!prevCommit && (want.commit !== prevCommit || want.via !== prevVia);
+  if (changedCommit && !req.revisionReason) refuse(400, "revision_reason_required", "Informe o motivo da troca de commit ou de fonte; ela fica registrada na nova revisão.");
+  if (want && directorCtx?.kind !== "github") refuse(400, "no_repository", "Esta demanda não tem repositório GitHub; não há commit para escolher.");
+
   const agent = req.agent;
   const demand = pSnap.demand;
-  const tools = architectTools(agent, directorCtx?.kind === "github", agent.connection);
+  const tools = architectTools(agent, directorCtx?.kind === "github", agent.connection, want?.via ?? "github");
   let context: SourceContext = directorCtx?.kind === "folder" ? directorCtx : { kind: "none", note: "Demanda sem fonte de projeto." };
   let sourceText = "";
-  if (directorCtx?.kind === "github") {
+  if (directorCtx?.kind === "github" && want) {
     if (!tools[0].allowed) {
       context = { kind: "none", note: "Leitura do repositório desligada na ficha do Arquiteto: nenhum arquivo foi enviado." };
+      if (requested.length) refuse(400, "reading_disabled", "Há perguntas marcadas para resolver por leitura, mas a leitura está desligada na ficha do Arquiteto.");
     } else {
       const taskText = [task!.title, task!.scope, task!.inputs, task!.deliverable, ...task!.acceptance_criteria].join("\n");
+      const keywords = [...new Set(`${taskText}\n${excerpt.step?.title ?? ""}\n${demand.title}\n${(req.decisions ?? []).map(d => d.answer).join(" ")}`.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_-]+/))];
       try {
-        const r = await readGithubContext({
-          owner: directorCtx.owner, repo: directorCtx.repo, branch: directorCtx.branch, commit: directorCtx.commit,
-          keywords: [...new Set(`${taskText}\n${excerpt.step?.title ?? ""}\n${demand.title}`.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_-]+/))],
-          limits: ARCHITECT_GITHUB_LIMITS, selection: "architect", mentions: extractPathMentions(taskText),
-        }, deps.github);
-        context = r.context;
-        sourceText = r.text;
+        if (want.via === "local_git") {
+          if (!deps.local?.dirs.length) refuse(403, "local_not_authorized", "Nenhuma cópia local do repositório está autorizada para leitura (AYLA_LOCAL_REPOS).");
+          const repos = await listLocalRepos(deps.local!.dirs, deps.local!.git);
+          const repo = repos.find(r => r.owner.toLowerCase() === directorCtx.owner.toLowerCase() && r.repo.toLowerCase() === directorCtx.repo.toLowerCase());
+          if (!repo) refuse(403, "local_not_authorized", `Nenhuma cópia local autorizada corresponde a ${directorCtx.owner}/${directorCtx.repo}.`);
+          const r = await readLocalGitContext({ dir: repo!.dir, owner: directorCtx.owner, repo: directorCtx.repo, commit: want.commit, baseCommit: excerpt.directorCommit, keywords, mentions: extractPathMentions(taskText), requested }, deps.local!.git);
+          if (r.context.local?.isDescendant !== true) refuse(409, "commit_not_descendant", `O commit ${want.commit.slice(0, 12)} não descende do commit ${excerpt.directorCommit?.slice(0, 12)} que o Diretor leu; use um commit da mesma história.`);
+          context = r.context; sourceText = r.text;
+        } else {
+          const r = await readGithubContext({ owner: directorCtx.owner, repo: directorCtx.repo, branch: directorCtx.branch, commit: want.commit, keywords, limits: ARCHITECT_GITHUB_LIMITS, selection: "architect", mentions: extractPathMentions(taskText), requested }, deps.github);
+          context = r.context; sourceText = r.text;
+        }
       } catch (err) {
         if (err instanceof GithubError) refuse(502, err.code, err.message);
         throw err;
@@ -130,34 +190,79 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
     }
   }
 
+  // How each earlier question was resolved (the user's answers stay marked as the user's).
+  if (waiting) {
+    const readPaths = context.kind === "github" ? context.files.map(f => f.path) : [];
+    for (const q of waiting.analysis?.questions ?? []) {
+      const a = req.answers?.find(x => x.question === q.question);
+      if (a) { clarifications.push({ question: q.question, askedIn: waiting.id, resolution: { by: "user", answer: a.answer } }); continue; }
+      const t = req.technical!.find(x => x.question === q.question)!;
+      const paths = [...new Set(t.files.map(f => f.split("#")[0]))];
+      clarifications.push({ question: q.question, askedIn: waiting.id, resolution: { by: "reading", requested: t.files, readFiles: paths.filter(p => readPaths.includes(p)), missing: paths.filter(p => !readPaths.includes(p)), commit: context.kind === "github" ? context.commit : "" } });
+    }
+  }
+  // The previous analysis is referenced, not repeated. Its provisional recommendation is only resent when the
+  // commit did not change: made on another commit, it would push the Architect towards an outdated conclusion.
+  const prevAnalysisCommit = waiting?.context?.kind === "github" ? waiting.context.commit : null;
+  const sameCommitAsWaiting = !!prevAnalysisCommit && context.kind === "github" && context.commit === prevAnalysisCommit;
+  const previousAnalysis = waiting?.analysis ? {
+    runId: waiting.id,
+    commit: prevAnalysisCommit,
+    understanding: clip(waiting.analysis.technical_understanding, 300),
+    provisional: sameCommitAsWaiting ? clip(waiting.analysis.recommendation.summary, 600) : "",
+  } : null;
+  const revision: ContextRevision = {
+    // Every earlier attempt of this task counts (a failed or discarded revision keeps its number).
+    number: Math.max(0, ...(await Promise.all(existing.map(async r => ((await store.snapshot(r.id)) as ArchitectSnapshot | null)?.revision?.number ?? 1)))) + 1,
+    previousRunId: previous?.id ?? null, previousCommit: prevCommit ?? null, previousVia: prevVia,
+    commit: context.kind === "github" ? context.commit : null, via: context.kind === "github" ? (context.via ?? "github") : null,
+    changedCommit, reason: req.revisionReason || (waiting ? "Esclarecimento das perguntas da análise anterior." : previous ? "Novo envio após falha ou cancelamento." : "Primeiro envio."),
+  };
+  const others = plan.tasks.filter(t => t.id !== task!.id);
+  const scope = {
+    asked: [`Análise técnica da tarefa ${task!.id} (${task!.title}), com o entregável: ${task!.deliverable}`, "Separar o que foi lido do que foi inferido; orientar o Desenvolvedor; recomendar checagens ao QA."],
+    outOfScope: [
+      "Implementar, editar arquivos, rodar comandos ou testes (nada disso é possível nesta execução).",
+      others.length ? `As demais tarefas do plano (${others.map(t => t.id).join(", ")}), que não são desta análise.` : "Outras tarefas.",
+      "Decisões de produto que você não tomou: registre-as como pergunta, não como decisão.",
+    ],
+  };
+
   const system = buildArchitectSystem(agent);
   const team = pSnap.team;
-  const answers = req.answers?.length ? req.answers : null;
-  let user = buildArchitectMessage({ demand, task: task!, plan: excerpt, team, context, sourceText, answers });
+  const decisions = req.decisions?.length ? req.decisions : [];
+  const build = () => buildArchitectMessage({ demand, task: task!, plan: excerpt, team, context, sourceText, revision, clarifications, decisions, previousAnalysis, scope });
+  let user = build();
   const schemaText = JSON.stringify(ANALYSIS_JSON_SCHEMA);
   let estimate = estimateTokens(system + user + schemaText);
   const budgetTokens = Math.max(0, Math.floor(agent.budget));
-  // Reduce repository text when it would take most of the sheet budget (documented in docs/executor-local.md).
+  // Reduce repository text when it would take most of the sheet budget: least relevant files first,
+  // files requested to resolve a question are the most relevant and go last (documented in docs/executor-local.md).
   for (let i = 0; i < 3 && context.kind === "github" && budgetTokens > 0 && estimate > budgetTokens * 0.6; i++) {
-    const shrunk = shrinkGithubText(context, sourceText, Math.floor(sourceText.length * 0.75), "priority");
+    const protect = new Set(requested.map(r => r.ref.split("#")[0]));
+    const shrunk = shrinkGithubText(context, sourceText, Math.floor(sourceText.length * 0.75), "priority", protect);
+    if (shrunk.ctx.files.length === context.files.length) break;
     context = shrunk.ctx; sourceText = shrunk.text;
-    user = buildArchitectMessage({ demand, task: task!, plan: excerpt, team, context, sourceText, answers });
+    for (const c of clarifications) if (c.resolution.by === "reading") { const kept = context.files.map(f => f.path); c.resolution.missing.push(...c.resolution.readFiles.filter(p => !kept.includes(p))); c.resolution.readFiles = c.resolution.readFiles.filter(p => kept.includes(p)); }
+    user = build();
     estimate = estimateTokens(system + user + schemaText);
   }
 
-  const snapshot: ArchitectSnapshot = { kind: "architect_task", agent, team, demand, task: task!, plan: excerpt, tools, answers };
+  const snapshot: ArchitectSnapshot = { kind: "architect_task", agent, team, demand, task: task!, plan: excerpt, tools, answers: null, revision, clarifications, decisions, previousAnalysis, scope };
   const prompt = { system, user };
   const budget: RunBudget = { sheetTokens: budgetTokens, estimatedInputTokens: estimate, calls: [], reportedTotalTokens: null, exceeded: false };
   const nr: NewRun = {
     id: randomUUID(), kind: "architect_task", demandId: demand.id, agentId: agent.id, idempotencyKey: req.idempotencyKey,
     connection: agent.connection as NewRun["connection"], model: agent.modelName.trim(), effort: agent.effort.trim(),
     snapshotHash: handoffHash({ snapshot, prompt, context, connection: agent.connection, model: agent.modelName.trim(), effort: agent.effort.trim() }),
-    snapshot, budget, previousRunId: req.previousRunId ?? null, parentRunId: parent!.id, taskId: task!.id,
+    snapshot, budget, previousRunId: previous?.id ?? null, parentRunId: parent!.id, taskId: task!.id,
     initialStatus: "awaiting_approval", prompt, context,
   };
   const res = await store.create(nr);
   if (res.created) {
-    await store.event(res.run.id, "prepared", `Tarefa ${task!.id} do plano ${parent!.id.slice(0, 8)} preparada para o Arquiteto: ${context.kind === "github" ? `${context.files.length} arquivo(s) do commit ${context.commit.slice(0, 12)}` : "sem arquivos do repositório"}, cerca de ${estimate} tokens de texto (estimativa).`, { files: context.kind === "github" ? context.files.map(f => f.path) : [] });
+    await store.event(res.run.id, "prepared", `Tarefa ${task!.id} do plano ${parent!.id.slice(0, 8)} preparada para o Arquiteto (revisão ${revision.number}): ${context.kind === "github" ? `${context.files.length} arquivo(s) do commit ${context.commit.slice(0, 12)}${context.via === "local_git" ? " (cópia local)" : ""}` : "sem arquivos do repositório"}, cerca de ${estimate} tokens de texto (estimativa).`, { files: context.kind === "github" ? context.files.map(f => f.path) : [] });
+    if (changedCommit) await store.event(res.run.id, "context_revision", `Revisão de contexto: commit ${prevCommit?.slice(0, 12)} (${prevVia}) → ${want!.commit.slice(0, 12)} (${want!.via}). Motivo: ${revision.reason}. O envio anterior (${previous?.id.slice(0, 8)}) não foi alterado.`);
+    if (clarifications.length) await store.event(res.run.id, "clarifications", `${clarifications.filter(c => c.resolution.by === "user").length} resposta(s) sua(s) e ${clarifications.filter(c => c.resolution.by === "reading").length} dúvida(s) resolvida(s) por leitura, vinculadas às perguntas da execução ${waiting!.id.slice(0, 8)}.`);
     if (budgetTokens > 0 && estimate >= budgetTokens) await store.event(res.run.id, "budget_alert", `Alerta: a estimativa do texto (${estimate}) já passa do orçamento da ficha do Arquiteto (${budgetTokens}). O orçamento é referência; a execução só começa se você confirmar.`);
   }
   return res;

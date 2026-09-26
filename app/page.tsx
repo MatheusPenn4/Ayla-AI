@@ -19,6 +19,7 @@ import { ZONE_LABEL } from "@/lib/office/defaults";
 import { presetUpdate } from "@/lib/office/profile";
 import { CAPACITY, STATION_BY_ID, ZONES } from "@/lib/office/layout";
 import { loadPrefs, savePrefs, serializeOffice, type QualityPref } from "@/lib/office/storage";
+import type { HandoffFollowUp } from "@/lib/engine/client";
 import type { RunDetail } from "@/lib/engine/types";
 import type { Agent, Demand, WorkZoneId, ZoneId } from "@/lib/office/types";
 
@@ -89,7 +90,7 @@ export default function Home() {
     else toast.error(r.error);
   };
   const openReview = (id: string) => { setRunId(null); setHandoffId(id); };
-  const handoff = async (planRunId: string, taskId: string, followUp?: { previousRunId: string; answers: { question: string; answer: string }[] }) => {
+  const handoff = async (planRunId: string, taskId: string, followUp?: HandoffFollowUp) => {
     const r = await runs.prepareHandoff(planRunId, taskId, agents, followUp);
     if (r.ok) openReview(r.run.id);
     else toast.error(r.error, { duration: 9000 });
@@ -284,7 +285,7 @@ export default function Home() {
         runId={runId} agents={agents} runs={runs} onClose={() => setRunId(null)} onOpenRun={setRunId}
         onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)}
         onHandoff={(planRunId, taskId) => void handoff(planRunId, taskId)} onReview={openReview}
-        onAnswerArchitect={(run, answers) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { previousRunId: run.id, answers }); }}
+        onAnswerArchitect={(run, followUp) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { ...followUp, previousRunId: run.id }); }}
       />
       <HandoffDialog
         runId={handoffId} agents={agents} runs={runs} onClose={() => setHandoffId(null)}

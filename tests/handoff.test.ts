@@ -17,6 +17,13 @@ import { buildNewRun, parseStartRequest } from "@/lib/executor/runs-service";
 import { ExecutorService, type ExecutorConfig } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
 import { RunStore } from "@/lib/executor/store";
+import { runProcess } from "@/lib/executor/proc";
+import { excerptFile } from "@/lib/executor/github";
+import { questionSimilarity } from "@/lib/engine/analysis-schema";
+import { promptComposition } from "@/lib/engine/composition";
+import { execFileSync } from "node:child_process";
+import { createHash as hashOf } from "node:crypto";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { connected, fakeAdapter, goodPlan, member, reply, request, usage } from "./helpers";
 
 let work: string;
@@ -61,10 +68,11 @@ const analysis = (over: Partial<ArchitectAnalysis> = {}): ArchitectAnalysis => (
 
 const cfg = (): ExecutorConfig => ({ version: "t", dataDir: work, storePath: ":memory:", workRoot: work, limits: { maxRunsPerHour: 50, maxConcurrentRuns: 1, callTimeoutMs: 1000, leaseMs: 60000, statusCacheMs: 0 }, github: { fetch: ghFetch() } });
 
-function service(steps: Parameters<typeof fakeAdapter>[0] = [], opts: { claude?: "connected" | "disconnected"; s?: RunStore; log?: string[] } = {}) {
+function service(steps: Parameters<typeof fakeAdapter>[0] = [], opts: { claude?: "connected" | "disconnected"; s?: RunStore; log?: string[]; localRepos?: string[] } = {}) {
   const arch = fakeAdapter(steps);
-  const svc = new ExecutorService({ ...cfg(), github: { fetch: ghFetch(opts.log) } }, {
-    store: opts.s ?? store, runner: async () => { throw new Error("nenhum processo real nos testes"); }, env: {},
+  const svc = new ExecutorService({ ...cfg(), github: { fetch: ghFetch(opts.log) }, localRepos: opts.localRepos ?? [] }, {
+    // Only git (local reader) runs as a real process; the official clients are scripted.
+    store: opts.s ?? store, runner: opts.localRepos ? runProcess : async () => { throw new Error("nenhum processo real nos testes"); }, env: opts.localRepos ? process.env : {},
     detectors: { claude_code: async () => connected("claude_code", opts.claude === "disconnected" ? { state: "disconnected", message: "sem login", steps: ["claude auth login --claudeai"] } : {}), codex: async () => connected("codex") },
     adapters: { claude_code: arch.adapter, codex: arch.adapter },
   });
@@ -113,8 +121,8 @@ describe("preparar o envio ao Arquiteto (nada executa)", () => {
     expect(sent).not.toContain("README.md");
     expect(run.context?.kind === "github" && run.context.commit).toBe(COMMIT);
     // Paths of every text file are listed (names only), so the Architect knows what exists and what it did not read.
-    expect(run.prompt?.user).toContain("apenas os caminhos");
-    expect(run.prompt?.user).toContain("lib/outro.ts");
+    expect(run.prompt?.user).toContain("apenas os nomes");
+    expect(run.prompt?.user).toContain("lib/: outro.ts");
     expect(run.context?.kind === "github" && run.context.files.map(f => f.path)).not.toContain("lib/outro.ts");
     await svc.idle();
     expect(calls).toHaveLength(0);
@@ -163,6 +171,9 @@ describe("preparar o envio ao Arquiteto (nada executa)", () => {
     expect(taskState(plan.tasks[0], []).key).toBe("proposed");
     expect(handoffBlocker(plan.tasks[1], plan.tasks, () => [])).toContain("t1");
     expect(handoffBlocker(plan.tasks[3], plan.tasks, () => [])).toContain("ainda não executa");
+    const mk = (id: string, status: RunDetail["status"]) => ({ id, status } as RunDetail);
+    expect(taskState(plan.tasks[0], [mk("r3", "failed"), mk("r1", "awaiting_clarification")])).toMatchObject({ key: "awaiting_clarification", run: { id: "r1" } });
+    expect(taskState(plan.tasks[0], [mk("r4", "awaiting_approval"), mk("r1", "awaiting_clarification")]).key).toBe("awaiting_approval");
   });
 });
 
@@ -386,6 +397,16 @@ describe("redução de contexto por relevância", () => {
     expect(shrinkGithubText(ctx, text, 3050, "priority").ctx.files.map(f => f.path)).toEqual(["a.ts"]);
     expect(shrinkGithubText(ctx, text, 3050, "size").ctx.files.map(f => f.path)).toEqual(["b.ts"]);
   });
+  it("texto e lista de arquivos lidos mudam juntos, também com cabeçalho de trecho; arquivos pedidos nunca saem", () => {
+    const ctx = { kind: "github" as const, owner: "o", repo: "r", branch: "main", commit: COMMIT, visibility: "public" as const, description: null, defaultBranch: "main", treeEntries: 3, treeTruncated: false, structureSample: [],
+      files: [{ path: "pedido.ts", bytes: 3000, sentChars: 3000, truncated: true, reason: "pedido" }, { path: "extra.ts", bytes: 3000, sentChars: 3000, truncated: true, reason: "termo" }], skipped: [], limits: { maxFiles: 1, maxFileBytes: 1, maxTotalChars: 1, timeoutMs: 1 }, elapsedMs: 1 };
+    const text = `lista\n\n--- arquivo: pedido.ts (trecho verificável: l.1-9 de 90 linhas; commit c) ---\n${"a".repeat(3000)}\n\n--- arquivo: extra.ts (trecho verificável: l.1-9 de 90 linhas; commit c) ---\n${"b".repeat(3000)}`;
+    const r = shrinkGithubText(ctx, text, 100, "priority", new Set(["pedido.ts"]));
+    expect(r.ctx.files.map(f => f.path)).toEqual(["pedido.ts"]);
+    expect(r.text).toContain("aaaa");
+    expect(r.text).not.toContain("bbbb");
+    expect(r.ctx.skipped).toEqual([expect.objectContaining({ path: "extra.ts" })]);
+  });
 });
 
 describe("seleção de arquivos citados na tarefa", () => {
@@ -407,5 +428,241 @@ describe("seleção de arquivos citados na tarefa", () => {
   it("extrai caminhos e pastas citados, sem URLs nem subidas de diretório", () => {
     expect(extractPathMentions("Ler components/office/ e lib/office/types.ts. Ver README.md e https://x.com/a/b e ../etc/passwd")).toEqual(expect.arrayContaining(["components/office/", "lib/office/types.ts", "README.md"]));
     expect(extractPathMentions("../etc/passwd https://x.com/a/b")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clarification, context revision and local Git source
+// ---------------------------------------------------------------------------
+
+const QUESTIONS = [
+  { question: "Qual arquivo implementa a janela de execução do Diretor?", why_it_blocks: "Sem ele não há ponto de inserção." },
+  { question: "O arquivo .md deve incluir o estado dos encaminhamentos?", why_it_blocks: "Decisão de produto." },
+];
+const clarify = (over: Partial<ArchitectAnalysis> = {}) => analysis({ outcome: "needs_clarification", recommendation: { summary: "Provisória: usar Blob.", rationale: "" }, developer_guidance: [], qa_checks: [], questions: QUESTIONS, ...over });
+
+async function waitingRun(svc: ExecutorService, plan: string) {
+  const first = body<{ run: RunDetail }>(await svc.prepare(handoffReq(plan))).run;
+  await svc.approve(first.id, { snapshotHash: first.snapshotHash });
+  await svc.idle();
+  return (await store.detail(first.id))!;
+}
+
+describe("esclarecimento pergunta a pergunta", () => {
+  it("respostas precisam corresponder às perguntas da execução certa, uma vez cada, todas resolvidas", async () => {
+    const { svc } = service([reply(clarify())]);
+    const plan = await directorPlan();
+    const w = await waitingRun(svc, plan);
+    expect(w.status).toBe("awaiting_clarification");
+    const code = async (over: object) => body<{ error: { code: string } }>(await svc.prepare(handoffReq(plan, "t1", { previousRunId: w.id, ...over }))).error.code;
+    expect(await code({ answers: [{ question: "Pergunta inventada?", answer: "x" }] })).toBe("unknown_question");
+    expect(await code({ answers: [{ question: QUESTIONS[0].question, answer: "x" }] })).toBe("unanswered_questions");
+    expect(await code({ answers: QUESTIONS.map(q => ({ question: q.question, answer: "x" })), technical: [{ question: QUESTIONS[0].question, files: ["src/botao.tsx"] }] })).toBe("question_twice");
+    expect(await code({ technical: [{ question: QUESTIONS[0].question, files: ["../segredo"] }], answers: [{ question: QUESTIONS[1].question, answer: "x" }] })).toBe("invalid_request");
+    const other = await directorPlan();
+    expect(body<{ error: { code: string } }>(await svc.prepare(handoffReq(other, "t1", { previousRunId: w.id, answers: [] }))).error.code).toBe("invalid_previous_run");
+  });
+
+  it("resposta sua e dúvida resolvida por leitura ficam identificadas, vinculadas e entram no envio; o anterior não muda", async () => {
+    const { svc } = service([reply(clarify())]);
+    const plan = await directorPlan();
+    const w = await waitingRun(svc, plan);
+    const before = JSON.stringify(await store.detail(w.id));
+    const r = await svc.prepare(handoffReq(plan, "t1", {
+      previousRunId: w.id,
+      technical: [{ question: QUESTIONS[0].question, files: ["src/botao.tsx#Botao", "lib/inexistente.ts"] }],
+      answers: [{ question: QUESTIONS[1].question, answer: "Não: só o plano, sem estados." }],
+      decisions: [{ topic: "Nome do arquivo", answer: "plano-<id>.md" }],
+    }));
+    expect(r.status).toBe(201);
+    const run = body<{ run: RunDetail }>(r).run;
+    const snap = run.snapshot as ArchitectSnapshot;
+    expect(run.previousRunId).toBe(w.id);
+    expect(snap.revision).toMatchObject({ number: 2, previousRunId: w.id, changedCommit: false, commit: COMMIT });
+    expect(snap.clarifications?.[0]).toMatchObject({ askedIn: w.id, resolution: { by: "reading", readFiles: ["src/botao.tsx"], missing: ["lib/inexistente.ts"], commit: COMMIT } });
+    expect(snap.clarifications?.[1]).toMatchObject({ resolution: { by: "user", answer: "Não: só o plano, sem estados." } });
+    expect(snap.previousAnalysis).toMatchObject({ runId: w.id, provisional: "Provisória: usar Blob." });
+    expect(run.prompt?.user).toContain("→ Resposta do solicitante (usuário): Não: só o plano, sem estados.");
+    expect(run.prompt?.user).toContain("→ Resolvida por leitura no commit");
+    expect(run.prompt?.user).toContain("<decisoes_do_solicitante>");
+    expect(run.prompt?.user).toContain("Fora do escopo:");
+    expect(run.context?.kind === "github" && run.context.files.find(f => f.path === "src/botao.tsx")?.reason).toContain("pergunta 1 por leitura");
+    expect(JSON.stringify(await store.detail(w.id))).toBe(before);
+  });
+
+  it("cliques repetidos no novo envio e na confirmação: um envio e uma chamada", async () => {
+    const { svc, calls } = service([reply(clarify()), reply(analysis())]);
+    const plan = await directorPlan();
+    const w = await waitingRun(svc, plan);
+    const req = () => handoffReq(plan, "t1", { previousRunId: w.id, answers: QUESTIONS.map(q => ({ question: q.question, answer: "sim" })) });
+    const rs = await Promise.all([svc.prepare(req()), svc.prepare(req()), svc.prepare(req())]);
+    expect(new Set(rs.map(r => body<{ run: RunDetail }>(r).run.id)).size).toBe(1);
+    const run = body<{ run: RunDetail }>(rs[0]).run;
+    await Promise.all([1, 2, 3].map(() => svc.approve(run.id, { snapshotHash: run.snapshotHash })));
+    await svc.idle();
+    expect(calls).toHaveLength(2);
+    expect((await store.get(run.id))!.status).toBe("analysis_ready");
+    expect((await store.get(w.id))!.status).toBe("awaiting_clarification");
+  });
+
+  it("o Arquiteto não pode repetir pergunta já respondida, salvo contradição declarada", async () => {
+    const again = clarify({ questions: [{ question: "Qual arquivo implementa a janela de execução do Diretor, afinal?", why_it_blocks: "ainda não sei" }] });
+    const contra = clarify({ questions: [{ question: "Qual arquivo implementa a janela de execução do Diretor?", why_it_blocks: "Contradição: a resposta cita run-dialog.tsx, mas o arquivo lido não tem a janela." }] });
+    const { svc, calls } = service([reply(clarify()), reply(again), reply(contra)]);
+    const plan = await directorPlan();
+    const w = await waitingRun(svc, plan);
+    const run = body<{ run: RunDetail }>(await svc.prepare(handoffReq(plan, "t1", { previousRunId: w.id, answers: QUESTIONS.map(q => ({ question: q.question, answer: "sim" })) }))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(3);
+    expect(calls[2].user).toContain("repete uma dúvida já resolvida");
+    expect((await store.get(run.id))!.status).toBe("awaiting_clarification");
+    expect(questionSimilarity(QUESTIONS[0].question, "Qual arquivo implementa a janela de execução do Diretor, afinal?")).toBeGreaterThanOrEqual(0.5);
+  });
+});
+
+describe("tempo esgotado numa revisão", () => {
+  it("falha com o limite explícito e uso desconhecido; a nova tentativa vira a revisão seguinte, ligada à mesma pergunta pendente", async () => {
+    const { svc } = service([reply(clarify()), new AgentError("timeout", "O cliente não terminou dentro do tempo limite do executor.", true)]);
+    const plan = await directorPlan();
+    const w = await waitingRun(svc, plan);
+    const req = () => handoffReq(plan, "t1", { previousRunId: w.id, answers: QUESTIONS.map(q => ({ question: q.question, answer: "sim" })) });
+    const r2 = body<{ run: RunDetail }>(await svc.prepare(req())).run;
+    await svc.approve(r2.id, { snapshotHash: r2.snapshotHash });
+    await svc.idle();
+    const failed = (await store.get(r2.id))!;
+    expect(failed.error?.message).toMatch(/limite de \d+ min do executor/);
+    expect(failed.error?.recovery?.join(" ")).toContain("consumo desta tentativa não é conhecido");
+    expect(failed.budget.reportedTotalTokens).toBeNull();
+    const r3 = body<{ run: RunDetail }>(await svc.prepare(req())).run;
+    expect((r3.snapshot as ArchitectSnapshot).revision?.number).toBe(3);
+    expect(r3.previousRunId).toBe(w.id);
+    expect((await store.get(w.id))!.status).toBe("awaiting_clarification");
+  });
+});
+
+describe("revisão de commit", () => {
+  it("trocar o commit exige motivo e vira nova revisão; o envio aprovado anterior fica como estava", async () => {
+    const log: string[] = [];
+    const NEW = "d".repeat(40);
+    const { svc } = service([reply(clarify())], { log });
+    const plan = await directorPlan();
+    const w = await waitingRun(svc, plan);
+    const before = JSON.stringify(await store.detail(w.id));
+    const base = { previousRunId: w.id, answers: QUESTIONS.map(q => ({ question: q.question, answer: "sim" })), source: { via: "github" as const, commit: NEW } };
+    expect(body<{ error: { code: string } }>(await svc.prepare(handoffReq(plan, "t1", base))).error.code).toBe("revision_reason_required");
+    const r = await svc.prepare(handoffReq(plan, "t1", { ...base, revisionReason: "O código citado está num commit mais novo." }));
+    const run = body<{ run: RunDetail }>(r).run;
+    expect((run.snapshot as ArchitectSnapshot).revision).toMatchObject({ number: 2, changedCommit: true, previousCommit: COMMIT, commit: NEW, via: "github", reason: "O código citado está num commit mais novo." });
+    expect(log.some(u => u.includes(`/git/trees/${NEW}`))).toBe(true);
+    expect(run.events.map(e => e.kind)).toContain("context_revision");
+    expect(JSON.stringify(await store.detail(w.id))).toBe(before);
+    expect(run.prompt?.user).toContain("<revisao_do_contexto>");
+  });
+});
+
+describe("cópia local autorizada (somente leitura, Git real em pasta temporária)", () => {
+  function makeRepo(root: string) {
+    const dir = path.join(root, "clone");
+    mkdirSync(dir);
+    const g = (...a: string[]) => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
+    g("init", "-q", "-b", "main");
+    g("remote", "add", "origin", "https://github.com/o/r.git");
+    writeFileSync(path.join(dir, "package.json"), '{"name":"x"}');
+    writeFileSync(path.join(dir, "README.md"), "# r");
+    g("add", "."); g("commit", "-q", "-m", "base");
+    const base = g("rev-parse", "HEAD");
+    mkdirSync(path.join(dir, "components"), { recursive: true });
+    writeFileSync(path.join(dir, "components", "run-dialog.tsx"), "export function DirectorBody() { return null }\n");
+    g("add", "."); g("commit", "-q", "-m", "janela do diretor");
+    const head = g("rev-parse", "HEAD");
+    // A commit with no relation to the Director's history, created without touching the working tree.
+    const emptyTree = execFileSync("git", ["-C", dir, "mktree"], { input: "", encoding: "utf8" }).trim();
+    const orphan = g("commit-tree", emptyTree, "-m", "solta");
+    // Uncommitted change: must never be read.
+    writeFileSync(path.join(dir, "components", "run-dialog.tsx"), "ALTERACAO NAO COMMITADA");
+    return { dir, base, head, orphan, status: () => g("status", "--porcelain") };
+  }
+
+  it("lê o commit local indicado, registra fonte, publicação e ascendência, sem alterar a cópia", async () => {
+    const repo = makeRepo(work);
+    const { svc } = service([reply(clarify())], { localRepos: [repo.dir] });
+    const plan = await directorPlan(archPlan(), store, "plan_ready");
+    // The fake Director read COMMIT; in this repo the Director commit is `base`.
+    const detail = (await store.detail(plan))!;
+    await store.update(plan, { context: { ...(detail.context as Extract<RunDetail["context"], { kind: "github" }>)!, commit: repo.base } });
+    const w = await waitingRun(svc, plan);
+    const statusBefore = repo.status();
+    const hashBefore = hashOf("sha256").update(readFileSync(path.join(repo.dir, "components", "run-dialog.tsx"))).digest("hex");
+    const r = await svc.prepare(handoffReq(plan, "t1", {
+      previousRunId: w.id, revisionReason: "A janela só existe em commits locais não publicados.",
+      source: { via: "local_git", commit: repo.head },
+      technical: [{ question: QUESTIONS[0].question, files: ["components/run-dialog.tsx#DirectorBody"] }],
+      answers: [{ question: QUESTIONS[1].question, answer: "Não." }],
+    }));
+    expect(r.status).toBe(201);
+    const run = body<{ run: RunDetail }>(r).run;
+    const ctx = run.context as Extract<RunDetail["context"], { kind: "github" }>;
+    expect(ctx).toMatchObject({ via: "local_git", commit: repo.head, local: { dirName: "clone", published: false, isDescendant: true, descendantOf: repo.base } });
+    expect(ctx.files.map(f => f.path)).toContain("components/run-dialog.tsx");
+    expect(run.prompt?.user).toContain("export function DirectorBody()");
+    expect(run.prompt?.user).not.toContain("ALTERACAO NAO COMMITADA");
+    expect(JSON.stringify(run)).not.toContain(repo.dir.replace(/\\/g, "\\\\"));
+    expect(repo.status()).toBe(statusBefore);
+    expect(hashOf("sha256").update(readFileSync(path.join(repo.dir, "components", "run-dialog.tsx"))).digest("hex")).toBe(hashBefore);
+    const st = await svc.status();
+    expect(st.localRepos?.[0]).toMatchObject({ dirName: "clone", owner: "o", repo: "r" });
+    expect(JSON.stringify(st.localRepos)).not.toContain(work.replace(/\\/g, "\\\\"));
+  });
+
+  it("recusa pasta não autorizada, commit fora da história do Diretor e origem diferente", async () => {
+    const repo = makeRepo(work);
+    const plan = await directorPlan();
+    const detail = (await store.detail(plan))!;
+    await store.update(plan, { context: { ...(detail.context as Extract<RunDetail["context"], { kind: "github" }>)!, commit: repo.base } });
+    const none = service([reply(clarify())], { localRepos: [] });
+    const w = await waitingRun(none.svc, plan);
+    const req = (commit: string) => handoffReq(plan, "t1", { previousRunId: w.id, revisionReason: "teste", source: { via: "local_git", commit }, answers: QUESTIONS.map(q => ({ question: q.question, answer: "sim" })) });
+    expect(body<{ error: { code: string } }>(await none.svc.prepare(req(repo.head))).error.code).toBe("local_not_authorized");
+    const ok = service([], { localRepos: [repo.dir] });
+    expect(body<{ error: { code: string } }>(await ok.svc.prepare(req(repo.orphan))).error.code).toBe("commit_not_descendant");
+    execFileSync("git", ["-C", repo.dir, "remote", "set-url", "origin", "https://github.com/outro/repo.git"]);
+    expect(body<{ error: { code: string } }>(await ok.svc.prepare(req(repo.head))).error.code).toBe("local_not_authorized");
+  });
+});
+
+describe("contexto verificável e diagnóstico de tamanho", () => {
+  it("arquivo grande vira lista de declarações + blocos relevantes com linhas", () => {
+    const body = ["import x from \"y\";", "", ...Array.from({ length: 30 }, (_, i) => [`export function Parte${i}() {`, "  return " + "'x'".repeat(60) + ";", "}"]).flat(), "export function DirectorBody() {", "  return null;", "}"].join("\n");
+    const ex = excerptFile(body, ["DirectorBody"], ["parte"], 3000);
+    expect(ex.text).toContain("Declarações de nível superior (31)");
+    expect(ex.text).toContain("DirectorBody (l.");
+    expect(ex.symbols[0]).toBe("DirectorBody");
+    // A symbol inside a block gets a window of lines, not the whole enclosing block.
+    const inner = excerptFile(["export function Home() {", ...Array.from({ length: 80 }, (_, i) => `  const v${i} = ${i};`), "  const exportData = () => 1;", ...Array.from({ length: 80 }, (_, i) => `  const w${i} = ${i};`), "}"].join("\n"), ["exportData"], [], 5000);
+    expect(inner.symbols).toEqual(["exportData"]);
+    expect(inner.text).toContain("const exportData");
+    expect(inner.text).not.toContain("const w70");
+    const near = excerptFile(["export function useX() {", "  const a = 1;", "  const latestFor = () => a;", "  const taskRunsFor = () => a;", ...Array.from({ length: 60 }, (_, i) => `  const z${i} = ${i};`), "}"].join("\n"), ["latestFor", "taskRunsFor"], [], 5000);
+    expect(near.ranges).toHaveLength(1);
+    expect(near.text.match(/const latestFor/g)).toHaveLength(1);
+    const withRefs = excerptFile(["type A = { b: B };", ...Array.from({ length: 40 }, () => "// ruído"), "type B = { x: number };", "type C = { y: string };", "export function useA(): A { return null as never }"].join("\n"), ["useA"], ["c"], 5000);
+    expect(withRefs.symbols).toEqual(["useA", "A"]);
+    const tests = excerptFile(['import { it } from "vitest";', 'describe("migração", () => {', '  it("mantém a ficha", () => {});', "});"].join("\n"), [], [], 5000);
+    expect(tests.text).toContain("▸ migração (l.2)");
+    expect(tests.text).toContain("· mantém a ficha (l.3)");
+    expect(ex.ranges.some(([a, b]) => a <= 93 && b >= 92)).toBe(true);
+  });
+  it("composição por seção em caracteres, somando exatamente o texto montado", () => {
+    const system = "PROTOCOLO\n\n=== FICHA DO ARQUITETO ===\nficha";
+    const user = "<demanda>\nd\n</demanda>\n\n<dados_da_fonte>\nlista\n\n--- arquivo: a.ts ---\nabc\n</dados_da_fonte>\n\nfim";
+    const c = promptComposition({ system, user }, 100);
+    expect(c.total).toBe(system.length + user.length + 100);
+    expect(c.parts.map(p => p.label)).toEqual(expect.arrayContaining(["Protocolo da execução (instruções)", "Ficha salva do colaborador (instruções)", "Demanda", "Arquivo: a.ts", "Esquema JSON da resposta (enviado como formato de saída)"]));
+  });
+  it("Claude Code: detalhe por requisição e turnos quando o cliente informa", () => {
+    const u = claudeUsage({ type: "result", num_turns: 2, duration_ms: 1500, usage: { iterations: [{ input_tokens: 2, cache_creation_input_tokens: 1400, output_tokens: 70 }, { input_tokens: 1, cache_read_input_tokens: 1400, output_tokens: 5 }] }, modelUsage: { m: { inputTokens: 3, outputTokens: 75, cacheReadInputTokens: 1400, cacheCreationInputTokens: 1400 } } } as never, "x")!;
+    expect(u.turns).toBe(2);
+    expect(u.apiCalls).toEqual([{ inputTokens: 2, outputTokens: 70, cacheReadTokens: null, cacheWriteTokens: 1400 }, { inputTokens: 1, outputTokens: 5, cacheReadTokens: 1400, cacheWriteTokens: null }]);
   });
 });

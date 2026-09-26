@@ -6,8 +6,11 @@ import { AlertTriangle, ArrowLeft, CheckCircle2, CircleDashed, Clock, FileText, 
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { useRuns } from "@/hooks/use-runs";
 import { Avatar } from "../avatar";
+import { ClarifyForm } from "./clarify-form";
 import { UsagePanel } from "./usage-panel";
-import { engineApi } from "@/lib/engine/client";
+import { engineApi, type HandoffFollowUp } from "@/lib/engine/client";
+import { ANALYSIS_JSON_SCHEMA } from "@/lib/engine/analysis-schema";
+import { PLAN_JSON_SCHEMA } from "@/lib/engine/plan-schema";
 import { connectionLabel } from "@/lib/engine/connections";
 import { TASK_STATE_LABEL, handoffBlocker, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DirectorSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
@@ -42,8 +45,8 @@ type DialogProps = {
   onHandoff: (planRunId: string, taskId: string) => void;
   /** Reopens the review of a prepared hand-off. */
   onReview: (handoffRunId: string) => void;
-  /** Answers to the Architect's questions (prepares a new hand-off for review). */
-  onAnswerArchitect: (run: RunDetail, answers: Answers) => void;
+  /** Resolution of the Architect's questions (prepares a new hand-off for review). */
+  onAnswerArchitect: (run: RunDetail, followUp: HandoffFollowUp) => void;
 };
 type BodyProps = DialogProps & { run: RunDetail; active: boolean };
 
@@ -272,7 +275,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
 
           <Tabs.Content value="context" className="run-pane"><ContextFiles run={run} /></Tabs.Content>
           <Tabs.Content value="events" className="run-pane"><Events run={run} /></Tabs.Content>
-          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="Diretor" /></Tabs.Content>
+          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="Diretor" prompt={run.prompt} schemaChars={JSON.stringify(PLAN_JSON_SCHEMA).length} /></Tabs.Content>
           <Tabs.Content value="input" className="run-pane"><Input run={run} systemTitle="Instruções (protocolo da fase + ficha do Diretor)" /></Tabs.Content>
         </div>
       </Tabs.Root>
@@ -286,9 +289,8 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
 
 // ---- Architect analysis ----------------------------------------------------
 
-function ArchitectBody({ run, active, agents, onCancel, onOpenRun, onReview, onAnswerArchitect }: BodyProps) {
+function ArchitectBody({ run, active, agents, runs, onCancel, onOpenRun, onReview, onAnswerArchitect }: BodyProps) {
   const [tab, setTab] = useState("analysis");
-  const [answers, setAnswers] = useState<Record<number, string>>({});
   const snap = run.snapshot as ArchitectSnapshot;
   const a = run.analysis;
   const architect = agents.find(x => x.id === run.agentId);
@@ -363,21 +365,11 @@ function ArchitectBody({ run, active, agents, onCancel, onOpenRun, onReview, onA
 
           <Tabs.Content value="questions" className="run-pane">
             {!a?.questions.length && <p className="muted">Nenhuma pergunta.</p>}
-            {!!a?.questions.length && (
+            {!!a?.questions.length && run.status === "awaiting_clarification" && <ClarifyForm run={run} runs={runs} onSubmit={f => onAnswerArchitect(run, f)} />}
+            {!!a?.questions.length && run.status !== "awaiting_clarification" && (
               <>
-                <p className="pane-intro">{run.status === "awaiting_clarification" ? "O Arquiteto precisa destas respostas para recomendar com segurança. Responder prepara um novo envio, que você revisa antes de confirmar." : "Perguntas registradas nesta execução."}</p>
-                {a.questions.map((q, i) => (
-                  <div key={i} className="question">
-                    <b>{i + 1}. {q.question}</b>
-                    <small>Por que bloqueia: {q.why_it_blocks || "—"}</small>
-                    {run.status === "awaiting_clarification" && <textarea rows={2} value={answers[i] ?? ""} onChange={e => setAnswers(s => ({ ...s, [i]: e.target.value }))} placeholder="Sua resposta" aria-label={`Resposta à pergunta ${i + 1}`} />}
-                  </div>
-                ))}
-                {run.status === "awaiting_clarification" && (
-                  <button className="btn-primary" disabled={!a.questions.every((_, i) => (answers[i] ?? "").trim())} onClick={() => onAnswerArchitect(run, a.questions.map((q, i) => ({ question: q.question, answer: answers[i].trim() })))}>
-                    <Send size={15} /> Responder e revisar novo envio
-                  </button>
-                )}
+                <p className="pane-intro">Perguntas registradas nesta execução.</p>
+                {a.questions.map((q, i) => <div key={i} className="question"><b>{i + 1}. {q.question}</b><small>Por que bloqueia: {q.why_it_blocks || "—"}</small></div>)}
               </>
             )}
           </Tabs.Content>
@@ -386,6 +378,7 @@ function ArchitectBody({ run, active, agents, onCancel, onOpenRun, onReview, onA
             <section className="run-sec"><h4>Tarefa {snap.task.id} (do Diretor, para {name(snap.task.assignee)})</h4>
               <dl className="kv"><dt>Escopo</dt><dd>{snap.task.scope}</dd><dt>Insumos</dt><dd>{snap.task.inputs || "—"}</dd><dt>Entregável</dt><dd>{snap.task.deliverable}</dd><dt>Critérios</dt><dd><ul>{snap.task.acceptance_criteria.map((c, i) => <li key={i}>{c}</li>)}</ul></dd></dl>
             </section>
+            <RevisionInfo snap={snap} onOpenRun={onOpenRun} />
             <section className="run-sec"><h4>Ferramentas nesta execução</h4><ul className="tool-grants">{snap.tools.map(t => <li key={t.label} className={t.allowed ? "ok" : "no"}><b>{t.label}: {t.allowed ? "permitida" : "bloqueada"}</b><small>{t.how}</small></li>)}</ul></section>
             {!!snap.plan.dependents.length && <section className="run-sec"><h4>Quem vai usar esta análise</h4><ul>{snap.plan.dependents.map(d => <li key={d.id}>{d.id} · {d.title} → {name(d.assignee)} (não acionado automaticamente)</li>)}</ul></section>}
           </Tabs.Content>
@@ -395,10 +388,43 @@ function ArchitectBody({ run, active, agents, onCancel, onOpenRun, onReview, onA
             {!!directorNotResent.length && <><h4 className="ctx-h">Lidos pelo Diretor e não reenviados ({directorNotResent.length})</h4><ul className="ctx-skip">{directorNotResent.map(f => <li key={f.path}>{f.path} — não citado pela tarefa; o Arquiteto recebeu só o caminho</li>)}</ul></>}
           </Tabs.Content>
           <Tabs.Content value="events" className="run-pane"><Events run={run} /></Tabs.Content>
-          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="Arquiteto" /></Tabs.Content>
+          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="Arquiteto" prompt={run.prompt} schemaChars={JSON.stringify(ANALYSIS_JSON_SCHEMA).length} /></Tabs.Content>
           <Tabs.Content value="input" className="run-pane"><Input run={run} systemTitle="Instruções (protocolo do Arquiteto + ficha do Arquiteto)" /></Tabs.Content>
         </div>
       </Tabs.Root>
+    </>
+  );
+}
+
+/** Context revision and how the earlier questions were resolved (shown in the run and in the review). */
+export function RevisionInfo({ snap, onOpenRun }: { snap: ArchitectSnapshot; onOpenRun?: (id: string) => void }) {
+  const r = snap.revision;
+  const cl = snap.clarifications ?? [];
+  if (!r && !cl.length && !snap.decisions?.length) return null;
+  return (
+    <>
+      {r && (
+        <section className="run-sec"><h4>Revisão {r.number} do envio desta tarefa</h4>
+          <ul>
+            <li>Commit usado: <code>{r.commit?.slice(0, 12) ?? "—"}</code> {r.via === "local_git" ? "(cópia local autorizada)" : r.via === "github" ? "(GitHub público)" : ""}</li>
+            {r.previousRunId && <li>Envio anterior: {onOpenRun ? <button className="link" onClick={() => onOpenRun(r.previousRunId!)}>{r.previousRunId.slice(0, 8)}</button> : r.previousRunId.slice(0, 8)} · commit <code>{r.previousCommit?.slice(0, 12) ?? "—"}</code> {r.previousVia === "local_git" ? "(cópia local)" : "(GitHub)"} — não foi alterado</li>}
+            <li>{r.changedCommit ? "Commit ou fonte trocados nesta revisão." : "Mesmo commit e fonte do envio anterior."} Motivo: {r.reason}</li>
+          </ul>
+        </section>
+      )}
+      {!!cl.length && (
+        <section className="run-sec"><h4>Esclarecimentos entregues ao Arquiteto</h4>
+          <ol>{cl.map((c, i) => (
+            <li key={i}><b>{c.question}</b>
+              {c.resolution.by === "user"
+                ? <div className="answer-by user"><span className="tag">resposta sua</span> {c.resolution.answer}</div>
+                : <div className="answer-by reading"><span className="tag">resolvida por leitura</span> commit <code>{c.resolution.commit.slice(0, 12)}</code>: {c.resolution.readFiles.join(", ") || "nenhum arquivo encontrado"}{c.resolution.missing.length ? ` · não encontrados/removidos: ${c.resolution.missing.join(", ")}` : ""} <small>(pedidos: {c.resolution.requested.join(", ")})</small></div>}
+            </li>
+          ))}</ol>
+        </section>
+      )}
+      {!!snap.decisions?.length && <section className="run-sec"><h4>Decisões suas neste envio</h4><ul>{snap.decisions.map((d, i) => <li key={i}><span className="tag">decisão sua</span> <b>{d.topic}:</b> {d.answer}</li>)}</ul></section>}
+      {snap.scope && <section className="run-sec"><h4>Escopo pedido ao Arquiteto</h4><ul>{snap.scope.asked.map((x, i) => <li key={i}>{x}</li>)}</ul><small>Fora do escopo:</small><ul>{snap.scope.outOfScope.map((x, i) => <li key={i}>{x}</li>)}</ul></section>}
     </>
   );
 }

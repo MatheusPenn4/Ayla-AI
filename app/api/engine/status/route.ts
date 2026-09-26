@@ -23,6 +23,7 @@ export async function GET(request: Request) {
     executableAgents: fromExecutor?.executableAgents ?? ["director"],
     handoffTargets: fromExecutor?.handoffTargets ?? [],
     readOnly: fromExecutor?.readOnly ?? {},
+    localRepos: fromExecutor?.localRepos ?? [],
   };
   return json(body);
 }

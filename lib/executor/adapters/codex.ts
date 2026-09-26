@@ -71,6 +71,8 @@ export function parseCodexEvents(stdout: string, label: string) {
       usage.cacheWriteTokens = add(usage.cacheWriteTokens, num(u.cache_write_input_tokens));
       usage.outputTokens = add(usage.outputTokens, num(u.output_tokens));
       usage.reasoningTokens = add(usage.reasoningTokens, num(u.reasoning_output_tokens));
+      (usage.apiCalls ??= []).push({ inputTokens: input === null ? null : Math.max(0, input - (cached ?? 0)), outputTokens: num(u.output_tokens), cacheReadTokens: cached, cacheWriteTokens: num(u.cache_write_input_tokens) });
+      usage.turns = usage.apiCalls.length;
     }
   }
   return { text, failure, errors, usage };
@@ -83,7 +85,16 @@ export function codexAdapter(inv: Invocation, runner: Runner, env: EnvVars = pro
       const schemaFile = path.join(c.workDir, "output-schema.json");
       writeFileSync(schemaFile, JSON.stringify(c.schema), "utf8");
       const args = [...inv.prefix, ...codexArgs(c, schemaFile)];
-      const res = await runner({ command: inv.command, args, cwd: c.workDir, stdin: codexPrompt(c), env: clientEnv(env), timeoutMs: c.timeoutMs, signal: c.signal });
+      const onStdoutLine = (line: string) => {
+        if (!c.onProgress || !line.trim().startsWith("{")) return;
+        try {
+          const e = JSON.parse(line) as { type?: string; message?: string; item?: { type?: string } };
+          if (e.type === "thread.started") c.onProgress({ kind: "started", message: "Codex CLI iniciou a sessão." });
+          else if (e.type === "error" && e.message) c.onProgress({ kind: "client_error", message: `Codex informou: ${e.message.slice(0, 200)}` });
+          else if (e.type === "item.completed" && e.item?.type) c.onProgress({ kind: "model_output", message: `Codex concluiu um item (${e.item.type}).` });
+        } catch { /* not a JSON line */ }
+      };
+      const res = await runner({ command: inv.command, args, cwd: c.workDir, stdin: codexPrompt(c), env: clientEnv(env), timeoutMs: c.timeoutMs, signal: c.signal, onStdoutLine });
       if (res.spawnError) throw new AgentError("not_installed", ERROR_MESSAGE.not_installed, false, res.spawnError);
       if (res.aborted) throw new AgentError("canceled", ERROR_MESSAGE.canceled, false);
       const ev = parseCodexEvents(res.stdout, c.label);

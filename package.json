@@ -15,7 +15,8 @@
     "test": "vitest run",
     "executor": "tsx executor/main.ts",
     "check:clients": "tsx scripts/check-clients.ts",
-    "check:readonly": "tsx scripts/check-readonly.ts"
+    "check:readonly": "tsx scripts/check-readonly.ts",
+    "diagnose:run": "tsx scripts/diagnose-run.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

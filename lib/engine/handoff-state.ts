@@ -23,6 +23,9 @@ export function taskState(task: PlanTask, taskRuns: RunRecord[]): { key: TaskSta
   if (!isHandoffTarget(task.assignee)) return { key: "not_executable", run: null };
   const latest = taskRuns[0] ?? null;
   if (!latest) return { key: "proposed", run: null };
+  // A failed or discarded follow-up does not hide pending questions: the task still waits for answers.
+  const waiting = taskRuns.find(r => r.status === "awaiting_clarification");
+  if (waiting && (latest.status === "failed" || latest.status === "canceled")) return { key: "awaiting_clarification", run: waiting };
   const map: Record<RunRecord["status"], TaskStateKey> = {
     awaiting_approval: "awaiting_approval", queued: "queued", planning: "working", analysis_ready: "analysis_ready",
     awaiting_clarification: "awaiting_clarification", failed: "failed", canceled: "canceled", plan_ready: "analysis_ready",

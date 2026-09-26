@@ -18,6 +18,8 @@ export type ProcSpec = {
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   signal?: AbortSignal;
+  /** Called for every complete line of stdout while the process runs (progress of streaming clients). */
+  onStdoutLine?: (line: string) => void;
 };
 
 export type ProcResult = {
@@ -67,6 +69,8 @@ function killTree(pid: number | undefined) {
   }
 }
 
+const LINE_BREAK = /\r?\n/;
+
 export const runProcess: Runner = spec =>
   new Promise(resolve => {
     if (/\.(cmd|bat)$/i.test(spec.command)) {
@@ -99,8 +103,15 @@ export const runProcess: Runner = spec =>
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    let pending = "";
     child.stdout.on("data", (d: string) => {
       if (stdout.length + d.length > maxOut) { truncated = true; stdout += d.slice(0, Math.max(0, maxOut - stdout.length)); killTree(child.pid); } else stdout += d;
+      if (spec.onStdoutLine) {
+        pending += d;
+        const parts = pending.split(LINE_BREAK);
+        pending = parts.pop() ?? "";
+        for (const line of parts) { try { spec.onStdoutLine(line); } catch { /* a progress callback never breaks the run */ } }
+      }
     });
     child.stderr.on("data", (d: string) => { if (stderr.length < maxErr) stderr += d.slice(0, maxErr - stderr.length); });
     child.on("error", err => finish(null, (err as NodeJS.ErrnoException).code === "ENOENT" ? "Executável não encontrado." : err.message));

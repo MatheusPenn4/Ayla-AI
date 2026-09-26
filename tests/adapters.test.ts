@@ -52,7 +52,8 @@ const CODEX_401 = '{"type":"thread.started","thread_id":"x"}\n{"type":"turn.star
 describe("adaptador Claude Code (assinatura)", () => {
   it("argumentos: modo -p, sem ferramentas, sem MCP, sem personalizações, sem sessão salva e nunca --bare", () => {
     const args = claudeArgs(call({ model: "sonnet", effort: "high" }), "sys.txt");
-    expect(args).toEqual(expect.arrayContaining(["-p", "--output-format", "json", "--json-schema", "--system-prompt-file", "sys.txt", "--strict-mcp-config", "--safe-mode", "--disable-slash-commands", "--no-session-persistence"]));
+    expect(args[args.indexOf("--output-format") + 1]).toBe("stream-json");
+    expect(args).toEqual(expect.arrayContaining(["-p", "--verbose", "--json-schema", "--system-prompt-file", "sys.txt", "--strict-mcp-config", "--safe-mode", "--disable-slash-commands", "--no-session-persistence"]));
     expect(args[args.indexOf("--tools") + 1]).toBe("");
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     expect(args).not.toContain("--bare");
@@ -215,5 +216,37 @@ describe("execução controlada de processos (real, com node)", () => {
   it("o ambiente dos clientes não carrega chaves de API nem o token do executor", () => {
     const env = clientEnv({ PATH: "x", ANTHROPIC_API_KEY: "a", OPENAI_API_KEY: "b", AYLA_EXECUTOR_TOKEN: "c", GITHUB_TOKEN: "d", HOME: "h" });
     expect(Object.keys(env).sort()).toEqual(["CI", "HOME", "NO_COLOR", "PATH"]);
+  });
+});
+
+describe("Claude Code em fluxo (stream-json): progresso e uso parcial", () => {
+  const INIT = JSON.stringify({ type: "system", subtype: "init", model: "claude-sonnet-5" });
+  const RETRY = JSON.stringify({ type: "system", subtype: "api_retry", attempt: 1, max_retries: 10, retry_delay_ms: 4000, error_status: 529, error: "overloaded" });
+  const MSG = (id: string, out: number) => JSON.stringify({ type: "assistant", message: { id, usage: { input_tokens: 3, output_tokens: out, cache_creation_input_tokens: 9000 }, content: [{ type: "thinking" }, { type: "tool_use" }] } });
+  it("registra início, repetições da API e mensagens; no tempo esgotado guarda o uso parcial informado", async () => {
+    const seen: string[] = [];
+    const runner: Runner = async spec => {
+      for (const l of [INIT, RETRY, MSG("m1", 100), MSG("m1", 900), MSG("m2", 50)]) spec.onStdoutLine?.(l);
+      return ok([INIT, RETRY, MSG("m1", 900)].join("\n"), { code: null, timedOut: true, stderr: "algo no stderr" });
+    };
+    const err = (await claudeAdapter({ command: "c", prefix: [], source: "t" }, runner, {}).call(call({ onProgress: p => seen.push(p.kind) })).catch(e => e)) as AgentError;
+    expect(err.code).toBe("timeout");
+    expect(seen).toEqual(["started", "api_retry", "model_output", "model_output", "model_output"]);
+    // Same message id twice: the last usage wins (no double counting).
+    expect(err.usage).toMatchObject({ outputTokens: 950, cacheWriteTokens: 18000, source: expect.stringContaining("parcial") });
+    expect(err.detail).toContain("2 mensagem(ns) distinta(s) do modelo em 3 evento(s)");
+    expect(err.detail).toContain("algo no stderr");
+  });
+  it("o resultado final do fluxo é lido como no formato json", async () => {
+    const out = [INIT, MSG("m1", 75), CLAUDE_OK].join("\n");
+    const r = await claudeAdapter({ command: "c", prefix: [], source: "t" }, async () => ok(out), {}).call(call());
+    expect(r.output).toEqual({ ok: true });
+    expect(r.usage?.source).toContain("stream-json");
+  });
+  it("o executor de processos entrega cada linha completa enquanto o processo roda", async () => {
+    const lines: string[] = [];
+    const r = await runProcess({ command: process.execPath, args: ["-e", "process.stdout.write('a\\nb'); setTimeout(()=>process.stdout.write('c\\nd\\n'),50)"], cwd: work, env: clientEnv(), timeoutMs: 10000, onStdoutLine: l => lines.push(l) });
+    expect(r.code).toBe(0);
+    expect(lines).toEqual(["a", "bc", "d"]);
   });
 });

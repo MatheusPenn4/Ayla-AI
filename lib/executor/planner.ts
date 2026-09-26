@@ -14,9 +14,9 @@ import path from "node:path";
 import { ANALYSIS_JSON_SCHEMA, validateAnalysis } from "@/lib/engine/analysis-schema";
 import { PLAN_JSON_SCHEMA, validatePlan } from "@/lib/engine/plan-schema";
 import { buildSystemPrompt, buildUserMessage } from "@/lib/engine/prompt";
-import { reportedTotal, type CallUsage, type ConnectionStatus, type DirectorSnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
+import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DirectorSnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
 import { LOGIN_STEPS } from "./clients";
-import { AgentError, type AgentAdapter, type AgentErrorCode } from "./adapters/types";
+import { AgentError, type AgentAdapter, type AgentErrorCode, type AgentProgress } from "./adapters/types";
 import { GithubError, readGithubContext, shrinkGithubText } from "./github";
 import type { RunStore } from "./store";
 
@@ -42,7 +42,7 @@ export class RunFailure extends Error {
 }
 const fail = (err: RunError): never => { throw new RunFailure(err); };
 
-function recoveryFor(code: AgentErrorCode | string, conn: ConnectionStatus | null, who: string): string[] {
+function recoveryFor(code: AgentErrorCode | string, conn: ConnectionStatus | null, who: string, timeoutMs = 0): string[] {
   const id = conn?.id ?? "claude_code";
   switch (code) {
     case "not_installed": return LOGIN_STEPS[id].install;
@@ -50,7 +50,8 @@ function recoveryFor(code: AgentErrorCode | string, conn: ConnectionStatus | nul
     case "session_expired": return LOGIN_STEPS[id].expired;
     case "usage_limit": return ["Aguarde a renovação do limite da assinatura (o cliente não informa o saldo restante ao Setor IA).", `Ou escolha a outra conexão na ficha do ${who} e tente novamente.`];
     case "model_unavailable": return [`Na ficha do ${who} (aba Perfil), deixe o modelo em “Padrão do cliente” ou escolha um modelo listado pelo próprio cliente.`, "Depois tente novamente."];
-    case "timeout": case "connection_lost": case "client_error": case "interrupted": return ["Verifique a conexão de rede e tente novamente.", "Se repetir, rode o mesmo cliente no seu terminal para ver a mensagem completa."];
+    case "timeout": return [`O limite do executor por chamada é de ${Math.round(timeoutMs / 60000)} min (AYLA_CALL_TIMEOUT_MS). Respostas longas podem passar disso.`, "Tente de novo; se repetir, reduza o contexto enviado ou escolha um esforço menor na ficha.", "O cliente foi encerrado antes de informar o uso: o consumo desta tentativa não é conhecido."];
+    case "connection_lost": case "client_error": case "interrupted": return ["Verifique a conexão de rede e tente novamente.", "Se repetir, rode o mesmo cliente no seu terminal para ver a mensagem completa."];
     default: return ["Tente novamente."];
   }
 }
@@ -92,7 +93,7 @@ function keywords(...texts: string[]) {
   return [...new Set(texts.join(" ").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_-]+/))];
 }
 
-type Prepared = { system: string; user: string; context: SourceContext; readPaths: string[] };
+type Prepared = { system: string; user: string; context: SourceContext; readPaths: string[]; answered?: string[] };
 type Outcome = { status: RunStatus; result: object; message: string };
 type Spec = {
   who: string;
@@ -168,10 +169,11 @@ function architectSpec(deps: PlannerDeps): Spec {
       const detail = (await deps.store.detail(run.id))!;
       if (!detail.prompt || !detail.context) fail({ code: "handoff_incomplete", message: "O encaminhamento não tem a entrada congelada na aprovação. Prepare o envio novamente.", retryable: false, recovery: ["Abra a tarefa e clique em “Enviar ao Arquiteto” de novo."] });
       const context = detail.context!;
-      return { system: detail.prompt!.system, user: detail.prompt!.user, context, readPaths: context.kind === "github" ? context.files.map(f => f.path) : [] };
+      const answered = ((detail.snapshot as ArchitectSnapshot).clarifications ?? []).map(c => c.question);
+      return { system: detail.prompt!.system, user: detail.prompt!.user, context, readPaths: context.kind === "github" ? context.files.map(f => f.path) : [], answered };
     },
     validate(output, p, budget) {
-      const v = validateAnalysis(output, p.readPaths);
+      const v = validateAnalysis(output, p.readPaths, p.answered ?? []);
       if (!v.ok) return v;
       const status = v.analysis.outcome === "needs_clarification" ? "awaiting_clarification" : "analysis_ready";
       return { ok: true, outcome: { status, result: { ...v.analysis, limitations: architectLimitations(p.context, budget) }, message: status === "analysis_ready" ? "Análise técnica concluída e registrada." : `O Arquiteto precisa de esclarecimento: ${v.analysis.questions.length} pergunta(s).` } };
@@ -224,13 +226,20 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
       await store.event(runId, "calling", `Chamando ${conn.client}${run.model ? ` (modelo ${run.model})` : " (modelo padrão do cliente)"}${run.effort ? `, esforço ${run.effort}` : ""}. Texto enviado: cerca de ${estimateTokens(prepared.system + prompt)} tokens (estimativa).`);
       let reply;
       try {
-        reply = await adapter.call({ label: attempt === 1 ? (run.kind === "architect_task" ? "análise" : "planejamento") : "correção", system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir });
+        // Progress from the client is recorded as events: start and API retries always, model output at most every 20 s.
+        let lastOutputEvent = 0;
+        const onProgress = (p: AgentProgress) => {
+          if (p.kind === "model_output" && Date.now() - lastOutputEvent < 20_000) return;
+          if (p.kind === "model_output") lastOutputEvent = Date.now();
+          void store.event(runId, `client_${p.kind}`, p.message, p.data);
+        };
+        reply = await adapter.call({ label: attempt === 1 ? (run.kind === "architect_task" ? "análise" : "planejamento") : "correção", system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, onProgress });
       } catch (err) {
         if (err instanceof AgentError) {
           record((err as AgentError & { usage?: CallUsage | null }).usage ?? null);
           if (["not_connected", "session_expired"].includes(err.code)) await store.logConnection(conn.id, false, err.code);
           if (err.code === "canceled") return;
-          fail({ code: err.code, message: err.message, detail: err.detail, retryable: err.retryable, recovery: recoveryFor(err.code, conn, spec.who) });
+          fail({ code: err.code, message: err.code === "timeout" ? `O cliente não terminou dentro do limite de ${Math.round(deps.limits.callTimeoutMs / 60000)} min do executor e foi encerrado.` : err.message, detail: err.detail, retryable: err.retryable, recovery: recoveryFor(err.code, conn, spec.who, deps.limits.callTimeoutMs) });
         }
         throw err;
       }
