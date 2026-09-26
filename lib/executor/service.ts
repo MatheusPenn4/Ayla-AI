@@ -9,7 +9,8 @@ import { claudeAdapter } from "./adapters/claude";
 import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
 import { detect, LOGIN_STEPS, resolveClient, type ClientDeps } from "./clients";
-import { HandoffRefused, HandoffZ, prepareHandoff } from "./handoff";
+import { developerPreview } from "./developer-preview";
+import { HandoffRefused, HandoffZ, prepareHandoff, sourceOptions } from "./handoff";
 import { listLocalRepos } from "./local-git";
 import { processRun } from "./planner";
 import type { Runner } from "./proc";
@@ -202,12 +203,30 @@ export class ExecutorService {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
     try {
-      const { run, created } = await prepareHandoff(req, { store: this.store, github: this.cfg.github, local: { dirs: this.cfg.localRepos ?? [], git: this.gitDeps() } });
+      const { run, created } = await prepareHandoff(req, this.handoffDeps());
       return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
     } catch (e) {
       if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
       throw e;
     }
+  }
+
+  private handoffDeps() {
+    return { store: this.store, github: this.cfg.github, local: { dirs: this.cfg.localRepos ?? [], git: this.gitDeps() } };
+  }
+
+  /** Before step 1: commits and files to choose from for a hand-off (read-only; nothing is recorded, no model is called). */
+  async sourceOptions(directorRunId: string, taskId: string): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(directorRunId) || !/^[A-Za-z0-9_-]{1,64}$/.test(taskId)) return err(400, "invalid_request", "Plano ou tarefa inválidos.");
+    try { return { status: 200, body: await sourceOptions({ directorRunId, taskId }, this.handoffDeps()) }; }
+    catch (e) { if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details); throw e; }
+  }
+
+  /** Preview of a future Developer hand-off: a view of the records only (no run, no model call, no write access). */
+  async developerPreview(directorRunId: string, taskId: string): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(directorRunId) || !/^[A-Za-z0-9_-]{1,64}$/.test(taskId)) return err(400, "invalid_request", "Plano ou tarefa inválidos.");
+    try { return { status: 200, body: { preview: await developerPreview({ directorRunId, taskId }, this.handoffDeps()) } }; }
+    catch (e) { if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details); throw e; }
   }
 
   /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). */

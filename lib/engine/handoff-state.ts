@@ -34,6 +34,27 @@ export function taskState(task: PlanTask, taskRuns: RunRecord[]): { key: TaskSta
 }
 
 /**
+ * Why the preview of a Developer task is not available yet (null = it is): every task it depends on,
+ * directly or not, must be an Architect task with a concluded analysis. The executor checks it again.
+ */
+export function developerBlocker(task: PlanTask, tasks: PlanTask[], runsOf: (taskId: string) => RunRecord[]): string | null {
+  if (task.assignee !== "developer") return "A prévia é só para tarefas do Desenvolvedor.";
+  const seen = new Set<string>();
+  const queue = [...task.depends_on];
+  while (queue.length) {
+    const id = queue.shift()!;
+    if (seen.has(id) || id === task.id) continue;
+    seen.add(id);
+    const dep = tasks.find(t => t.id === id);
+    if (!dep) continue;
+    if (!isHandoffTarget(dep.assignee)) return `Depende de ${dep.id} (${dep.assignee}), que ainda não executa nesta fase.`;
+    if (!runsOf(dep.id).some(r => r.status === "analysis_ready")) return `Depende de ${dep.id}: essa análise do Arquiteto ainda não foi concluída.`;
+    queue.push(...dep.depends_on);
+  }
+  return null;
+}
+
+/**
  * Why a task cannot be sent yet (null = it can). The executor checks the same
  * rules again; this only avoids offering a button that would be refused.
  */

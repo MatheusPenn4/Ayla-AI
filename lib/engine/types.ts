@@ -217,7 +217,7 @@ export type PlanExcerpt = {
   flow: { type: DirectorPlan["flow"]["type"]; rationale: string };
   step: PlanStep | null;
   /** Tasks this one depends on, with the Architect's earlier analysis summary when there is one. */
-  dependsOn: { id: string; title: string; assignee: string; analysisSummary: string | null; analysisRunId: string | null }[];
+  dependsOn: { id: string; title: string; assignee: string; analysisSummary: string | null; analysisRunId: string | null; analysis?: DependencyAnalysis | null }[];
   /** Tasks that depend on this one (who will use the analysis). */
   dependents: { id: string; title: string; assignee: string }[];
   risks: string[];
@@ -228,6 +228,40 @@ export type PlanExcerpt = {
   directorCommit: string | null;
   /** Items of the plan not repeated here (the full plan stays in the Director run). */
   omitted?: { risks: number; assumptions: number; not_verified: number };
+};
+
+/**
+ * Concluded analysis of a task this one depends on, as sent to the next collaborator: a bounded excerpt
+ * of the registered analysis (not facts verified again), with the commit it was made on and the user's
+ * decisions recorded in that hand-off.
+ */
+export type DependencyAnalysis = {
+  runId: string;
+  revision: number | null;
+  commit: string | null;
+  via: "github" | "local_git" | null;
+  understanding: string;
+  recommendation: { summary: string; rationale: string };
+  guidance: string[];
+  risks: string[];
+  assumptions: string[];
+  notVerified: string[];
+  examined: { ref: string; basis: "read" | "inferred" }[];
+  /** Decisions the user stated in that hand-off (they stay the user's). */
+  decisions: { topic: string; answer: string }[];
+  omitted: { guidance: number; risks: number; assumptions: number; notVerified: number; examined: number };
+};
+
+/** Where a file stands in two commits of the same repository (read from the authorized local clone). */
+export type SourceComparison = {
+  from: { commit: string; label: string };
+  to: { commit: string; label: string };
+  /** "descendant" = `to` contains `from` in its history. */
+  relation: "same" | "descendant" | "not_descendant" | "unknown";
+  /** Files changed between the two commits (whole repository), when known. */
+  changedTotal: number | null;
+  files: { path: string; atFrom: boolean; atTo: boolean; changed: boolean | null }[];
+  note: string;
 };
 
 /** How one of the Architect's earlier questions was resolved before a new hand-off. */
@@ -250,6 +284,10 @@ export type ContextRevision = {
   via: "github" | "local_git" | null;
   changedCommit: boolean;
   reason: string;
+  /** Files the user confirmed for reading when preparing (path or path#Symbol) and why each was suggested. */
+  requestedFiles?: { ref: string; reason: string }[];
+  /** The chosen commit compared with the Director's commit and with the commits of the dependency analyses. */
+  comparisons?: SourceComparison[];
 };
 
 export type DirectorSnapshot = {

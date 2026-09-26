@@ -2,7 +2,8 @@
 // executor). No secrets here: the executor token stays on the server.
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
-import type { ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, StartRunRequest, TeamMemberInput } from "./types";
+import type { DeveloperPreview } from "./developer-preview";
+import type { ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, SourceComparison, StartRunRequest, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -14,6 +15,18 @@ export type HandoffFollowUp = {
   decisions?: { topic: string; answer: string }[];
   source?: { via: "github" | "local_git"; commit: string };
   revisionReason?: string;
+  /** Files confirmed for reading (path or path#Symbol). */
+  files?: string[];
+};
+
+/** Commits and suggested files for a first hand-off (see lib/executor/handoff.ts#sourceOptions). */
+export type SourceOptions = {
+  directorCommit: string | null; owner: string | null; repo: string | null;
+  dependencies: { taskId: string; runId: string; revision: number | null; commit: string | null; via: "github" | "local_git" | null }[];
+  localRepos: { dirName: string; head: string; headSubject: string }[];
+  proposed: { via: "github" | "local_git"; commit: string; why: string } | null;
+  suggestedFiles: { ref: string; reason: string }[];
+  comparisons: SourceComparison[];
 };
 
 export class EngineApiError extends Error {
@@ -64,6 +77,10 @@ export const engineApi = {
   /** Hand-off step 1: the executor validates the task and returns the frozen content for review (status awaiting_approval). */
   prepareHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput } & HandoffFollowUp) =>
     call<{ run: RunDetail; created: boolean }>("/api/handoffs", { method: "POST", body: JSON.stringify(req) }),
+  /** Before step 1: commits and suggested files to choose from (read-only). */
+  sourceOptions: (planRunId: string, taskId: string) => call<SourceOptions>(`/api/handoffs/source-options?plan=${planRunId}&task=${encodeURIComponent(taskId)}`),
+  /** Preview of a future Developer hand-off (a view: no run, no model call, no write access). */
+  developerPreview: (planRunId: string, taskId: string) => call<{ preview: DeveloperPreview }>(`/api/developer-preview?plan=${planRunId}&task=${encodeURIComponent(taskId)}`),
   /** Hand-off step 2: the user's confirmation of exactly that content. */
   approve: (id: string, snapshotHash: string) => call<{ run: RunRecord; approved: boolean }>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify({ snapshotHash }) }),
 };

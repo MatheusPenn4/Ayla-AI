@@ -1,0 +1,80 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { Download, Loader2, Lock, X } from "lucide-react";
+import { EngineApiError, engineApi } from "@/lib/engine/client";
+import { developerPreviewMarkdown, type DeveloperPreview } from "@/lib/engine/developer-preview";
+import { TaskStateBadge } from "./run-dialog";
+
+/**
+ * Preview of a FUTURE hand-off to the Developer. A view of the executor's records only:
+ * it creates no run, calls no model and grants no write access.
+ */
+export function DeveloperPreviewPanel({ planRunId, taskId, onOpenRun, onClose }: { planRunId: string; taskId: string; onOpenRun: (id: string) => void; onClose: () => void }) {
+  const [p, setP] = useState<DeveloperPreview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    engineApi.developerPreview(planRunId, taskId)
+      .then(r => live && setP(r.preview))
+      .catch(e => live && setError(e instanceof EngineApiError ? e.message : "Não foi possível montar a prévia."));
+    return () => { live = false; };
+  }, [planRunId, taskId]);
+
+  // Local copy of the preview; the generic download helper is left for the Developer's own task (task-4).
+  const download = () => {
+    if (!p) return;
+    const url = URL.createObjectURL(new Blob([developerPreviewMarkdown(p)], { type: "text/markdown;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = `previa-desenvolvedor-${p.task.id}-${p.plan.runId.slice(0, 8)}.md`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  if (error) return <div className="dev-preview"><p className="form-error">{error}</p><button className="btn-ghost small" onClick={onClose}>Fechar</button></div>;
+  if (!p) return <div className="dev-preview"><Loader2 size={14} className="spin" /> Montando a prévia a partir dos registros (nada é executado)…</div>;
+  return (
+    <div className="dev-preview" aria-label={`Prévia do envio de ${p.task.id} ao Desenvolvedor`}>
+      <div className="send-head"><b>Prévia do envio ao Desenvolvedor · {p.task.id}</b><button className="icon-btn" onClick={onClose} aria-label="Fechar prévia"><X size={14} /></button></div>
+      <div className="notice lock"><Lock size={14} /><div>{p.notice.map((n, i) => <p key={i}>{n}</p>)}</div></div>
+      <p><b>Apta para revisão:</b> {p.eligible ? "sim — todas as dependências têm análise concluída do Arquiteto." : `não — ${p.blockers.join("; ")}.`}</p>
+
+      <section className="run-sec"><h4>Tarefas relevantes (estado real no executor)</h4>
+        <table className="ctx-table"><thead><tr><th>Tarefa</th><th>Responsável</th><th>Relação</th><th>Estado</th></tr></thead>
+          <tbody>{p.tasks.map(t => <tr key={t.id}><td>{t.id} · {t.title}</td><td>{t.assigneeName}</td><td>{t.relation}</td><td><TaskStateBadge state={t.state} />{t.runId && <button className="link" onClick={() => onOpenRun(t.runId!)}> {t.runId.slice(0, 8)}</button>}</td></tr>)}</tbody>
+        </table>
+      </section>
+
+      <section className="run-sec"><h4>Análises registradas dos Arquitetos ({p.analyses.length})</h4>
+        {p.analyses.map(a => (
+          <div key={a.runId} className="question">
+            <b>{a.taskId} · {a.title}</b>
+            <small>Execução <button className="link" onClick={() => onOpenRun(a.runId)}>{a.runId.slice(0, 8)}</button>{a.revision ? `, revisão ${a.revision}` : ""}, commit <code>{a.commit?.slice(0, 12) ?? "—"}</code>{a.via === "local_git" ? " (cópia local)" : ""} · insumo, não fato verificado</small>
+            <p>{a.recommendation.summary}</p>
+            {!!a.guidance.length && <ol>{a.guidance.map((g, i) => <li key={i}>{g}</li>)}</ol>}
+            {!!a.decisions.length && <ul>{a.decisions.map((d, i) => <li key={i}><span className="tag">decisão sua</span> <b>{d.topic}:</b> {d.answer}</li>)}</ul>}
+          </div>
+        ))}
+      </section>
+
+      <section className="run-sec"><h4>Commit de base proposto</h4>
+        {p.base.proposed ? <p><code>{p.base.proposed.commit}</code>{p.base.proposed.via === "local_git" ? " (cópia local, não publicado)" : ""} — {p.base.proposed.why}</p> : <p className="muted">Nenhum.</p>}
+        {p.base.head && <small>HEAD da cópia local: <code>{p.base.head.commit.slice(0, 12)}</code> ({p.base.head.subject}){p.base.head.descendsFromProposed === true ? ", descende do proposto" : p.base.head.descendsFromProposed === false ? ", NÃO descende do proposto" : ""}.</small>}
+        <ul>{p.base.sinceAnalyses.map(s => <li key={s.taskId}>Desde a análise de {s.taskId} (<code>{s.commit.slice(0, 12)}</code>, {s.relation}): {s.changedTotal ?? "?"} arquivo(s) alterado(s){s.examinedChanged.length ? `; examinados e alterados: ${s.examinedChanged.join(", ")}` : "; nenhum arquivo examinado mudou"}.</li>)}</ul>
+        <small>{p.base.note}</small>
+      </section>
+
+      <section className="run-sec"><h4>Pontos ainda não verificados ({p.unverified.length})</h4>
+        {p.unverified.length ? <ul>{p.unverified.map((u, i) => <li key={i}><span className="tag">{u.source}</span> {u.text}</li>)}</ul> : <p className="muted">Nenhum registrado.</p>}
+      </section>
+
+      <section className="run-sec"><h4>Escopo de edição previsto (não é permissão)</h4>
+        {p.editScope.length ? <table className="ctx-table"><thead><tr><th>Arquivo</th><th>Previsão</th><th>Citado em</th></tr></thead><tbody>{p.editScope.map(e => <tr key={e.path}><td>{e.path}</td><td>{e.action}</td><td>{e.from.join(", ")}</td></tr>)}</tbody></table> : <p className="muted">Nenhum arquivo citado.</p>}
+        <small>Fora do escopo desta tarefa:</small><ul>{p.outOfScope.map((o, i) => <li key={i}>{o}</li>)}</ul>
+      </section>
+
+      <section className="run-sec limits"><h4>O que uma futura execução do Desenvolvedor exigiria (não implementado)</h4><ul>{p.future.map((f, i) => <li key={i}>{f}</li>)}</ul></section>
+      <div className="task-actions"><button className="btn-secondary small" onClick={download}><Download size={13} /> Baixar prévia (.md)</button><span className="run-hint">Cópia desta visualização, gerada dos mesmos dados.</span></div>
+    </div>
+  );
+}

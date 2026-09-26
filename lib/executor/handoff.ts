@@ -12,9 +12,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { buildArchitectMessage, buildArchitectSystem } from "@/lib/engine/architect-prompt";
 import { ANALYSIS_JSON_SCHEMA } from "@/lib/engine/analysis-schema";
-import { HANDOFF_TARGETS, type ArchitectSnapshot, type Clarification, type ContextRevision, type DirectorSnapshot, type PlanExcerpt, type RunBudget, type RunRecord, type SourceContext, type TeamMemberInput } from "@/lib/engine/types";
-import { ARCHITECT_GITHUB_LIMITS, GithubError, extractPathMentions, readGithubContext, shrinkGithubText, type RequestedFile } from "./github";
-import { listLocalRepos, readLocalGitContext, type GitDeps } from "./local-git";
+import { HANDOFF_TARGETS, type ArchitectSnapshot, type Clarification, type ContextRevision, type DependencyAnalysis, type DirectorSnapshot, type HandoffTask, type PlanExcerpt, type RunBudget, type RunRecord, type SourceComparison, type SourceContext, type TeamMemberInput } from "@/lib/engine/types";
+import { ARCHITECT_GITHUB_LIMITS, GithubError, extractFileRefs, extractPathMentions, readGithubContext, shrinkGithubText, type RequestedFile } from "./github";
+import { compareLocalCommits, listLocalRepos, readLocalGitContext, type GitDeps } from "./local-git";
 import { estimateTokens } from "./planner";
 import { MemberZ } from "./runs-service";
 import type { NewRun, RunStore } from "./store";
@@ -39,6 +39,8 @@ export const HandoffZ = z.object({
   source: z.object({ via: z.enum(["github", "local_git"]), commit: hex40 }).optional(),
   /** Required when the source/commit differs from the previous hand-off of the task. */
   revisionReason: z.string().trim().max(500).optional(),
+  /** Files the user confirmed for reading (path or path#Symbol); when present, the path heuristic is not used. */
+  files: z.array(fileRef).max(12).optional(),
 });
 export type HandoffRequest = z.infer<typeof HandoffZ>;
 
@@ -75,6 +77,121 @@ export type PrepareDeps = {
 
 const cap = <T,>(items: T[], n: number) => ({ items: items.slice(0, n), omitted: Math.max(0, items.length - n) });
 const clip = (t: string, n: number) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
+const FILE_REF = /^[A-Za-z0-9_.@[\]/-]+(#[A-Za-z0-9_$]+)?$/;
+
+/** Bounded excerpt of a concluded analysis, for the collaborator whose task depends on it. */
+export async function dependencyAnalysis(store: RunStore, run: RunRecord): Promise<DependencyAnalysis | null> {
+  const a = run.analysis;
+  if (!a || run.status !== "analysis_ready") return null;
+  const snap = (await store.snapshot(run.id)) as ArchitectSnapshot | null;
+  const ctx = run.context?.kind === "github" ? run.context : null;
+  const guidance = cap(a.developer_guidance.map(x => clip(x, 260)), 8);
+  const risks = cap(a.risks.map(x => clip(`${x.risk}${x.mitigation ? ` — mitigação: ${x.mitigation}` : ""}`, 260)), 4);
+  const assumptions = cap(a.assumptions.map(x => clip(x, 240)), 4);
+  const notVerified = cap(a.not_verified.map(x => clip(x, 240)), 4);
+  const examined = cap(a.examined.map(e => ({ ref: clip(e.ref, 160), basis: e.basis })), 12);
+  return {
+    runId: run.id, revision: snap?.revision?.number ?? null, commit: ctx?.commit ?? null, via: ctx ? (ctx.via ?? "github") : null,
+    understanding: clip(a.technical_understanding, 400),
+    recommendation: { summary: clip(a.recommendation.summary, 700), rationale: clip(a.recommendation.rationale, 500) },
+    guidance: guidance.items, risks: risks.items, assumptions: assumptions.items, notVerified: notVerified.items, examined: examined.items,
+    decisions: snap?.decisions ?? [],
+    omitted: { guidance: guidance.omitted, risks: risks.omitted, assumptions: assumptions.omitted, notVerified: notVerified.omitted, examined: examined.omitted },
+  };
+}
+
+/**
+ * Files worth reading for a task, taken from the analyses it depends on: what they examined (read or
+ * inferred) and the paths they list as not verified or cite in their guidance. A suggestion only: the
+ * user confirms the list when preparing, and the executor reads only what exists at the chosen commit.
+ */
+export function suggestFiles(deps: { taskId: string; analysis: DependencyAnalysis }[], known?: Set<string>) {
+  const out: { ref: string; reason: string }[] = [];
+  const add = (ref: string, reason: string) => {
+    if (!FILE_REF.test(ref) || ref.includes("..")) return;
+    const path = ref.split("#")[0];
+    if (known && !known.has(path)) return;
+    if (!out.some(x => x.ref === ref)) out.push({ ref, reason });
+  };
+  for (const d of deps) {
+    const id = `${d.taskId} (${d.analysis.runId.slice(0, 8)})`;
+    for (const e of d.analysis.examined) add(e.ref.trim(), e.basis === "read" ? `lido na análise de ${id}` : `inferido (não lido) na análise de ${id}`);
+    for (const t of d.analysis.notVerified) for (const m of extractFileRefs(t)) add(m, `citado como não verificado na análise de ${id}`);
+    for (const t of [...d.analysis.assumptions, ...d.analysis.guidance]) for (const m of extractFileRefs(t)) add(m, `citado na análise de ${id}`);
+  }
+  // A bare path adds nothing when the same file is already asked for by symbol (it would only widen the excerpt).
+  return out.filter(x => x.ref.includes("#") || !out.some(y => y.ref.startsWith(`${x.ref}#`))).slice(0, 24);
+}
+
+/** Concluded analyses of the tasks this one depends on (direct dependencies). */
+async function dependencyRuns(store: RunStore, planRunId: string, plan: NonNullable<RunRecord["result"]>, task: HandoffTask) {
+  const out: { task: HandoffTask; run: RunRecord; analysis: DependencyAnalysis }[] = [];
+  for (const depId of task.depends_on) {
+    const dep = plan.tasks.find(t => t.id === depId);
+    if (!dep) continue;
+    const done = (await store.runsForTask(planRunId, dep.id)).find(r => r.status === "analysis_ready");
+    const analysis = done ? await dependencyAnalysis(store, done) : null;
+    if (done && analysis) out.push({ task: dep, run: done, analysis });
+  }
+  return out;
+}
+
+/** Compares the chosen commit with the Director's commit and with each dependency analysis commit (local clone only). */
+async function compareWith(local: PrepareDeps["local"], owner: string, repo: string, to: { commit: string; label: string }, froms: { commit: string; label: string }[], paths: string[]): Promise<SourceComparison[]> {
+  if (!local?.dirs.length) return [];
+  const repos = await listLocalRepos(local.dirs, local.git);
+  const r = repos.find(x => x.owner.toLowerCase() === owner.toLowerCase() && x.repo.toLowerCase() === repo.toLowerCase());
+  if (!r) return [];
+  const seen = new Set<string>();
+  const out: SourceComparison[] = [];
+  for (const f of froms) {
+    if (seen.has(f.commit)) continue;
+    seen.add(f.commit);
+    out.push(await compareLocalCommits({ dir: r.dir, from: f, to, paths }, local.git));
+  }
+  return out;
+}
+
+export type SourceOptions = {
+  directorCommit: string | null;
+  owner: string | null; repo: string | null;
+  dependencies: { taskId: string; runId: string; revision: number | null; commit: string | null; via: "github" | "local_git" | null }[];
+  localRepos: { dirName: string; head: string; headSubject: string }[];
+  /** Proposal: the commit of the most recent dependency analysis, else the Director's commit. */
+  proposed: { via: "github" | "local_git"; commit: string; why: string } | null;
+  suggestedFiles: { ref: string; reason: string }[];
+  comparisons: SourceComparison[];
+};
+
+/** What the user needs to choose the source of a first hand-off (read-only: nothing is recorded, no model is called). */
+export async function sourceOptions(q: { directorRunId: string; taskId: string }, deps: PrepareDeps): Promise<SourceOptions> {
+  const parent = await deps.store.get(q.directorRunId);
+  if (!parent || parent.kind !== "director_plan" || !parent.result) refuse(404, "plan_not_found", "Plano do Diretor não encontrado ou não concluído.");
+  const task = parent!.result!.tasks.find(t => t.id === q.taskId);
+  if (!task) refuse(404, "task_not_found", `A tarefa "${q.taskId}" não existe neste plano do Diretor.`);
+  const ctx = (await deps.store.detail(parent!.id))?.context;
+  const gh = ctx?.kind === "github" ? ctx : null;
+  const deps_ = await dependencyRuns(deps.store, parent!.id, parent!.result!, task!);
+  const repos = deps.local?.dirs.length && gh ? (await listLocalRepos(deps.local.dirs, deps.local.git)).filter(r => r.owner.toLowerCase() === gh.owner.toLowerCase() && r.repo.toLowerCase() === gh.repo.toLowerCase()) : [];
+  const latestDep = deps_.filter(d => d.analysis.commit).sort((a, b) => (b.run.finishedAt ?? "").localeCompare(a.run.finishedAt ?? ""))[0];
+  const proposed = latestDep?.analysis.commit
+    ? { via: (latestDep.analysis.via ?? "github") as "github" | "local_git", commit: latestDep.analysis.commit, why: `Commit em que foi feita a análise de ${latestDep.task.id} (${latestDep.run.id.slice(0, 8)}), da qual esta tarefa depende.` }
+    : gh ? { via: "github" as const, commit: gh.commit, why: "Commit que o Diretor leu." } : null;
+  const suggestedFiles = suggestFiles(deps_.map(d => ({ taskId: d.task.id, analysis: d.analysis })));
+  const paths = [...new Set(suggestedFiles.map(f => f.ref.split("#")[0]))];
+  const comparisons: SourceComparison[] = [];
+  if (gh && repos.length) {
+    const froms = [{ commit: gh.commit, label: "commit do Diretor" }, ...deps_.filter(d => d.analysis.commit).map(d => ({ commit: d.analysis.commit!, label: `análise de ${d.task.id}` }))];
+    const tos = [...new Map([...(proposed ? [[proposed.commit, "proposto"]] : []), [repos[0].head, "HEAD da cópia local"]] as [string, string][]).entries()];
+    for (const [commit, label] of tos) comparisons.push(...(await compareWith(deps.local, gh.owner, gh.repo, { commit, label }, froms.filter(f => f.commit !== commit), paths)));
+  }
+  return {
+    directorCommit: gh?.commit ?? null, owner: gh?.owner ?? null, repo: gh?.repo ?? null,
+    dependencies: deps_.map(d => ({ taskId: d.task.id, runId: d.run.id, revision: d.analysis.revision, commit: d.analysis.commit, via: d.analysis.via })),
+    localRepos: repos.map(r => ({ dirName: r.dirName, head: r.head, headSubject: r.headSubject })),
+    proposed, suggestedFiles, comparisons,
+  };
+}
 
 /** Validates the hand-off against the executor's records and freezes what will be sent. */
 export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Promise<{ run: RunRecord; created: boolean }> {
@@ -128,9 +245,14 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
     if (!HANDOFF_TARGETS.includes(dep.assignee as (typeof HANDOFF_TARGETS)[number])) { blockers.push(`${dep.id} (${dep.assignee}) ainda não executa nesta fase`); continue; }
     const done = (await store.runsForTask(parent!.id, dep.id)).find(r => r.status === "analysis_ready");
     if (!done) { blockers.push(`${dep.id} precisa antes de uma análise concluída do Arquiteto`); continue; }
-    dependsOn.push({ id: dep.id, title: dep.title, assignee: dep.assignee, analysisSummary: done.analysis?.recommendation.summary ?? null, analysisRunId: done.id });
+    dependsOn.push({ id: dep.id, title: dep.title, assignee: dep.assignee, analysisSummary: done.analysis?.recommendation.summary ?? null, analysisRunId: done.id, analysis: await dependencyAnalysis(store, done) });
   }
   if (blockers.length) refuse(409, "dependency_pending", `A tarefa ${task!.id} depende de outras ainda não concluídas.`, blockers);
+
+  // Files the user confirmed when preparing (usually suggested from the analyses this task depends on).
+  const suggested = suggestFiles(dependsOn.filter(d => d.analysis).map(d => ({ taskId: d.id, analysis: d.analysis! })));
+  const confirmedFiles = [...new Set(req.files ?? [])].map(ref => ({ ref, reason: suggested.find(s => s.ref === ref)?.reason ?? "indicado por você no preparo do envio" }));
+  for (const f of confirmedFiles) if (!requested.some(r => r.ref === f.ref)) requested.push(f);
 
   const pSnap = (await store.snapshot(parent!.id)) as DirectorSnapshot;
   const pDetail = (await store.detail(parent!.id))!;
@@ -218,6 +340,17 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
     commit: context.kind === "github" ? context.commit : null, via: context.kind === "github" ? (context.via ?? "github") : null,
     changedCommit, reason: req.revisionReason || (waiting ? "Esclarecimento das perguntas da análise anterior." : previous ? "Novo envio após falha ou cancelamento." : "Primeiro envio."),
   };
+  if (confirmedFiles.length) revision.requestedFiles = confirmedFiles;
+  // A local commit is compared, file by file, with the Director's commit and with the commits of the analyses it builds on.
+  if (context.kind === "github" && context.via === "local_git") {
+    const c = context;
+    const froms = [
+      ...(excerpt.directorCommit ? [{ commit: excerpt.directorCommit, label: "commit do Diretor" }] : []),
+      ...dependsOn.filter(d => d.analysis?.commit).map(d => ({ commit: d.analysis!.commit!, label: `análise de ${d.id}` })),
+    ].filter(f => f.commit !== c.commit);
+    const cmp = await compareWith(deps.local, c.owner, c.repo, { commit: c.commit, label: "commit deste envio" }, froms, [...new Set(requested.map(r => r.ref.split("#")[0]))]);
+    if (cmp.length) revision.comparisons = cmp;
+  }
   const others = plan.tasks.filter(t => t.id !== task!.id);
   const scope = {
     asked: [`Análise técnica da tarefa ${task!.id} (${task!.title}), com o entregável: ${task!.deliverable}`, "Separar o que foi lido do que foi inferido; orientar o Desenvolvedor; recomendar checagens ao QA."],
@@ -261,7 +394,8 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
   const res = await store.create(nr);
   if (res.created) {
     await store.event(res.run.id, "prepared", `Tarefa ${task!.id} do plano ${parent!.id.slice(0, 8)} preparada para o Arquiteto (revisão ${revision.number}): ${context.kind === "github" ? `${context.files.length} arquivo(s) do commit ${context.commit.slice(0, 12)}${context.via === "local_git" ? " (cópia local)" : ""}` : "sem arquivos do repositório"}, cerca de ${estimate} tokens de texto (estimativa).`, { files: context.kind === "github" ? context.files.map(f => f.path) : [] });
-    if (changedCommit) await store.event(res.run.id, "context_revision", `Revisão de contexto: commit ${prevCommit?.slice(0, 12)} (${prevVia}) → ${want!.commit.slice(0, 12)} (${want!.via}). Motivo: ${revision.reason}. O envio anterior (${previous?.id.slice(0, 8)}) não foi alterado.`);
+    if (changedCommit) await store.event(res.run.id, "context_revision", `Revisão de contexto: commit ${prevCommit?.slice(0, 12)} (${prevVia}) → ${want!.commit.slice(0, 12)} (${want!.via}). Motivo: ${revision.reason}. ${previous ? `O envio anterior (${previous.id.slice(0, 8)}) não foi alterado.` : "Primeiro envio desta tarefa: o commit anterior é o que o Diretor leu; o plano do Diretor não foi alterado."}${revision.comparisons?.length ? ` Comparação: ${revision.comparisons.map(c => `${c.from.label} ${c.from.commit.slice(0, 12)} → ${c.to.commit.slice(0, 12)}: ${c.files.filter(f => !f.atFrom && f.atTo).length} arquivo(s) pedido(s) inexistente(s) antes, ${c.files.filter(f => f.changed).length} alterado(s)`).join("; ")}.` : ""}`, { comparisons: revision.comparisons ?? [] });
+    if (confirmedFiles.length) await store.event(res.run.id, "requested_files", `${confirmedFiles.length} arquivo(s) confirmado(s) por você para leitura: ${confirmedFiles.map(f => f.ref).join(", ")}.`, { files: confirmedFiles });
     if (clarifications.length) await store.event(res.run.id, "clarifications", `${clarifications.filter(c => c.resolution.by === "user").length} resposta(s) sua(s) e ${clarifications.filter(c => c.resolution.by === "reading").length} dúvida(s) resolvida(s) por leitura, vinculadas às perguntas da execução ${waiting!.id.slice(0, 8)}.`);
     if (budgetTokens > 0 && estimate >= budgetTokens) await store.event(res.run.id, "budget_alert", `Alerta: a estimativa do texto (${estimate}) já passa do orçamento da ficha do Arquiteto (${budgetTokens}). O orçamento é referência; a execução só começa se você confirmar.`);
   }

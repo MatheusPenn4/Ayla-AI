@@ -7,12 +7,14 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import type { useRuns } from "@/hooks/use-runs";
 import { Avatar } from "../avatar";
 import { ClarifyForm } from "./clarify-form";
+import { DeveloperPreviewPanel } from "./developer-preview-panel";
+import { ComparisonTable, SendForm } from "./send-form";
 import { UsagePanel } from "./usage-panel";
 import { engineApi, type HandoffFollowUp } from "@/lib/engine/client";
 import { ANALYSIS_JSON_SCHEMA } from "@/lib/engine/analysis-schema";
 import { PLAN_JSON_SCHEMA } from "@/lib/engine/plan-schema";
 import { connectionLabel } from "@/lib/engine/connections";
-import { TASK_STATE_LABEL, handoffBlocker, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
+import { TASK_STATE_LABEL, developerBlocker, handoffBlocker, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DirectorSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
 
@@ -42,7 +44,7 @@ type DialogProps = {
   onReplan: (run: RunDetail, answers?: Answers) => void;
   onCancel: (runId: string) => void;
   /** “Enviar ao Arquiteto” on a task of a Director plan (prepares the hand-off and opens the review). */
-  onHandoff: (planRunId: string, taskId: string) => void;
+  onHandoff: (planRunId: string, taskId: string, followUp?: HandoffFollowUp) => void;
   /** Reopens the review of a prepared hand-off. */
   onReview: (handoffRunId: string) => void;
   /** Resolution of the Architect's questions (prepares a new hand-off for review). */
@@ -160,6 +162,8 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   const name = (id: string) => who(id)?.name ?? snap.team.find(t => t.id === id)?.name ?? id;
   const architectTasks = res?.tasks.filter(t => isHandoffTarget(t.assignee)) ?? [];
   const runsOf = (taskId: string) => runs.taskRunsFor(run.id, taskId);
+  const [sendFor, setSendFor] = useState<string | null>(null);
+  const [previewFor, setPreviewFor] = useState<string | null>(null);
 
   return (
     <>
@@ -233,7 +237,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                   {isHandoffTarget(t.assignee) && run.status === "plan_ready" && (
                     <div className="task-actions">
                       {canSend && (
-                        <button className="btn-primary small" disabled={!!blocker || sending || !runs.status?.executionEnabled} title={blocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoff(run.id, t.id)}>
+                        <button className="btn-primary small" disabled={!!blocker || sending || !runs.status?.executionEnabled || sendFor === t.id} title={blocker ?? runs.status?.disabledReason ?? undefined} onClick={() => setSendFor(t.id)}>
                           {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><Send size={13} /> {st.key === "proposed" ? "Enviar ao Arquiteto" : "Enviar ao Arquiteto novamente"}</>}
                         </button>
                       )}
@@ -245,7 +249,20 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                       {tr.length > 1 && <span className="run-history">Histórico: {tr.map(r => <button key={r.id} className="chip" onClick={() => (r.status === "awaiting_approval" ? onReview(r.id) : onOpenRun(r.id))} title={time(r.createdAt)}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>}
                     </div>
                   )}
+                  {canSend && sendFor === t.id && run.status === "plan_ready" && (
+                    <SendForm planRunId={run.id} taskId={t.id} sending={sending} disabled={!runs.status?.executionEnabled} onClose={() => setSendFor(null)} onSubmit={f => { setSendFor(null); onHandoff(run.id, t.id, f); }} />
+                  )}
                   {!isHandoffTarget(t.assignee) && <small className="muted">Proposta registrada. {name(t.assignee)} ainda não executa nesta fase; nada foi delegado.</small>}
+                  {t.assignee === "developer" && run.status === "plan_ready" && (() => {
+                    const devBlocker = developerBlocker(t, res.tasks, runsOf);
+                    return (
+                      <div className="task-actions">
+                        <button className="btn-secondary small" disabled={!!devBlocker || previewFor === t.id} title={devBlocker ?? undefined} onClick={() => setPreviewFor(t.id)}><FileText size={13} /> Ver prévia do envio ao Desenvolvedor</button>
+                        <span className="run-hint">{devBlocker ?? "Só visualização: não cria execução nem concede escrita."}</span>
+                      </div>
+                    );
+                  })()}
+                  {previewFor === t.id && <DeveloperPreviewPanel planRunId={run.id} taskId={t.id} onOpenRun={onOpenRun} onClose={() => setPreviewFor(null)} />}
                 </article>
               );
             }) ?? <p className="muted">Sem tarefas.</p>}
@@ -346,6 +363,7 @@ function ArchitectBody({ run, active, agents, runs, onCancel, onOpenRun, onRevie
                 <section className="run-sec"><h4>Arquivos, símbolos e contratos examinados</h4>
                   {a.examined.length ? <table className="ctx-table"><thead><tr><th>Referência</th><th>Tipo</th><th>Base</th><th>Nota</th></tr></thead><tbody>{a.examined.map((e, i) => <tr key={i}><td><code>{e.ref}</code></td><td>{e.kind}</td><td><span className={`basis b-${e.basis}`}>{e.basis === "read" ? "lido (conteúdo enviado)" : "inferido"}</span></td><td>{e.note}</td></tr>)}</tbody></table> : <p className="muted">Nenhum.</p>}
                 </section>
+                <Coverage run={run} />
                 <div className="run-cols">
                   <section className="run-sec"><h4>Dependências</h4>{a.dependencies.length ? <ul>{a.dependencies.map((x, i) => <li key={i}>{x}</li>)}</ul> : <p className="muted">—</p>}</section>
                   <section className="run-sec"><h4>Compatibilidade</h4>{a.compatibility.length ? <ul>{a.compatibility.map((x, i) => <li key={i}>{x}</li>)}</ul> : <p className="muted">—</p>}</section>
@@ -396,6 +414,28 @@ function ArchitectBody({ run, active, agents, runs, onCancel, onOpenRun, onRevie
   );
 }
 
+/** What the analysis says it read, what it only inferred, what was sent but not cited, and what was not examined. */
+function Coverage({ run }: { run: RunDetail }) {
+  const a = run.analysis;
+  const ctx = run.context?.kind === "github" ? run.context : null;
+  if (!a || !ctx) return null;
+  const path = (ref: string) => ref.trim().replace(/^`|`$/g, "").split(/[#\s(]/)[0];
+  const read = a.examined.filter(e => e.basis === "read"), inferred = a.examined.filter(e => e.basis === "inferred");
+  const cited = new Set(a.examined.map(e => path(e.ref)));
+  const sentNotCited = ctx.files.filter(f => !cited.has(f.path));
+  const notExamined = Math.max(0, ctx.structureSample.length - ctx.files.length);
+  return (
+    <section className="run-sec"><h4>Cobertura da leitura</h4>
+      <ul>
+        <li><b>Lido</b> (conteúdo enviado e conferido pelo executor): {read.length ? read.map(e => e.ref).join(", ") : "nenhum"}.</li>
+        <li><b>Inferido</b> (não lido; deve ser conferido): {inferred.length ? inferred.map(e => e.ref).join(", ") : "nenhum"}.</li>
+        <li><b>Enviado e não citado</b>: {sentNotCited.length ? sentNotCited.map(f => f.path).join(", ") : "nenhum"}.</li>
+        <li><b>Não examinado</b>: os outros {notExamined} arquivo(s) de texto do repositório foram enviados só pelo nome{ctx.skipped.length ? `; pedidos e não lidos: ${ctx.skipped.map(x => `${x.path} (${x.reason})`).join(", ")}` : ""}.</li>
+      </ul>
+    </section>
+  );
+}
+
 /** Context revision and how the earlier questions were resolved (shown in the run and in the review). */
 export function RevisionInfo({ snap, onOpenRun }: { snap: ArchitectSnapshot; onOpenRun?: (id: string) => void }) {
   const r = snap.revision;
@@ -408,8 +448,11 @@ export function RevisionInfo({ snap, onOpenRun }: { snap: ArchitectSnapshot; onO
           <ul>
             <li>Commit usado: <code>{r.commit?.slice(0, 12) ?? "—"}</code> {r.via === "local_git" ? "(cópia local autorizada)" : r.via === "github" ? "(GitHub público)" : ""}</li>
             {r.previousRunId && <li>Envio anterior: {onOpenRun ? <button className="link" onClick={() => onOpenRun(r.previousRunId!)}>{r.previousRunId.slice(0, 8)}</button> : r.previousRunId.slice(0, 8)} · commit <code>{r.previousCommit?.slice(0, 12) ?? "—"}</code> {r.previousVia === "local_git" ? "(cópia local)" : "(GitHub)"} — não foi alterado</li>}
-            <li>{r.changedCommit ? "Commit ou fonte trocados nesta revisão." : "Mesmo commit e fonte do envio anterior."} Motivo: {r.reason}</li>
+            {!r.previousRunId && r.changedCommit && <li>Primeiro envio desta tarefa. Commit que o Diretor leu: <code>{r.previousCommit?.slice(0, 12) ?? "—"}</code> {r.previousVia === "local_git" ? "(cópia local)" : "(GitHub público)"} — o plano do Diretor não foi alterado.</li>}
+            <li>{r.changedCommit ? (r.previousRunId ? "Commit ou fonte trocados nesta revisão." : "Commit ou fonte diferentes do que o Diretor leu.") : "Mesmo commit e fonte do envio anterior."} Motivo: {r.reason}</li>
           </ul>
+          {!!r.requestedFiles?.length && <><small>Arquivos confirmados por você para leitura ({r.requestedFiles.length}):</small><ul className="ctx-skip">{r.requestedFiles.map(f => <li key={f.ref}><code>{f.ref}</code> — {f.reason}</li>)}</ul></>}
+          {r.comparisons?.map((c, i) => <ComparisonTable key={i} c={c} />)}
         </section>
       )}
       {!!cl.length && (

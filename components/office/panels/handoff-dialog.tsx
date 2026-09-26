@@ -46,6 +46,24 @@ function compareFile(f: ConsultedFile, commit: string, prev: RunDetail | null): 
   return { label: `enviado antes no commit ${pc.commit.slice(0, 12)}; relido no novo commit (o envio anterior não registrou hash para comparar)`, cls: "changed" };
 }
 
+/** What earlier Architect runs on the same connection reported: the only basis for the possible cost of a new call. */
+function CostNote({ runs, run }: { runs: RunsApi; run: RunDetail }) {
+  const past = runs.runs.filter(r => r.kind === "architect_task" && r.id !== run.id && r.connection === run.connection && r.budget.reportedTotalTokens != null && r.budget.estimatedInputTokens);
+  const est = run.budget.estimatedInputTokens ?? 0;
+  const ratios = past.map(r => r.budget.reportedTotalTokens! / r.budget.estimatedInputTokens!);
+  const lo = ratios.length ? Math.min(...ratios) : 0, hi = ratios.length ? Math.max(...ratios) : 0;
+  const secs = past.map(r => (r.startedAt && r.finishedAt ? (Date.parse(r.finishedAt) - Date.parse(r.startedAt)) / 1000 : null)).filter((x): x is number => x != null);
+  return (
+    <div className="form-note">
+      <b>Custo possível desta chamada.</b>{" "}
+      {past.length
+        ? <>Nas {past.length} execução(ões) anteriores do Arquiteto por {connectionLabel(run.connection)}, o cliente informou {past.map(r => fmt(r.budget.reportedTotalTokens!)).join(" e ")} tokens no total (entre {lo.toFixed(1)}× e {hi.toFixed(1)}× a estimativa do texto), em {secs.map(s => `${Math.round(s)} s`).join(" e ")}. Para esta estimativa, isso sugeriria algo entre {fmt(Math.round(est * lo))} e {fmt(Math.round(est * hi))} tokens — é uma referência, não uma medida nem um limite.</>
+        : <>Não há execução anterior do Arquiteto por esta conexão com uso informado para comparar.</>}
+      {" "}O consumo sai da cota da sua assinatura (não há cobrança por API); o saldo e os limites da assinatura não são informados ao Setor IA. O valor real só é conhecido depois, pelo que o cliente informar. Tempo limite por chamada: {Math.round((runs.status?.limits.callTimeoutMs ?? 0) / 60000)} min.
+    </div>
+  );
+}
+
 function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; agents: Agent[]; runs: RunsApi; onClose: () => void; onApproved: (runId: string) => void }) {
   const { run, error } = useRunDetail(runId);
   const prevId = run ? (run.snapshot as ArchitectSnapshot).revision?.previousRunId ?? null : null;
@@ -107,8 +125,8 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
           {snap.plan.directorFiles.length ? <><small>Commit <code>{snap.plan.directorCommit?.slice(0, 12)}</code></small><ul className="ctx-skip">{snap.plan.directorFiles.map(f => <li key={f.path}>{f.path} · {fmt(f.bytes)} B{f.truncated ? " (lido em parte)" : ""}</li>)}</ul></> : <p className="muted">O Diretor não leu arquivos do repositório nesta demanda.</p>}
         </section>
 
-        {(snap.revision?.number ?? 1) > 1 && (
-          <section className={`run-sec ${snap.revision?.changedCommit ? "rev-changed" : ""}`}><h4>Revisão {snap.revision?.number}: o que muda em relação ao envio anterior</h4>
+        {((snap.revision?.number ?? 1) > 1 || snap.revision?.changedCommit) && (
+          <section className={`run-sec ${snap.revision?.changedCommit ? "rev-changed" : ""}`}><h4>{(snap.revision?.number ?? 1) > 1 ? `Revisão ${snap.revision?.number}: o que muda em relação ao envio anterior` : "Commit diferente do que o Diretor leu"}</h4>
             <RevisionInfo snap={snap} />
             {prev?.analysis && <small>Da análise anterior ({prev.id.slice(0, 8)}) vão só um resumo do entendimento e a recomendação provisória; a resposta completa não é reenviada.</small>}
           </section>
@@ -118,7 +136,9 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
           <ul>
             <li>Demanda (título, descrição e critérios) e esta tarefa completa.</li>
             <li>Resumo do plano: objetivo, fluxo, etapa desta tarefa, riscos, suposições e o que o Diretor não verificou.</li>
-            {snap.plan.dependsOn.map(d => <li key={d.id}>Análise anterior de {d.id} ({d.title}): resumo da recomendação.</li>)}
+            {snap.plan.dependsOn.map(d => d.analysis
+              ? <li key={d.id}>Análise concluída de <b>{d.id}</b> ({d.title}): execução <code>{d.analysis.runId.slice(0, 8)}</code>{d.analysis.revision ? `, revisão ${d.analysis.revision}` : ""}, commit <code>{d.analysis.commit?.slice(0, 12) ?? "—"}</code>{d.analysis.via === "local_git" ? " (cópia local)" : ""}. Vão: entendimento, recomendação e justificativa, {d.analysis.examined.length} referência(s) examinada(s), {d.analysis.guidance.length} orientação(ões), {d.analysis.risks.length} risco(s), {d.analysis.assumptions.length} suposição(ões), {d.analysis.notVerified.length} ponto(s) não verificado(s){d.analysis.decisions.length ? <> e <b>{d.analysis.decisions.length} decisão(ões) sua(s)</b> registrada(s) nesse envio ({d.analysis.decisions.map(x => x.topic).join("; ")})</> : ""}. Marcada como insumo, não como fato verificado.</li>
+              : <li key={d.id}>Análise anterior de {d.id} ({d.title}): resumo da recomendação.</li>)}
             {!!snap.plan.dependents.length && <li>Quem usa o resultado: {snap.plan.dependents.map(d => `${d.id} → ${name(d.assignee)}`).join(", ")} (só como referência; ninguém é acionado).</li>}
             <li>Não vão: as demais tarefas em detalhe e a resposta completa do Diretor.</li>
             {snap.answers?.length ? <li>Suas respostas às perguntas anteriores do Arquiteto ({snap.answers.length}).</li> : null}
@@ -132,13 +152,15 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
                 {" "}Conteúdo enviado de {files.length} arquivo(s):
               </small>
               <table className="ctx-table"><thead><tr><th>Arquivo</th><th>Motivo</th><th>Enviado</th><th>Em relação ao envio anterior</th></tr></thead>
-                <tbody>{files.map(f => { const c = compareFile(f, ctx.commit, prev); return <tr key={f.path}><td><FileText size={12} /> {f.path}</td><td>{f.reason}</td><td>{fmt(f.sentChars)} car.{f.excerpt ? ` (trecho: ${f.excerpt.ranges.map(([a, b]) => `l.${a}-${b}`).join(", ")} de ${f.excerpt.totalLines})` : f.truncated ? " (truncado)" : ""}</td><td><span className={`cmp-${c.cls}`}>{c.label}</span></td></tr>; })}</tbody>
+                <tbody>{files.map(f => { const c = compareFile(f, ctx.commit, prev); return <tr key={f.path}><td><FileText size={12} /> {f.path}</td><td>{f.reason}</td><td>{fmt(f.sentChars)} de {fmt(f.bytes)} B{f.excerpt ? <> · trecho: {[...f.excerpt.ranges].sort((x, y) => x[0] - y[0]).map(([a, b]) => `l.${a}-${b}`).join(", ")} de {f.excerpt.totalLines}<br /><small>blocos enviados: {f.excerpt.symbols.join(", ") || "só a lista de declarações"}</small></> : f.truncated ? " (truncado)" : " · inteiro"}</td><td><span className={`cmp-${c.cls}`}>{c.label}</span></td></tr>; })}</tbody>
               </table>
+              <small>Só conta como <b>lido</b> o que está nesta tabela; num trecho, só os blocos listados (a lista de declarações não é leitura). O executor recusa uma análise que marque como lido algo fora disso. Os outros {Math.max(0, ctx.structureSample.length - files.length)} arquivo(s) de texto listados vão <b>só pelo nome</b> (não examinados).</small>
               {!!notResent.length && <small>Lidos pelo Diretor e não reenviados (só o caminho vai): {notResent.map(f => f.path).join(", ")}.</small>}
               {!!ctx.skipped.length && <small> Não lidos por limite: {ctx.skipped.map(s => s.path).join(", ")}.</small>}
             </>
           )}
           {ctx && ctx.kind !== "github" && <p>{ctx.kind === "folder" ? "Pasta local: somente metadados; nenhum arquivo será enviado." : ctx.note}</p>}
+          <CostNote runs={runs} run={run} />
           <p className={`form-note ${overBudget ? "warn" : ""}`}>Texto enviado: cerca de {fmt(est)} tokens (estimativa do Setor IA; o cliente acrescenta instruções próprias). Orçamento da ficha do Arquiteto: {fmt(run.budget.sheetTokens)} tokens (referência/alerta).{overBudget ? " A estimativa já passa do orçamento: ao confirmar, você aceita esse alerta." : ""}</p>
           <details className="raw"><summary>Ver o texto exato que será enviado</summary>
             <h4 className="ctx-h">Instruções (protocolo do Arquiteto + ficha salva do Arquiteto)</h4><pre className="brief">{run.prompt?.system}</pre>

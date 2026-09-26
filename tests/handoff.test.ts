@@ -25,6 +25,11 @@ import { execFileSync } from "node:child_process";
 import { createHash as hashOf } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { connected, fakeAdapter, goodPlan, member, reply, request, usage } from "./helpers";
+import { partialTexts } from "@/lib/engine/analysis-schema";
+import { developerPreviewMarkdown, type DeveloperPreview } from "@/lib/engine/developer-preview";
+import { TASK_STATE_LABEL, developerBlocker } from "@/lib/engine/handoff-state";
+import { extractFileRefs } from "@/lib/executor/github";
+import { suggestFiles, type SourceOptions } from "@/lib/executor/handoff";
 
 let work: string;
 let store: RunStore;
@@ -162,7 +167,9 @@ describe("preparar o envio ao Arquiteto (nada executa)", () => {
     expect(second.status).toBe(201);
     const snap = body<{ run: RunDetail }>(second).run.snapshot as ArchitectSnapshot;
     expect(snap.plan.dependsOn[0]).toMatchObject({ id: "t1", analysisRunId: first.id, analysisSummary: "Adicionar a classe azul no Botao." });
-    expect(body<{ run: RunDetail }>(second).run.prompt?.user).toContain("Análise registrada do Arquiteto: Adicionar a classe azul no Botao.");
+    // The concluded analysis goes once, in its own section, with its commit (not repeated in the plan summary).
+    expect(body<{ run: RunDetail }>(second).run.prompt?.user).toContain(`t1 · análise concluída ${first.id.slice(0, 8)}`);
+    expect(body<{ run: RunDetail }>(second).run.prompt?.user).toContain("Recomendação: Adicionar a classe azul no Botao.");
   });
 
   it("o estado das tarefas na interface segue os registros do executor", () => {
@@ -664,5 +671,176 @@ describe("contexto verificável e diagnóstico de tamanho", () => {
     const u = claudeUsage({ type: "result", num_turns: 2, duration_ms: 1500, usage: { iterations: [{ input_tokens: 2, cache_creation_input_tokens: 1400, output_tokens: 70 }, { input_tokens: 1, cache_read_input_tokens: 1400, output_tokens: 5 }] }, modelUsage: { m: { inputTokens: 3, outputTokens: 75, cacheReadInputTokens: 1400, cacheCreationInputTokens: 1400 } } } as never, "x")!;
     expect(u.turns).toBe(2);
     expect(u.apiCalls).toEqual([{ inputTokens: 2, outputTokens: 70, cacheReadTokens: null, cacheWriteTokens: 1400 }, { inputTokens: 1, outputTokens: 5, cacheReadTokens: 1400, cacheWriteTokens: null }]);
+  });
+});
+
+// ---- Task chain: an Architect task that depends on another, and the Developer preview (SIMULATED clients) ----
+const chainPlan = () => archPlan({
+  tasks: archPlan().tasks.map(t => (t.id === "t3" ? { ...t, depends_on: ["t2"], scope: "Criar src/serializador.ts e alterar src/botao.tsx" } : t)),
+});
+const DECISION = { topic: "Formato", answer: "Mostrar o estado real de cada tarefa." };
+
+/** t1 concluded (with a decision of the user recorded in its hand-off). */
+async function chainWithT1(svc: ExecutorService) {
+  const plan = await directorPlan(chainPlan());
+  const t1 = body<{ run: RunDetail }>(await svc.prepare(handoffReq(plan, "t1", { decisions: [DECISION] }))).run;
+  await svc.approve(t1.id, { snapshotHash: t1.snapshotHash });
+  await svc.idle();
+  return { plan, t1: (await store.detail(t1.id))! };
+}
+
+describe("tarefa dependente e prévia do Desenvolvedor", () => {
+  it("opções de fonte: propõe o commit da análise da dependência e sugere os arquivos dela, sem criar registro", async () => {
+    const { svc } = service([reply(analysis())]);
+    const { plan, t1 } = await chainWithT1(svc);
+    const before = await store.listForDemands([t1.demandId]);
+    const o = body<SourceOptions>(await svc.sourceOptions(plan, "t2"));
+    expect(o.proposed).toMatchObject({ commit: COMMIT, via: "github" });
+    expect(o.dependencies).toEqual([expect.objectContaining({ taskId: "t1", runId: t1.id, commit: COMMIT })]);
+    const refs = o.suggestedFiles.map(f => f.ref);
+    expect(refs).toContain("src/botao.tsx#Botao");
+    expect(refs).toContain("src/tema.ts");
+    // "Editar src/botao.tsx" in the guidance does not add the bare path again.
+    expect(refs).not.toContain("src/botao.tsx");
+    expect(o.suggestedFiles.find(f => f.ref === "src/tema.ts")?.reason).toContain("inferido");
+    expect(await store.listForDemands([t1.demandId])).toEqual(before);
+    expect(body<{ error: { code: string } }>(await svc.sourceOptions("nao-e-uuid", "t2")).error.code).toBe("invalid_request");
+  });
+
+  it("envio de t2: leva a análise de t1 (uma vez, com commit e a decisão sua), só os arquivos confirmados, e não reaproveita a aprovação de t1", async () => {
+    const { svc, calls } = service([reply(analysis()), reply(analysis({ recommendation: { summary: "Especificação do .md.", rationale: "Curta." } }))]);
+    const { plan, t1 } = await chainWithT1(svc);
+    const r = await svc.prepare(handoffReq(plan, "t2", { files: ["src/botao.tsx#Botao", "src/nao-existe.ts"] }));
+    expect(r.status).toBe(201);
+    const run = body<{ run: RunDetail }>(r).run;
+    const snap = run.snapshot as ArchitectSnapshot;
+    expect(snap.plan.dependsOn[0].analysis).toMatchObject({ runId: t1.id, commit: COMMIT, via: "github", decisions: [DECISION] });
+    expect(snap.revision?.requestedFiles).toEqual([
+      { ref: "src/botao.tsx#Botao", reason: `lido na análise de t1 (${t1.id.slice(0, 8)})` },
+      { ref: "src/nao-existe.ts", reason: "indicado por você no preparo do envio" },
+    ]);
+    const u = run.prompt!.user;
+    expect(u).toContain("<analises_das_dependencias>");
+    expect(u.split("Adicionar a classe azul no Botao.").length - 1).toBe(1);
+    expect(u).toContain("Decisões do solicitante registradas nesse envio (valem como decisão do usuário):\n- Formato: Mostrar o estado real de cada tarefa.");
+    expect(run.prompt!.system).toContain("13. <analises_das_dependencias>");
+    const ctx = run.context as Extract<RunDetail["context"], { kind: "github" }>;
+    // Explicit files: the confirmed ones plus the task's own citations; no manifest, no name heuristic.
+    expect(ctx.files.map(f => f.path).sort()).toEqual(["src/botao.tsx", "src/estilo.css"]);
+    expect(ctx.skipped.map(s => s.path)).toContain("src/nao-existe.ts");
+    expect(run.events.map(e => e.kind)).toContain("requested_files");
+    // The approval of another run is not valid here.
+    expect((await svc.approve(run.id, { snapshotHash: t1.snapshotHash })).status).toBe(409);
+    expect((await store.get(run.id))!.status).toBe("awaiting_approval");
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(2);
+    expect((await store.get(run.id))!.status).toBe("analysis_ready");
+    expect((await store.get(t1.id))!.status).toBe("analysis_ready");
+  });
+
+  it("prévia do Desenvolvedor: bloqueada até todas as dependências (inclusive indiretas); depois, só visualização com estados reais", async () => {
+    const { svc, calls } = service([reply(analysis()), reply(analysis({ recommendation: { summary: "Criar src/serializador.ts puro.", rationale: "Testável." }, developer_guidance: ["Criar src/serializador.ts", "Alterar src/botao.tsx", "Antes de implementar, ler src/estilo.css"] }))]);
+    const { plan } = await chainWithT1(svc);
+    const tasks = chainPlan().tasks;
+    const runsOf = (id: string) => (id === "t1" ? [{ status: "analysis_ready" }] : []) as never;
+    expect(developerBlocker(tasks.find(t => t.id === "t3")!, tasks, runsOf)).toContain("t2");
+    const early = body<{ preview: DeveloperPreview }>(await svc.developerPreview(plan, "t3")).preview;
+    expect(early.eligible).toBe(false);
+    expect(early.blockers.join(" ")).toContain("t2");
+    expect(body<{ error: { code: string } }>(await svc.developerPreview(plan, "t1")).error.code).toBe("not_developer_task");
+
+    const t2 = body<{ run: RunDetail }>(await svc.prepare(handoffReq(plan, "t2"))).run;
+    await svc.approve(t2.id, { snapshotHash: t2.snapshotHash });
+    await svc.idle();
+    expect(developerBlocker(tasks.find(t => t.id === "t3")!, tasks, id => (id === "t1" || id === "t2") ? ([{ status: "analysis_ready" }] as never) : [])).toBeNull();
+    const runsBefore = await store.listForDemands([t2.demandId]);
+    const p = body<{ preview: DeveloperPreview }>(await svc.developerPreview(plan, "t3")).preview;
+    expect(p.eligible).toBe(true);
+    expect(p.analyses.map(a => a.taskId)).toEqual(["t2", "t1"]);
+    expect(p.analyses[1].decisions).toEqual([DECISION]);
+    expect(p.base.proposed).toMatchObject({ commit: COMMIT });
+    expect(p.tasks.find(t => t.id === "t3")).toMatchObject({ relation: "esta tarefa", state: "not_executable" });
+    expect(p.tasks.find(t => t.id === "t2")).toMatchObject({ relation: "dependência direta", state: "analysis_ready", runId: t2.id });
+    expect(p.tasks.find(t => t.id === "t1")).toMatchObject({ relation: "dependência indireta", state: "analysis_ready" });
+    expect(p.tasks.find(t => t.id === "t4")).toMatchObject({ relation: "depende desta" });
+    expect(p.editScope.map(e => e.path)).toEqual(expect.arrayContaining(["src/serializador.ts", "src/botao.tsx"]));
+    expect(p.editScope.find(e => e.path === "src/estilo.css")?.action).toBe("consultar"); // "ler" before the path: read, not edit
+    expect(p.editScope.find(e => e.path === "src/serializador.ts")?.action).toBe("a confirmar");
+    expect(p.unverified.some(x => x.source.startsWith("inferido") && x.text.includes("src/tema.ts"))).toBe(true);
+    // Same states in the Markdown copy as on screen (both come from taskState of the executor's records).
+    const md = developerPreviewMarkdown(p);
+    for (const t of p.tasks) expect(md).toContain(`| ${t.id} · ${t.title} | ${t.assigneeName} | ${t.relation} | ${TASK_STATE_LABEL[t.state]}`);
+    expect(md).toContain("não concede acesso de escrita");
+    // A view only: no run recorded, no client called, nothing changed.
+    expect(await store.listForDemands([t2.demandId])).toEqual(runsBefore);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("sugestões e referências: caminho com símbolo, sem duplicar o caminho puro, sem ..", () => {
+    expect(extractFileRefs("Ler lib/engine/types.ts#RunRecord e lib/utils.ts (ex.: lib/utils.ts#downloadTextFile); ../x/y.ts não")).toEqual(["lib/engine/types.ts#RunRecord", "lib/utils.ts", "lib/utils.ts#downloadTextFile"]);
+    const a = { runId: "r".repeat(36), revision: 1, commit: COMMIT, via: "github" as const, understanding: "", recommendation: { summary: "", rationale: "" }, guidance: ["Editar lib/a.ts"], risks: [], assumptions: [], notVerified: ["lib/b.ts l.1-9 não lido"], examined: [{ ref: "lib/a.ts#A", basis: "read" as const }], decisions: [], omitted: { guidance: 0, risks: 0, assumptions: 0, notVerified: 0, examined: 0 } };
+    expect(suggestFiles([{ taskId: "t1", analysis: a }]).map(x => x.ref)).toEqual(["lib/a.ts#A", "lib/b.ts"]);
+  });
+});
+
+describe("\"lido\" em arquivo enviado só em trecho", () => {
+  it("um símbolo que só aparece na lista de declarações não pode ser marcado como lido", () => {
+    const user = [
+      "<fonte>x</fonte>", "", "<dados_da_fonte>", "Descrição do repositório: x", "",
+      "--- arquivo: lib/t.ts (trecho verificável: l.1-3 de 40 linhas; commit cccccccccccc) ---",
+      "Declarações de nível superior (2): A (l.1), RunRecord (l.20)", "", "[linhas 1-3 · A]", "export type A = {", "  x: number;", "};",
+      "", "--- arquivo: lib/inteiro.ts ---", "export const B = 1;", "</dados_da_fonte>",
+    ].join("\n");
+    const files = [{ path: "lib/t.ts", truncated: true }, { path: "lib/inteiro.ts", truncated: false }];
+    const partial = partialTexts(user, files);
+    expect(Object.keys(partial)).toEqual(["lib/t.ts"]);
+    expect(partial["lib/t.ts"]).not.toContain("RunRecord");
+    const mk = (ref: string) => analysis({ examined: [{ ref, kind: "symbol", basis: "read", note: "" }] });
+    const read = ["lib/t.ts", "lib/inteiro.ts"];
+    expect(validateAnalysis(mk("lib/t.ts#A"), read, [], partial).ok).toBe(true);
+    expect(validateAnalysis(mk("lib/inteiro.ts#Qualquer"), read, [], partial).ok).toBe(true);
+    const bad = validateAnalysis(mk("lib/t.ts#RunRecord"), read, [], partial);
+    expect(bad.ok).toBe(false);
+    expect(!bad.ok && bad.errors[0]).toContain("só em trecho");
+    expect(validateAnalysis(analysis({ examined: [{ ref: "lib/t.ts#RunRecord", kind: "symbol", basis: "inferred", note: "" }] }), read, [], partial).ok).toBe(true);
+  });
+});
+
+describe("primeiro envio numa cópia local, comparado com o commit do Diretor (Git real)", () => {
+  it("registra arquivos confirmados e a comparação arquivo a arquivo; o evento não fala de envio anterior inexistente", async () => {
+    const dir = path.join(work, "clone");
+    mkdirSync(dir);
+    const g = (...a: string[]) => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
+    g("init", "-q", "-b", "main"); g("remote", "add", "origin", "https://github.com/o/r.git");
+    writeFileSync(path.join(dir, "package.json"), '{"name":"x"}');
+    mkdirSync(path.join(dir, "src"));
+    writeFileSync(path.join(dir, "src", "estilo.css"), ".a{}");
+    g("add", "."); g("commit", "-q", "-m", "base");
+    const base = g("rev-parse", "HEAD");
+    writeFileSync(path.join(dir, "src", "botao.tsx"), "export const Botao = () => null\n");
+    writeFileSync(path.join(dir, "src", "estilo.css"), ".a{color:blue}");
+    g("add", "."); g("commit", "-q", "-m", "botao");
+    const head = g("rev-parse", "HEAD");
+    const { svc } = service([], { localRepos: [dir] });
+    const plan = await directorPlan();
+    const detail = (await store.detail(plan))!;
+    await store.update(plan, { context: { ...(detail.context as Extract<RunDetail["context"], { kind: "github" }>)!, commit: base } });
+    const statusBefore = g("status", "--porcelain");
+    const o = body<SourceOptions>(await svc.sourceOptions(plan, "t1"));
+    expect(o.localRepos[0]).toMatchObject({ dirName: "clone", head });
+    const req = handoffReq(plan, "t1", { source: { via: "local_git", commit: head }, files: ["src/botao.tsx#Botao"] });
+    expect(body<{ error: { code: string } }>(await svc.prepare(req)).error.code).toBe("revision_reason_required");
+    const run = body<{ run: RunDetail }>(await svc.prepare({ ...req, revisionReason: "O botão só existe no commit local." })).run;
+    const rev = (run.snapshot as ArchitectSnapshot).revision!;
+    expect(rev).toMatchObject({ number: 1, previousRunId: null, previousCommit: base, commit: head, via: "local_git", changedCommit: true });
+    expect(rev.comparisons?.[0]).toMatchObject({ from: { commit: base, label: "commit do Diretor" }, to: { commit: head }, relation: "descendant", changedTotal: 2 });
+    expect(rev.comparisons?.[0].files).toEqual([{ path: "src/botao.tsx", atFrom: false, atTo: true, changed: true }]);
+    const ev = run.events.find(e => e.kind === "context_revision")!;
+    expect(ev.message).toContain("Primeiro envio desta tarefa");
+    expect(ev.message).not.toContain("undefined");
+    expect(run.prompt!.user).toContain("Primeiro envio desta tarefa, em um commit diferente do que o Diretor leu");
+    expect(run.prompt!.user).toContain("não existiam lá: src/botao.tsx");
+    expect(g("status", "--porcelain")).toBe(statusBefore);
   });
 });

@@ -11,7 +11,7 @@
 // reason and the recovery steps. No collaborator triggers another one.
 import { mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
-import { ANALYSIS_JSON_SCHEMA, validateAnalysis } from "@/lib/engine/analysis-schema";
+import { ANALYSIS_JSON_SCHEMA, partialTexts, validateAnalysis } from "@/lib/engine/analysis-schema";
 import { PLAN_JSON_SCHEMA, validatePlan } from "@/lib/engine/plan-schema";
 import { buildSystemPrompt, buildUserMessage } from "@/lib/engine/prompt";
 import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DirectorSnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
@@ -93,7 +93,7 @@ function keywords(...texts: string[]) {
   return [...new Set(texts.join(" ").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_-]+/))];
 }
 
-type Prepared = { system: string; user: string; context: SourceContext; readPaths: string[]; answered?: string[] };
+type Prepared = { system: string; user: string; context: SourceContext; readPaths: string[]; answered?: string[]; partial?: Record<string, string> };
 type Outcome = { status: RunStatus; result: object; message: string };
 type Spec = {
   who: string;
@@ -170,10 +170,11 @@ function architectSpec(deps: PlannerDeps): Spec {
       if (!detail.prompt || !detail.context) fail({ code: "handoff_incomplete", message: "O encaminhamento não tem a entrada congelada na aprovação. Prepare o envio novamente.", retryable: false, recovery: ["Abra a tarefa e clique em “Enviar ao Arquiteto” de novo."] });
       const context = detail.context!;
       const answered = ((detail.snapshot as ArchitectSnapshot).clarifications ?? []).map(c => c.question);
-      return { system: detail.prompt!.system, user: detail.prompt!.user, context, readPaths: context.kind === "github" ? context.files.map(f => f.path) : [], answered };
+      const partial = context.kind === "github" ? partialTexts(detail.prompt!.user, context.files) : {};
+      return { system: detail.prompt!.system, user: detail.prompt!.user, context, readPaths: context.kind === "github" ? context.files.map(f => f.path) : [], answered, partial };
     },
     validate(output, p, budget) {
-      const v = validateAnalysis(output, p.readPaths, p.answered ?? []);
+      const v = validateAnalysis(output, p.readPaths, p.answered ?? [], p.partial ?? {});
       if (!v.ok) return v;
       const status = v.analysis.outcome === "needs_clarification" ? "awaiting_clarification" : "analysis_ready";
       return { ok: true, outcome: { status, result: { ...v.analysis, limitations: architectLimitations(p.context, budget) }, message: status === "analysis_ready" ? "Análise técnica concluída e registrada." : `O Arquiteto precisa de esclarecimento: ${v.analysis.questions.length} pergunta(s).` } };

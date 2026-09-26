@@ -9,7 +9,7 @@
 // - structured arguments, no shell, time limit, output cap.
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { SourceContext } from "@/lib/engine/types";
+import type { SourceComparison, SourceContext } from "@/lib/engine/types";
 import { ARCHITECT_GITHUB_LIMITS, GithubError, assembleContext, type RequestedFile, type TreeEntry } from "./github";
 import { clientEnv, type EnvVars, type Runner } from "./proc";
 
@@ -56,6 +56,42 @@ export async function listLocalRepos(dirs: string[], deps: GitDeps): Promise<Loc
     out.push({ dir, dirName: path.basename(dir), owner: o.owner, repo: o.repo, head: sha, headSubject: (subject ?? "").slice(0, 120) });
   }
   return out;
+}
+
+/**
+ * Compares two commits of an authorized clone for a list of files: does each file exist in each commit,
+ * did it change between them, and does `to` descend from `from`. Plumbing commands only (no checkout).
+ */
+export async function compareLocalCommits(
+  opts: { dir: string; from: { commit: string; label: string }; to: { commit: string; label: string }; paths: string[] },
+  deps: GitDeps,
+): Promise<SourceComparison> {
+  const base: SourceComparison = { from: opts.from, to: opts.to, relation: "unknown", changedTotal: null, files: opts.paths.map(p => ({ path: p, atFrom: false, atTo: false, changed: null })), note: "" };
+  const hex = /^[0-9a-f]{40}$/;
+  if (!hex.test(opts.from.commit) || !hex.test(opts.to.commit)) return { ...base, note: "Commit inválido para comparação." };
+  if (opts.from.commit === opts.to.commit) {
+    const g0 = resolveGit(deps);
+    const t = g0 ? await git(deps, g0, opts.dir, ["ls-tree", "-r", "--name-only", "--full-tree", opts.to.commit], 8_000_000) : null;
+    const known = new Set((t?.code === 0 ? t.stdout : "").split(/\r?\n/));
+    return { ...base, relation: "same", changedTotal: 0, files: opts.paths.map(p => ({ path: p, atFrom: known.has(p), atTo: known.has(p), changed: false })), note: "Mesmo commit." };
+  }
+  const g = resolveGit(deps);
+  if (!g) return { ...base, note: "Git não encontrado neste computador: comparação indisponível." };
+  const names = async (c: string) => {
+    const r = await git(deps, g, opts.dir, ["ls-tree", "-r", "--name-only", "--full-tree", c], 8_000_000);
+    return r.code === 0 ? new Set(r.stdout.split(/\r?\n/).filter(Boolean)) : null;
+  };
+  const [a, b] = [await names(opts.from.commit), await names(opts.to.commit)];
+  if (!a || !b) return { ...base, note: "Um dos commits não existe na cópia local autorizada." };
+  const mb = await git(deps, g, opts.dir, ["merge-base", "--is-ancestor", opts.from.commit, opts.to.commit]);
+  const relation: SourceComparison["relation"] = mb.code === 0 ? "descendant" : mb.code === 1 ? "not_descendant" : "unknown";
+  const diff = await git(deps, g, opts.dir, ["diff-tree", "-r", "--no-commit-id", "--name-only", opts.from.commit, opts.to.commit], 8_000_000);
+  const changed = diff.code === 0 ? new Set(diff.stdout.split(/\r?\n/).filter(Boolean)) : null;
+  return {
+    ...base, relation, changedTotal: changed ? changed.size : null,
+    files: opts.paths.map(p => ({ path: p, atFrom: a.has(p), atTo: b.has(p), changed: changed ? changed.has(p) : null })),
+    note: `Comparação feita na cópia local autorizada com git ls-tree, merge-base e diff-tree (somente leitura de objetos).`,
+  };
 }
 
 /** Reads a commit of an authorized clone with the same selection and limits as the GitHub reader. */

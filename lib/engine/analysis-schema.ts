@@ -54,6 +54,31 @@ export function refPath(ref: string) {
   return ref.trim().replace(/^`|`$/g, "").split(/[#\s(]|:(?=\d|[A-Za-z_]\w*$)/)[0].replace(/\/$/, "");
 }
 
+/** Symbol part of a reference ("lib/a.ts#Foo" → "Foo", "lib/a.ts (Foo)" → "Foo"); null when there is none. */
+export function refSymbol(ref: string) {
+  const m = /#([A-Za-z_$][\w$]*)|\(([A-Za-z_$][\w$]*)\)|:([A-Za-z_$][\w$]*)$/.exec(ref.trim().replace(/^`|`$/g, ""));
+  return m ? (m[1] ?? m[2] ?? m[3]) : null;
+}
+
+/**
+ * Text actually sent for each file sent in part (excerpt or truncated), taken from the frozen message.
+ * The outline of declarations at the top of an excerpt is removed: a name listed there was not read.
+ */
+export function partialTexts(user: string, files: { path: string; truncated: boolean }[]): Record<string, string> {
+  const start = user.indexOf("<dados_da_fonte>"), end = user.lastIndexOf("</dados_da_fonte>");
+  if (start < 0 || end < start) return {};
+  const body = user.slice(start, end);
+  const out: Record<string, string> = {};
+  for (const sec of body.split(/\n\n(?=--- arquivo: )/)) {
+    const f = files.find(x => x.truncated && (sec.startsWith(`--- arquivo: ${x.path} `) || sec.startsWith(`--- arquivo: ${x.path}\n`)));
+    if (!f) continue;
+    const content = sec.slice(sec.indexOf("\n") + 1);
+    const cut = content.indexOf("\n\n");
+    out[f.path] = content.startsWith("Declarações de nível superior") ? (cut < 0 ? "" : content.slice(cut + 2)) : content;
+  }
+  return out;
+}
+
 const words = (t: string) => new Set(t.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_./-]+/).filter(w => w.length >= 4));
 /** Word overlap (Jaccard) between two questions: 1 = same words. */
 export function questionSimilarity(a: string, b: string) {
@@ -68,7 +93,11 @@ export function questionSimilarity(a: string, b: string) {
  * @param readPaths files whose content the executor actually sent to the Architect.
  * @param answered questions already resolved (by the user or by reading); repeating one is refused unless a contradiction is stated.
  */
-export function validateAnalysis(raw: unknown, readPaths: string[], answered: string[] = []): AnalysisValidation {
+/**
+ * @param partial text sent for files sent only in part (see partialTexts): a "file#Symbol" reference to one
+ * of them may be marked as read only if the symbol appears in what was sent (not only in the outline).
+ */
+export function validateAnalysis(raw: unknown, readPaths: string[], answered: string[] = [], partial: Record<string, string> = {}): AnalysisValidation {
   const parsed = AnalysisZ.safeParse(raw);
   if (!parsed.success) return { ok: false, errors: parsed.error.issues.slice(0, 12).map(i => `${i.path.join(".") || "(raiz)"}: ${i.message}`) };
   const a = parsed.data as ArchitectAnalysis;
@@ -77,7 +106,11 @@ export function validateAnalysis(raw: unknown, readPaths: string[], answered: st
   for (const e of a.examined) {
     if (e.basis !== "read") continue;
     const p = refPath(e.ref);
-    if (!read.has(p)) errors.push(`examined "${e.ref}": marcado como lido, mas o conteúdo desse arquivo não foi enviado nesta execução. Use basis = "inferred" ou remova.`);
+    if (!read.has(p)) { errors.push(`examined "${e.ref}": marcado como lido, mas o conteúdo desse arquivo não foi enviado nesta execução. Use basis = "inferred" ou remova.`); continue; }
+    const sym = refSymbol(e.ref);
+    if (sym && p in partial && !new RegExp(`(^|[^\\w$])${sym.replace(/\$/g, "\\$")}([^\\w$]|$)`).test(partial[p])) {
+      errors.push(`examined "${e.ref}": o arquivo foi enviado só em trecho e o bloco de ${sym} não está nele (aparece no máximo na lista de declarações). Use basis = "inferred".`);
+    }
   }
   for (const q of a.questions) {
     const same = answered.find(x => questionSimilarity(x, q.question) >= 0.5);

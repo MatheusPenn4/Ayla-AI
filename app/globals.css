@@ -640,3 +640,17 @@ details.raw summary { cursor: pointer; color: var(--sky); font-size: 12.5px; mar
 .run-sec.rev-changed { border-color: #7a5a2a !important; }
 button.link { background: none; border: 0; padding: 0; color: var(--sky); text-decoration: underline; cursor: pointer; font: inherit; }
 @media (max-width: 760px) { .decision-row { grid-template-columns: 1fr; } }
+
+/* ---- Source choice before a hand-off, Developer preview ---- */
+.send-form, .dev-preview { display: grid; gap: 10px; padding: 12px 14px; border-radius: 12px; border: 1px solid #3d4a8c; background: #0b0e24; min-width: 0; }
+.send-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.send-form .radio { align-items: flex-start; flex-wrap: wrap; }
+.send-form .radio code, .dev-preview code { word-break: break-all; }
+.dev-preview .run-sec { padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: #0f1230; display: grid; gap: 6px; }
+.dev-preview .run-sec ol, .dev-preview .run-sec ul { margin: 0; padding-left: 18px; }
+.notice.lock { display: flex; gap: 8px; align-items: flex-start; border-color: #3d6a4c; background: #0f2218; color: #c8f0d6; }
+.notice.lock p { margin: 0; }
+.cmp-row-new td { color: #bfe3ff; }
+.ctx-table { max-width: 100%; }
+@media (max-width: 760px) { .send-form, .dev-preview { padding: 10px; } .dev-preview .ctx-table { display: block; overflow-x: auto; } }
+.question input[type="checkbox"], .question input[type="radio"] { width: auto; flex: none; margin-top: 3px; }

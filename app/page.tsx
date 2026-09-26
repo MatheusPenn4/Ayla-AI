@@ -284,7 +284,7 @@ export default function Home() {
       <RunDialog
         runId={runId} agents={agents} runs={runs} onClose={() => setRunId(null)} onOpenRun={setRunId}
         onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)}
-        onHandoff={(planRunId, taskId) => void handoff(planRunId, taskId)} onReview={openReview}
+        onHandoff={(planRunId, taskId, followUp) => void handoff(planRunId, taskId, followUp)} onReview={openReview}
         onAnswerArchitect={(run, followUp) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { ...followUp, previousRunId: run.id }); }}
       />
       <HandoffDialog

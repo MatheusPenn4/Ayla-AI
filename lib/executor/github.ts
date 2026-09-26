@@ -21,6 +21,17 @@ export function extractPathMentions(text: string): string[] {
   return [...out].slice(0, 20);
 }
 
+/** File references written in an analysis: "lib/a.ts", "lib/a.ts#Foo" (paths with a folder and an extension). */
+export function extractFileRefs(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/(?:^|[\s`'"(\[,;])((?:[A-Za-z0-9_.@-]+\/)+[A-Za-z0-9_.@\[\]-]+\.[a-z]{1,5})(#[A-Za-z_$][\w$]*)?(?=$|[\s`'")\],;:.]|\()/g)) {
+    const p = m[1].replace(/^\.\//, "");
+    if (p.startsWith("http") || p.includes("..") || p.length > 200) continue;
+    out.add(m[2] ? `${p}${m[2]}` : p);
+  }
+  return [...out].slice(0, 30);
+}
+
 /**
  * Portuguese task words → the English words code usually uses in file names.
  * Deterministic and small on purpose: it only helps pick files by path; it
