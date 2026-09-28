@@ -281,6 +281,23 @@ describe("pipeline do Diretor (clientes simulados)", () => {
     expect(run).toMatchObject({ status: "failed", error: { code: "session_expired" } });
     expect((await service.connection("claude_code", true)).state).toBe("expired");
   });
+  it("falha ao renovar o token (passageira, segundo o cliente): recuperável, não vira 'sessão expirada', mas a conexão avisa", async () => {
+    const parsed = parseStartRequest(request());
+    if (!parsed.ok) throw new Error();
+    const busy = new AgentError("auth_busy", "Não renovou o token.", true, "Failed to refresh OAuth token: another Claude Code process is refreshing it");
+    const service = new ExecutorService(
+      { version: "t", dataDir: work, storePath: ":memory:", workRoot: work, limits: { maxRunsPerHour: 10, maxConcurrentRuns: 1, callTimeoutMs: 1000, leaseMs: 60000, statusCacheMs: 0 }, github: {} } satisfies ExecutorConfig,
+      { store, runner: async () => { throw new Error("não deve rodar processo"); }, env: {}, detectors: { claude_code: async () => connected(), codex: async () => connected("codex") }, adapters: { claude_code: fakeAdapter([busy]).adapter } },
+    );
+    await service.start(parsed.value);
+    await service.idle();
+    const run = (await store.listForDemands([parsed.value.demand.id]))[0];
+    expect(run).toMatchObject({ status: "failed", error: { code: "auth_busy", retryable: true } });
+    expect(run.error?.recovery?.join(" ")).toContain("não mexe nos arquivos de login");
+    const st = await service.connection("claude_code", true);
+    expect(st.state).toBe("connected");
+    expect(st.message).toContain("não conseguiu renovar o token");
+  });
   it("queda de conexão e tempo esgotado são falhas distintas e recuperáveis", async () => {
     const drop = await startRun(request(), { adapter: fakeAdapter([new AgentError("connection_lost", "Caiu.", true)]).adapter });
     expect(drop.error).toMatchObject({ code: "connection_lost", retryable: true });

@@ -133,7 +133,13 @@ describe("classificação de erros dos clientes", () => {
     ["429 Too Many Requests", "usage_limit"],
     ["stream disconnected before completion", "connection_lost"],
     ["algo inesperado", "client_error"],
+    // Real message of Claude Code 2.1.280 (28/09/2026): a transient refresh race, not an expired login.
+    ["Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again", "auth_busy"],
+    ["OAuth token has expired. Please obtain a new token", "session_expired"],
   ])("%s → %s", (text, code) => expect(classifyClientError(text).code).toBe(code));
+  it("disputa na renovação do token é passageira e não marca a conexão como expirada", () => {
+    expect(classifyClientError("Failed to refresh OAuth token: another Claude Code process is refreshing it")).toEqual({ code: "auth_busy", retryable: true });
+  });
 });
 
 describe("detecção dos clientes oficiais", () => {

@@ -87,7 +87,7 @@ export function buildArchitectMessage(input: {
       const absent = c.files.filter(f => !f.atFrom && f.atTo).map(f => f.path), changed = c.files.filter(f => f.atFrom && f.changed).map(f => f.path);
       L.push(`Em relação ao ${c.from.label} (${c.from.commit.slice(0, 12)}): ${absent.length ? `não existiam lá: ${absent.join(", ")}` : "todos os arquivos pedidos já existiam"}${changed.length ? `; alterados desde então: ${changed.join(", ")}` : ""}.`);
     }
-    if (revision.number > 1) L.push("O que a análise anterior disse sobre o commit antigo pode não valer para este commit.");
+    if (revision.number > 1 && revision.changedCommit && previousAnalysis) L.push("O que a análise anterior disse sobre o commit antigo pode não valer para este commit.");
     L.push("</revisao_do_contexto>");
     L.push("");
   }

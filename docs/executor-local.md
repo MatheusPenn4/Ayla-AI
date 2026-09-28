@@ -98,7 +98,7 @@ O leitor público só vê o que está no GitHub. Se a tarefa fala de código que
 - só pastas listadas em `AYLA_LOCAL_REPOS` (caminho absoluto, em `.dev.vars`), autorizadas por você;
 - o `origin` da cópia precisa ser o mesmo repositório da demanda;
 - o commit precisa **descender** do commit que o Diretor leu (`git merge-base --is-ancestor`);
-- só objetos commitados são lidos (`git ls-tree`, `git show`, `git merge-base`, `git branch -r --contains`), com argumentos estruturados e sem shell; sem checkout, sem `status`, sem `fetch`, sem escrita, e **alterações não commitadas nunca entram**;
+- só objetos commitados são lidos (`git ls-tree`, `git show`, `git merge-base`, `git branch -r --contains`, `git diff-tree --name-only`), com argumentos estruturados e sem shell; sem checkout, sem `status`, sem `fetch`, sem escrita, e **alterações não commitadas nunca entram**;
 - o registro guarda o nome da pasta (não o caminho completo), se o commit está publicado no GitHub (segundo as referências locais `origin/*`) e a relação com o commit do Diretor.
 
 ### Caso real da task-1 (26/09/2026)
@@ -108,6 +108,49 @@ O leitor público só vê o que está no GitHub. Se a tarefa fala de código que
 - **Revisão 2** (d4ffb0d7): commit `c878f7b` local, as 5 perguntas resolvidas por leitura de 7 arquivos, sua decisão. **Falhou por tempo esgotado**: o executor encerrou o cliente aos 5 min. Não havia progresso registrado nem uso informado (o formato `json` só escreve no fim).
 - **Revisão 3** (3678137a): mesmo conteúdo, preparada e **descartada** por você antes de executar, para investigar a falha.
 - **Revisão 4** (7ddd04b5): contexto reduzido (abaixo), limite de 10 min, progresso em fluxo. **Análise concluída em 206 s**, sem novas perguntas, com recomendação, 12 referências examinadas (11 lidas, 1 inferida), riscos, orientação ao Desenvolvedor e checagens para o QA. Repositório conferido idêntico antes e depois (HEAD, `status` e hash de cada arquivo); nenhuma execução de Desenvolvedor, QA ou Revisor.
+
+### Tarefa que depende de outra: fonte, arquivos e análise da dependência
+
+Antes de preparar, o botão “Enviar ao Arquiteto” abre um painel (nada é gravado e nenhum modelo é chamado ao abrir):
+
+- **Fonte e commit**, com a origem de cada opção: o commit que o Diretor leu (GitHub público), o commit de cada análise concluída da qual a tarefa depende e o HEAD da cópia local autorizada. O proposto é o commit da análise da dependência. Escolher um commit diferente do Diretor exige **motivo**, que fica na revisão (`context_revision`).
+- **Comparação arquivo a arquivo** (só na cópia local, com `git ls-tree`, `git merge-base --is-ancestor` e `git diff-tree --name-only`): para cada arquivo pedido, se existe no commit do Diretor, se existe no commit escolhido e se mudou entre eles. A comparação fica gravada no envio e aparece na revisão e no texto enviado (“não existiam lá: …”).
+- **Arquivos a ler**, sugeridos a partir da análise da dependência: o que ela examinou (lido ou inferido) e os caminhos que ela cita como não verificados ou na orientação. Por padrão, as sugestões são marcadas enquanto cabem no limite (10 arquivos, 12 referências); você desmarca ou acrescenta `caminho` ou `caminho#Símbolo`. Com arquivos confirmados, a heurística por nome e o manifesto não entram.
+- **Novo envio após falha**: o painel começa do mesmo commit e dos mesmos arquivos do envio anterior (que não é alterado), e o número da revisão continua.
+
+O que vai para o Arquiteto de uma dependência concluída (`<analises_das_dependencias>`, uma vez só): execução, revisão, commit e fonte da análise; entendimento (até 400 caracteres); recomendação e justificativa; até 12 referências examinadas com a base (lido/inferido); até 8 orientações ao Desenvolvedor; até 4 riscos, suposições e pontos não verificados, cada um cortado, com a contagem do que ficou de fora; e as **decisões suas** registradas naquele envio, marcadas como decisão do usuário. O protocolo (regra 13) diz que isso é insumo, não fato verificado, e se refere ao commit da análise.
+
+**“Lido” por símbolo.** Num arquivo enviado só em trecho, `arquivo#Símbolo` só pode ser marcado como lido se o símbolo aparece no trecho enviado; a lista de declarações do topo não conta. O executor recusa e pede correção quando isso não acontece. Aplicada à análise da task-1 já registrada (sem alterá-la), a regra aponta uma referência: `hooks/use-runs.ts#useRuns` foi marcada como lida, mas só a janela de `taskRunsFor` (dentro de `useRuns`) tinha sido enviada. A prévia do Desenvolvedor mostra isso como “lido só em parte”.
+
+**Revisão antes de confirmar** (além do que já mostrava): análises das dependências usadas e as decisões suas herdadas; arquivos confirmados e o motivo de cada um; comparação dos commits; para cada arquivo, bytes no commit, caracteres enviados, linhas e **blocos** enviados; quantos arquivos do repositório vão só pelo nome (não examinados); e o **custo possível**: o total que o cliente informou nas execuções anteriores do Arquiteto pela mesma conexão, a razão entre esse total e a estimativa do texto e a faixa que isso sugeriria para o envio atual. É referência, não medida nem limite; o consumo sai da cota da assinatura, sem cobrança por API.
+
+**Cobertura da leitura** (aba Análise): o que foi lido (conteúdo enviado e conferido pelo executor), o que foi só inferido, o que foi enviado e não citado, e quantos arquivos não foram examinados.
+
+### Caso real da task-2 (28/09/2026)
+
+- O plano do Diretor (`92788815`) diz que a task-2 depende da task-1 e que a task-3 (Desenvolvedor) depende da task-2.
+- **Fonte**: o commit do Diretor (`0f6cdf6`, GitHub) não tem 6 dos 8 arquivos necessários (a janela do Diretor, os tipos do plano, `handoff-state.ts`, `plan-schema.ts`, `use-runs.ts`); 73 arquivos mudaram entre ele e o commit usado. A análise da task-1 foi feita em `c878f7b`; entre ele e o commit usado mudaram 36 arquivos, 6 deles pedidos. Escolha proposta pelo Claude Code e confirmada por você: `b6bad7a` (HEAD local, não publicado, descende de ambos), com o estado atual de `taskState`, `RunRecord` e `DirectorBody`.
+- **Envio**: 8 arquivos (12 referências: `DirectorBody`; `DirectorPlan`, `PlanStep`, `PlanTask`, `ArchitectAnalysis`, `RunRecord` e os tipos que eles usam; `handoff-state.ts` inteiro; `exportData`; `PlanZ`; `taskRunsFor`; `lib/utils.ts`; `package.json`), sem nenhuma linha enviada duas vezes; a análise da task-1 e a sua decisão registrada nela. 52.716 caracteres na mensagem e 5.083 nas instruções; estimativa ≈ 17.280 tokens (orçamento de referência 24.000).
+- **Revisão 1 (`483de03a`)**: confirmada por você; falhou em 19 s. O Claude Code informou: “Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient”. Nenhum uso foi informado e o repositório ficou idêntico (HEAD, `status` e hash de cada arquivo versionado). O executor classificou errado como “sessão expirada” e marcou a conexão como expirada; o registro dessa falha ficou como foi gravado.
+- **Correção**: essa mensagem agora é o erro `auth_busy` (recuperável). Ele não vira “sessão expirada”, mas a conexão passa a avisar que a última chamada falhou ao renovar o token, com os passos de recuperação.
+- **Teste de sessão (autorizado por você)**: falhou com a mesma mensagem, sem chamada ao modelo. A trava `~/.claude/.oauth_refresh.lock` (só nome e data foram vistos) foi criada durante o próprio teste e ficou parada, vazia. O arquivo de login do cliente não é renovado desde 26/09. O único outro processo do Claude Code na máquina é a sessão do app Claude usada para desenvolver o Setor IA. Conclusão: a renovação do login do cliente está falhando. O Setor IA não abre nem mexe nesses arquivos; a recuperação é sua, pelo próprio cliente.
+- **Revisão 2 (`e70e9937`)**: preparada com o mesmo commit e os mesmos arquivos (todos reaproveitados, mesmo blob), **aguardando sua aprovação**. Não foi confirmada, porque a conexão ainda está marcada como expirada e o cliente não renova o token.
+
+### Prévia do envio ao Desenvolvedor (somente visualização)
+
+Nas tarefas do Desenvolvedor, “Ver prévia do envio ao Desenvolvedor” só fica disponível quando **todas** as dependências, diretas e indiretas, são tarefas do Arquiteto com análise concluída. A prévia é montada pelo executor a partir dos registros. Ela **não cria execução, não chama modelo, não grava nada e não concede escrita**, e diz isso no topo. Mostra:
+
+- a demanda original e a tarefa;
+- as tarefas relevantes com o **estado real** (a mesma `taskState` da aba Tarefas): a própria, as dependências diretas e indiretas e as que dependem dela;
+- as análises registradas dos Arquitetos (execução, revisão, commit, recomendação, orientação, riscos, decisões suas, quantidade de checagens para o QA);
+- o **commit de base proposto** (o da análise da dependência mais próxima), o HEAD local e, para cada análise, quantos arquivos mudaram desde então e quais dos examinados mudaram;
+- os pontos ainda não verificados (não verificado, suposições, inferidos, lidos só em parte, alterados desde a análise);
+- o **escopo de edição previsto**: arquivos citados pela tarefa e pelas análises, classificados como alterar, criar ou apenas consultar (pelo verbo antes do caminho: “ler …” é consulta). É previsão, não permissão, e as demais tarefas ficam fora do escopo;
+- o que uma futura execução do Desenvolvedor exigiria (não implementado).
+
+“Baixar prévia (.md)” gera uma cópia em Markdown dos mesmos dados; os estados na tela e no arquivo vêm da mesma fonte. Isso não é a exportação do plano pedida na demanda: aquela é trabalho do Desenvolvedor (task-3 e task-4) e não foi implementada.
+
+Estado em 28/09/2026: a prévia da task-3 está **bloqueada**, porque a task-2 não tem análise concluída.
 
 ### Contexto do Arquiteto e suas reduções
 
@@ -163,6 +206,7 @@ Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada ped
 | Desconectado | cliente sem login, ou autenticado por chave de API/outro provedor em vez da assinatura |
 | Conectado | o cliente informa login pela assinatura (Claude: `authMethod` claude.ai; Codex: “Logged in using ChatGPT”) |
 | Sessão expirada | o cliente ainda lista um login, mas a última chamada real foi recusada por autenticação |
+| Conectado, com aviso | a última chamada real falhou porque o cliente não conseguiu renovar o token de acesso (`auth_busy`: “another … process is refreshing it”); o cliente diz que é passageiro, então não vira “sessão expirada” |
 | Indisponível | o cliente não respondeu ao status ou respondeu algo inesperado |
 
 “Verificar conexão” repete os comandos de status. “Testar sessão” faz uma chamada real mínima (usa um pouco da assinatura) e só roda quando você clica.
@@ -225,6 +269,7 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 
 - `pnpm test`: encaminhamento ao Arquiteto (tarefa elegível, sem Arquiteto, adulterada, sem aprovação, hash diferente, cliques repetidos, dependências, esclarecimento, cliente desconectado, erro, cancelamento, “lido” só para arquivos enviados, pasta de trabalho vazia, argumentos de somente leitura, migração com linhas antigas intactas, persistência e reinício, categorias de uso indisponíveis, seleção e redução de contexto), pipeline do Diretor, validação do plano, composição da entrada, GitHub, registro durável (inclusive reabrindo o arquivo), cliques repetidos, cancelamento, limites, estados de conexão, adaptadores com saídas reais gravadas dos clientes, detecção, execução de processos (real, com `node`) e proteção HTTP (servidor real em 127.0.0.1). Nesses testes, os clientes oficiais são **simulados**.
 - A execução real com cada cliente é feita pela interface ou pela API local, com o executor em execução; os resultados ficam no registro com o cliente e o uso informados.
+- Tarefa dependente e prévia (simulados; a comparação usa **Git real** em pasta temporária): opções de fonte sem criar registro; análise da dependência enviada uma vez, com o commit e a decisão do usuário; só os arquivos confirmados; aprovação de outra execução recusada; primeiro envio numa cópia local com a comparação arquivo a arquivo e sem mencionar envio anterior inexistente; “lido” por símbolo em trecho; prévia bloqueada até as dependências indiretas, sem registro nem chamada, com os mesmos estados na tela e no Markdown; escopo alterar/criar/consultar; falha ao renovar o token classificada como passageira, sem “sessão expirada”.
 - `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente). `pnpm diagnose:run <id>`: composição e uso de uma execução registrada (só leitura do banco).
 - Esclarecimento e revisão (simulados): respostas ligadas às perguntas certas, perguntas inventadas/duplicadas/sem resposta recusadas, resposta sua e leitura identificadas, envio anterior intacto (comparação byte a byte do registro), cliques repetidos no novo envio e na confirmação, repetição de pergunta recusada salvo contradição, troca de commit exige motivo e gera revisão, tempo esgotado com limite explícito e revisão seguinte, cópia local com **Git real** em pasta temporária (commit descendente, alteração não commitada ignorada, cópia não modificada, pasta não autorizada, commit fora da história e origem diferente recusados), trechos e janelas, composição que soma exatamente o texto montado, fluxo do Claude Code com repetição de API e uso parcial.
 
@@ -232,7 +277,7 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 
 O Desenvolvedor precisa **escrever**, e isso não cabe no modelo de somente leitura do Arquiteto. Desenho proposto, a implementar na próxima etapa:
 
-1. **Entrada**: tarefa do Desenvolvedor no plano + análises concluídas do Arquiteto das quais ela depende (já registradas e vinculadas por `parent_run_id`/`task_id`), com a mesma revisão e aprovação explícitas. No plano 92788815, a `task-3` do Desenvolvedor depende de `task-2` (Arquiteto, ainda proposta), que depende de `task-1` (análise concluída na revisão 4). A análise da `task-1` já está pronta para servir de insumo; a `task-2` precisa ser enviada ao Arquiteto antes. O commit de trabalho deve ser o mesmo da análise (`c878f7b`) ou um descendente registrado como nova revisão.
+1. **Entrada**: tarefa do Desenvolvedor no plano + análises concluídas do Arquiteto das quais ela depende (já registradas e vinculadas por `parent_run_id`/`task_id`), com a mesma revisão e aprovação explícitas. No plano 92788815, a `task-3` do Desenvolvedor depende de `task-2`, que depende de `task-1` (análise concluída na revisão 4). Em 28/09/2026 a `task-2` tem uma revisão que falhou ao renovar o token (`483de03a`) e uma revisão 2 (`e70e9937`) aguardando aprovação, no commit `b6bad7a`. A prévia da `task-3` só fica disponível depois da análise concluída da `task-2`; o commit de base proposto será o dessa análise (ou um descendente, registrado como nova revisão).
 2. **Cópia de trabalho isolada**: clone raso do repositório no commit registrado, numa pasta temporária do executor, em branch própria e sem credencial de push. O projeto original do usuário não é tocado.
 3. **Permissões por execução**: Claude Code com `Read,Edit,Write` e um conjunto fechado de comandos (`--allowedTools`), ou Codex com `--sandbox workspace-write` restrito à cópia, sem rede; timeout e limite de saída.
 4. **Resultado**: diff, lista de arquivos alterados e saída real dos comandos de verificação, para o QA; nada é publicado, enviado por push nem mesclado sem uma aprovação separada sua.

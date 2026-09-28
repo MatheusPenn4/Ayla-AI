@@ -100,6 +100,9 @@ export class ExecutorService {
         const last = await this.store.lastConnectionOutcome(id);
         if (last && !last.ok && last.code === "session_expired") {
           st = { ...st, state: "expired", message: `${st.client} ainda tem um login salvo, mas a última chamada real foi recusada por sessão expirada (${new Date(last.at).toLocaleString("pt-BR")}).`, steps: LOGIN_STEPS[id].expired };
+        } else if (last && !last.ok && last.code === "auth_busy") {
+          // Not an expired login (the client says it is transient), but the user must know the last real call failed on it.
+          st = { ...st, message: `${st.message} Atenção: a última chamada real (${new Date(last.at).toLocaleString("pt-BR")}) falhou porque o cliente não conseguiu renovar o token de acesso. Se repetir, rode o cliente uma vez no seu terminal para ele renovar o login.` };
         }
       }
       this.cache.set(id, { at: Date.now(), status: st });
@@ -138,7 +141,7 @@ export class ExecutorService {
       return { status: 200, body: { ok: true, status: await this.connection(id, true), message: "Sessão confirmada com uma chamada real mínima.", usage: r.usage } };
     } catch (e) {
       const code = (e as { code?: string }).code ?? "client_error";
-      if (code === "session_expired" || code === "not_connected") await this.store.logConnection(id, false, code);
+      if (code === "session_expired" || code === "not_connected" || code === "auth_busy") await this.store.logConnection(id, false, code);
       this.cache.delete(id);
       return { status: 200, body: { ok: false, status: await this.connection(id, true), message: (e as Error).message, code, detail: (e as { detail?: string }).detail } };
     } finally {

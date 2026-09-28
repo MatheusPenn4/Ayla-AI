@@ -3,7 +3,7 @@
 // published on GitHub (the public reader cannot see them).
 // - only folders listed in AYLA_LOCAL_REPOS (absolute paths) are read;
 // - the clone's "origin" must point to the demand's GitHub repository;
-// - only committed objects are read (git ls-tree / git show / merge-base /
+// - only committed objects are read (git ls-tree / git show / merge-base / diff-tree /
 //   branch --contains): no checkout, no status, no fetch, no writes, and
 //   uncommitted changes are never included;
 // - structured arguments, no shell, time limit, output cap.

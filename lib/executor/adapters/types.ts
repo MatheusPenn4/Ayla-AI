@@ -33,7 +33,7 @@ export type AgentReply = {
 
 /** Error codes shared by all adapters (shown to the user with recovery steps). */
 export type AgentErrorCode =
-  | "not_installed" | "not_connected" | "session_expired" | "usage_limit" | "model_unavailable"
+  | "not_installed" | "not_connected" | "session_expired" | "auth_busy" | "usage_limit" | "model_unavailable"
   | "timeout" | "canceled" | "connection_lost" | "client_error" | "invalid_output" | "output_too_large";
 
 export class AgentError extends Error {
@@ -51,6 +51,9 @@ export interface AgentAdapter {
 export function classifyClientError(text: string, status?: number | null): { code: AgentErrorCode; retryable: boolean } {
   const t = text.toLowerCase();
   if (/not logged in|missing bearer|no auth/.test(t)) return { code: "not_connected", retryable: false };
+  // Claude Code 2.1: "Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh.
+  // This is usually transient" — the saved login is still valid; it is not an expired session (seen in a real run, 28/09/2026).
+  if (/another claude code process is refreshing|exited mid-refresh/.test(t)) return { code: "auth_busy", retryable: true };
   if (/login expired|session expired|token (has )?expired|refresh token|invalid_grant|re-?authenticate|unauthorized|\b401\b|oauth token/.test(t)) return { code: "session_expired", retryable: false };
   if (/please run \/login|codex login/.test(t)) return { code: "not_connected", retryable: false };
   if (status === 429 || /usage limit|rate limit|limit reached|hit your .*limit|out of (extra )?usage|too many requests|\b429\b|quota|weekly limit|5-hour/.test(t)) return { code: "usage_limit", retryable: true };
@@ -63,6 +66,7 @@ export const ERROR_MESSAGE: Record<AgentErrorCode, string> = {
   not_installed: "O cliente oficial escolhido na ficha não está instalado neste computador.",
   not_connected: "O cliente oficial não tem login salvo neste computador.",
   session_expired: "A sessão salva pelo cliente oficial expirou ou foi recusada. É preciso entrar novamente.",
+  auth_busy: "O cliente oficial não conseguiu renovar o token de acesso: ele informa que outro processo dele está renovando ou saiu no meio da renovação. Ele trata isso como falha passageira e não diz que o login expirou.",
   usage_limit: "O limite de uso da assinatura foi atingido (informado pelo cliente). Aguarde a renovação do limite ou escolha outra conexão na ficha.",
   model_unavailable: "O modelo escolhido na ficha não está disponível para esta conta no cliente oficial.",
   timeout: "O cliente não terminou dentro do tempo limite do executor.",

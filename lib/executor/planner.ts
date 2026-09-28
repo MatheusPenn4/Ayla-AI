@@ -48,6 +48,11 @@ function recoveryFor(code: AgentErrorCode | string, conn: ConnectionStatus | nul
     case "not_installed": return LOGIN_STEPS[id].install;
     case "not_connected": return LOGIN_STEPS[id].login;
     case "session_expired": return LOGIN_STEPS[id].expired;
+    case "auth_busy": return [
+      "Espere cerca de um minuto e prepare um novo envio: o cliente diz que costuma ser passageiro.",
+      "Se repetir, feche as outras sessões do mesmo cliente e, no seu terminal, rode o cliente uma vez (claude) para ele mesmo renovar o login; se ele pedir, entre de novo (claude auth login --claudeai).",
+      "O Setor IA não mexe nos arquivos de login nem na trava de renovação do cliente.",
+    ];
     case "usage_limit": return ["Aguarde a renovação do limite da assinatura (o cliente não informa o saldo restante ao Setor IA).", `Ou escolha a outra conexão na ficha do ${who} e tente novamente.`];
     case "model_unavailable": return [`Na ficha do ${who} (aba Perfil), deixe o modelo em “Padrão do cliente” ou escolha um modelo listado pelo próprio cliente.`, "Depois tente novamente."];
     case "timeout": return [`O limite do executor por chamada é de ${Math.round(timeoutMs / 60000)} min (AYLA_CALL_TIMEOUT_MS). Respostas longas podem passar disso.`, "Tente de novo; se repetir, reduza o contexto enviado ou escolha um esforço menor na ficha.", "O cliente foi encerrado antes de informar o uso: o consumo desta tentativa não é conhecido."];
@@ -238,7 +243,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
       } catch (err) {
         if (err instanceof AgentError) {
           record((err as AgentError & { usage?: CallUsage | null }).usage ?? null);
-          if (["not_connected", "session_expired"].includes(err.code)) await store.logConnection(conn.id, false, err.code);
+          if (["not_connected", "session_expired", "auth_busy"].includes(err.code)) await store.logConnection(conn.id, false, err.code);
           if (err.code === "canceled") return;
           fail({ code: err.code, message: err.code === "timeout" ? `O cliente não terminou dentro do limite de ${Math.round(deps.limits.callTimeoutMs / 60000)} min do executor e foi encerrado.` : err.message, detail: err.detail, retryable: err.retryable, recovery: recoveryFor(err.code, conn, spec.who, deps.limits.callTimeoutMs) });
         }

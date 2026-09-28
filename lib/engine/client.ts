@@ -27,6 +27,7 @@ export type SourceOptions = {
   proposed: { via: "github" | "local_git"; commit: string; why: string } | null;
   suggestedFiles: { ref: string; reason: string }[];
   comparisons: SourceComparison[];
+  previous: { runId: string; status: string; revision: number | null; commit: string | null; via: "github" | "local_git" | null; files: string[] } | null;
 };
 
 export class EngineApiError extends Error {

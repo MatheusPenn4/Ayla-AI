@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { Loader2, Send, X } from "lucide-react";
 import { EngineApiError, engineApi, type HandoffFollowUp, type SourceOptions } from "@/lib/engine/client";
-import type { SourceComparison } from "@/lib/engine/types";
+import { RUN_STATUS_LABEL, type RunStatus, type SourceComparison } from "@/lib/engine/types";
 
 const HEX40 = /^[0-9a-f]{40}$/;
 const REF = /^[A-Za-z0-9_.@[\]/-]+(#[A-Za-z0-9_$]+)?$/;
@@ -59,7 +59,20 @@ export function SendForm({ planRunId, taskId, sending, disabled, onSubmit, onClo
   useEffect(() => {
     let live = true;
     engineApi.sourceOptions(planRunId, taskId)
-      .then(o => { if (!live) return; setOpts(o); setPicked(defaultPick(o.suggestedFiles.map(f => f.ref))); setSource(o.proposed ? `${o.proposed.via}:${o.proposed.commit}` : ""); })
+      .then(o => {
+        if (!live) return;
+        setOpts(o);
+        // A retry starts from the previous envio of the task (same commit and files); otherwise from the proposal.
+        const prev = o.previous?.commit && o.previous.files.length ? o.previous : null;
+        if (prev) {
+          setPicked(Object.fromEntries(prev.files.filter(r => o.suggestedFiles.some(f => f.ref === r)).map(r => [r, true])));
+          setExtra(prev.files.filter(r => !o.suggestedFiles.some(f => f.ref === r)).join(", "));
+          setSource(`${prev.via ?? "github"}:${prev.commit}`);
+        } else {
+          setPicked(defaultPick(o.suggestedFiles.map(f => f.ref)));
+          setSource(o.proposed ? `${o.proposed.via}:${o.proposed.commit}` : "");
+        }
+      })
       .catch(e => live && setError(e instanceof EngineApiError ? e.message : "Não foi possível carregar as opções de fonte."));
     return () => { live = false; };
   }, [planRunId, taskId]);
@@ -90,6 +103,7 @@ export function SendForm({ planRunId, taskId, sending, disabled, onSubmit, onClo
       <p className="pane-intro">Escolha o commit e confirme os arquivos. Preparar <b>não chama o modelo</b>: o executor lê os arquivos e congela o envio para você revisar e confirmar.</p>
       <div className="question">
         <b>Fonte e commit</b>
+        {opts.previous && <small>Envio anterior desta tarefa: <code>{opts.previous.runId.slice(0, 8)}</code>{opts.previous.revision ? ` (revisão ${opts.previous.revision})` : ""}, {RUN_STATUS_LABEL[opts.previous.status as RunStatus] ?? opts.previous.status}, commit <code>{opts.previous.commit?.slice(0, 12) ?? "—"}</code>. Ele não é alterado; este será um novo envio{opts.previous.files.length ? ", começando do mesmo commit e dos mesmos arquivos" : ""}.</small>}
         {opts.proposed && <small>Proposto: <code>{opts.proposed.commit.slice(0, 12)}</code> — {opts.proposed.why}</small>}
         {choices.map(c => <label key={c.key} className="radio"><input type="radio" checked={source === c.key} onChange={() => setSource(c.key)} /> <code>{c.commit.slice(0, 12)}</code> {c.label}</label>)}
         <label className="radio"><input type="radio" checked={source === "other"} onChange={() => setSource("other")} /> Outro commit</label>
@@ -106,7 +120,7 @@ export function SendForm({ planRunId, taskId, sending, disabled, onSubmit, onClo
       <div className="question">
         <b>Arquivos a ler ({files.length})</b>
         <small>Sugeridos a partir das análises das quais esta tarefa depende. Um arquivo grande vai como trecho verificável (lista de declarações + blocos dos símbolos pedidos). Sem nenhum arquivo, o executor escolhe pelo nome, como antes.</small>
-        {opts.suggestedFiles.map(f => <label key={f.ref} className="radio"><input type="checkbox" checked={!!picked[f.ref]} onChange={e => setPicked(s => ({ ...s, [f.ref]: e.target.checked }))} /> <code>{f.ref}</code> <span className="muted">{f.reason}</span></label>)}
+        {opts.suggestedFiles.map(f => <label key={f.ref} className="radio"><input type="checkbox" aria-label={f.ref} checked={!!picked[f.ref]} onChange={e => setPicked(s => ({ ...s, [f.ref]: e.target.checked }))} /> <code>{f.ref}</code> <span className="muted">{f.reason}</span></label>)}
         <input value={extra} onChange={e => setExtra(e.target.value)} placeholder="outros arquivos: caminho ou caminho#Símbolo, separados por vírgula" aria-label="Outros arquivos" />
       </div>
       {!!problems.length && <ul className="form-problems">{problems.map((p, i) => <li key={i}>{p}</li>)}</ul>}

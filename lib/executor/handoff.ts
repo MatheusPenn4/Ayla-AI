@@ -161,6 +161,8 @@ export type SourceOptions = {
   proposed: { via: "github" | "local_git"; commit: string; why: string } | null;
   suggestedFiles: { ref: string; reason: string }[];
   comparisons: SourceComparison[];
+  /** Latest hand-off of this task (a retry starts from its commit and files; it is never modified). */
+  previous: { runId: string; status: string; revision: number | null; commit: string | null; via: "github" | "local_git" | null; files: string[] } | null;
 };
 
 /** What the user needs to choose the source of a first hand-off (read-only: nothing is recorded, no model is called). */
@@ -185,8 +187,12 @@ export async function sourceOptions(q: { directorRunId: string; taskId: string }
     const tos = [...new Map([...(proposed ? [[proposed.commit, "proposto"]] : []), [repos[0].head, "HEAD da cópia local"]] as [string, string][]).entries()];
     for (const [commit, label] of tos) comparisons.push(...(await compareWith(deps.local, gh.owner, gh.repo, { commit, label }, froms.filter(f => f.commit !== commit), paths)));
   }
+  const last = (await deps.store.runsForTask(parent!.id, task!.id))[0] ?? null;
+  const lastSnap = last ? ((await deps.store.snapshot(last.id)) as ArchitectSnapshot | null) : null;
+  const lastCtx = last?.context?.kind === "github" ? last.context : null;
+  const previous = last ? { runId: last.id, status: last.status, revision: lastSnap?.revision?.number ?? null, commit: lastCtx?.commit ?? null, via: lastCtx ? (lastCtx.via ?? "github") : null, files: (lastSnap?.revision?.requestedFiles ?? []).map(x => x.ref) } : null;
   return {
-    directorCommit: gh?.commit ?? null, owner: gh?.owner ?? null, repo: gh?.repo ?? null,
+    directorCommit: gh?.commit ?? null, owner: gh?.owner ?? null, repo: gh?.repo ?? null, previous,
     dependencies: deps_.map(d => ({ taskId: d.task.id, runId: d.run.id, revision: d.analysis.revision, commit: d.analysis.commit, via: d.analysis.via })),
     localRepos: repos.map(r => ({ dirName: r.dirName, head: r.head, headSubject: r.headSubject })),
     proposed, suggestedFiles, comparisons,
