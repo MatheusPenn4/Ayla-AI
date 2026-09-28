@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EngineApiError, buildStartRequest, engineApi, toTeamInput, type HandoffFollowUp } from "@/lib/engine/client";
-import { ACTIVE_STATUSES, type ConnectionId, type EngineStatus, type RunRecord } from "@/lib/engine/types";
+import { ACTIVE_STATUSES, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
 import type { Agent, Demand } from "@/lib/office/types";
 
 const message = (e: unknown, fallback: string) => (e instanceof EngineApiError ? `${e.message}${e.details?.length ? ` (${e.details.join("; ")})` : ""}` : fallback);
@@ -17,6 +17,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [completions, setCompletions] = useState<Record<string, TaskCompletion[]>>({});
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [startErrors, setStartErrors] = useState<Record<string, string>>({});
   // One idempotency key per demand while a start request is in flight;
@@ -71,7 +72,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     prevActive.current = anyActive;
   }, [anyActive, refreshStatus]);
 
-  const isHandoff = (r: RunRecord) => r.kind === "architect_task" || r.kind === "developer_task";
+  const isHandoff = (r: RunRecord) => r.kind === "architect_task" || r.kind === "developer_task" || r.kind === "qa_task";
   // Director plans of a demand (the queue card) and hand-offs of a plan's tasks (Architect or Developer) are kept apart.
   const latestFor = useCallback((demandId: string) => runs.find(r => r.demandId === demandId && !isHandoff(r)) ?? null, [runs]);
   const historyFor = useCallback((demandId: string) => runs.filter(r => r.demandId === demandId && !isHandoff(r)), [runs]);
@@ -147,6 +148,37 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     }
   }, []);
 
+  /**
+   * “Enviar ao QA”: asks the executor to prepare (validate + freeze) the hand-off. Calls no model — that
+   * only happens after approve().
+   */
+  const preparingQA = useRef(new Set<string>());
+  const prepareQAHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[]) => {
+    const key = `${planRunId}:${taskId}`;
+    if (preparingQA.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
+    const qa = agents.find(a => a.id === "qa");
+    if (!qa) return { ok: false as const, error: "O QA não está na equipe." };
+    preparingQA.current.add(key);
+    setPending(s => new Set(s).add(key));
+    try {
+      const { run } = await engineApi.prepareQAHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(qa, agents) });
+      setRuns(list => [run, ...list.filter(r => r.id !== run.id)]);
+      return { ok: true as const, run };
+    } catch (e) {
+      return { ok: false as const, error: message(e, "Falha ao preparar o envio ao QA.") };
+    } finally {
+      preparingQA.current.delete(key);
+      setPending(s => { const n = new Set(s); n.delete(key); return n; });
+    }
+  }, []);
+
+  /** Validated task-completions of one plan (dependencyEvidence's only source besides a completed run). Fetched on demand, not polled. */
+  const loadCompletions = useCallback(async (planRunId: string) => {
+    try { const { completions: list } = await engineApi.listCompletions(planRunId); setCompletions(s => ({ ...s, [planRunId]: list })); }
+    catch { /* the dependency UI just shows nothing extra; the executor re-checks for real regardless */ }
+  }, []);
+  const completionsFor = useCallback((planRunId: string, taskId: string) => (completions[planRunId] ?? []).filter(c => c.taskId === taskId), [completions]);
+
   const approving = useRef(new Set<string>());
   const approve = useCallback(async (runId: string, snapshotHash: string) => {
     if (approving.current.has(runId)) return { ok: false as const, error: "Confirmação já enviada." };
@@ -166,5 +198,5 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     try { const { run } = await engineApi.cancel(runId); setRuns(list => list.map(r => (r.id === run.id ? run : r))); } catch { /* shown on next refresh */ }
   }, []);
 
-  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, approve, cancel, refresh, refreshStatus, verify, probe };
+  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, loadCompletions, completionsFor, approve, cancel, refresh, refreshStatus, verify, probe };
 }

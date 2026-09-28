@@ -7,8 +7,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { refPath, validateAnalysis } from "@/lib/engine/analysis-schema";
-import { handoffBlocker, taskState } from "@/lib/engine/handoff-state";
-import { reportedTotal, type ArchitectAnalysis, type ArchitectSnapshot, type DirectorPlan, type PlanTask, type RunDetail } from "@/lib/engine/types";
+import { taskState } from "@/lib/engine/handoff-state";
+import { dependencyBlocker, findDependencyIssues } from "@/lib/engine/dependency";
+import { reportedTotal, type ArchitectAnalysis, type ArchitectSnapshot, type DirectorPlan, type PlanTask, type RunDetail, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
 import { claudeArgs, claudeUsage, claudeAdapter } from "@/lib/executor/adapters/claude";
 import { codexArgs, parseCodexEvents, codexAdapter } from "@/lib/executor/adapters/codex";
 import { AgentError, type AgentCall } from "@/lib/executor/adapters/types";
@@ -18,7 +19,7 @@ import { ExecutorService, type ExecutorConfig } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
 import { RunStore } from "@/lib/executor/store";
 import { runProcess, type Runner } from "@/lib/executor/proc";
-import { redactSecrets } from "@/lib/executor/worktree";
+import { redactSecrets } from "@/lib/executor/redact";
 import { excerptFile } from "@/lib/executor/github";
 import { questionSimilarity } from "@/lib/engine/analysis-schema";
 import { promptComposition } from "@/lib/engine/composition";
@@ -28,7 +29,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { connected, fakeAdapter, goodPlan, member, reply, request, usage } from "./helpers";
 import { partialTexts } from "@/lib/engine/analysis-schema";
 import { developerPreviewMarkdown, type DeveloperPreview } from "@/lib/engine/developer-preview";
-import { TASK_STATE_LABEL, developerBlocker } from "@/lib/engine/handoff-state";
+import { TASK_STATE_LABEL } from "@/lib/engine/handoff-state";
 import { extractFileRefs } from "@/lib/executor/github";
 import { suggestFiles, type SourceOptions } from "@/lib/executor/handoff";
 
@@ -178,8 +179,12 @@ describe("preparar o envio ao Arquiteto (nada executa)", () => {
     // t3 is a Developer task: it now has its own hand-off flow, so it is "proposed" (executable), not "not_executable".
     expect(taskState(plan.tasks[2], []).key).toBe("proposed");
     expect(taskState(plan.tasks[0], []).key).toBe("proposed");
-    expect(handoffBlocker(plan.tasks[1], plan.tasks, () => [])).toContain("t1");
-    expect(handoffBlocker(plan.tasks[3], plan.tasks, () => [])).toContain("ainda não executa");
+    expect(dependencyBlocker(plan.tasks[1], plan.tasks, () => [], () => [])).toContain("t1");
+    // t4 (architect) depends on t3 (developer). Under the old Architect-only rule this was a categorical
+    // "developer doesn't execute" block; the coherent rule (lib/engine/dependency.ts) now reports the real,
+    // more accurate reason — t3 simply hasn't been sent to anyone yet — since a Developer dependency CAN be
+    // satisfied once it has real evidence (see the dedicated describe block below for that behavior).
+    expect(dependencyBlocker(plan.tasks[3], plan.tasks, () => [], () => [])).toBe("Depende de t3: ainda não foi enviado a ninguém.");
     const mk = (id: string, status: RunDetail["status"]) => ({ id, status } as RunDetail);
     expect(taskState(plan.tasks[0], [mk("r3", "failed"), mk("r1", "awaiting_clarification")])).toMatchObject({ key: "awaiting_clarification", run: { id: "r1" } });
     expect(taskState(plan.tasks[0], [mk("r4", "awaiting_approval"), mk("r1", "awaiting_clarification")]).key).toBe("awaiting_approval");
@@ -391,6 +396,10 @@ describe("persistência e migração", () => {
     const idx = (check.prepare(`SELECT name FROM sqlite_master WHERE type='index'`).all() as { name: string }[]).map(r => r.name);
     expect(idx).not.toContain("director_runs_one_active");
     expect(idx).toEqual(expect.arrayContaining(["runs_one_active_plan", "runs_one_active_task"]));
+    // v5: task_completions exists for a DB that started life as v1, and the old row still has no completion.
+    const tables = (check.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all() as { name: string }[]).map(r => r.name);
+    expect(tables).toContain("task_completions");
+    expect((check.prepare(`SELECT COUNT(*) AS n FROM task_completions`).get() as { n: number }).n).toBe(0);
     check.close();
     const b = new DatabaseSync(backup, { readOnly: true });
     expect((b.prepare(`SELECT COUNT(*) AS n FROM director_runs`).get() as { n: number }).n).toBe(1);
@@ -680,6 +689,11 @@ describe("contexto verificável e diagnóstico de tamanho", () => {
 const chainPlan = () => archPlan({
   tasks: archPlan().tasks.map(t => (t.id === "t3" ? { ...t, depends_on: ["t2"], scope: "Criar src/serializador.ts e alterar src/botao.tsx" } : t)),
 });
+/** chainPlan plus a QA task (t5) depending on the Developer task (t3) — for testing the QA hand-off. */
+const qaChainPlan = () => {
+  const p = chainPlan();
+  return { ...p, tasks: [...p.tasks, { id: "t5", step_id: "s2", assignee: "qa", title: "Verificar a entrega", scope: "Conferir o serializador contra os critérios", inputs: "t3", deliverable: "Parecer de QA", acceptance_criteria: ["Botão azul"], depends_on: ["t3"] }] };
+};
 const DECISION = { topic: "Formato", answer: "Mostrar o estado real de cada tarefa." };
 
 /** t1 concluded (with a decision of the user recorded in its hand-off). */
@@ -746,7 +760,7 @@ describe("tarefa dependente e prévia do Desenvolvedor", () => {
     const { plan } = await chainWithT1(svc);
     const tasks = chainPlan().tasks;
     const runsOf = (id: string) => (id === "t1" ? [{ status: "analysis_ready" }] : []) as never;
-    expect(developerBlocker(tasks.find(t => t.id === "t3")!, tasks, runsOf)).toContain("t2");
+    expect(dependencyBlocker(tasks.find(t => t.id === "t3")!, tasks, runsOf, () => [])).toContain("t2");
     const early = body<{ preview: DeveloperPreview }>(await svc.developerPreview(plan, "t3")).preview;
     expect(early.eligible).toBe(false);
     expect(early.blockers.join(" ")).toContain("t2");
@@ -755,7 +769,7 @@ describe("tarefa dependente e prévia do Desenvolvedor", () => {
     const t2 = body<{ run: RunDetail }>(await svc.prepare(handoffReq(plan, "t2"))).run;
     await svc.approve(t2.id, { snapshotHash: t2.snapshotHash });
     await svc.idle();
-    expect(developerBlocker(tasks.find(t => t.id === "t3")!, tasks, id => (id === "t1" || id === "t2") ? ([{ status: "analysis_ready" }] as never) : [])).toBeNull();
+    expect(dependencyBlocker(tasks.find(t => t.id === "t3")!, tasks, (id: string) => (id === "t1" || id === "t2") ? ([{ status: "analysis_ready" }] as never) : [], () => [])).toBeNull();
     const runsBefore = await store.listForDemands([t2.demandId]);
     const p = body<{ preview: DeveloperPreview }>(await svc.developerPreview(plan, "t3")).preview;
     expect(p.eligible).toBe(true);
@@ -853,7 +867,7 @@ describe("primeiro envio numa cópia local, comparado com o commit do Diretor (G
 
 // ---- Developer: prepare/approve, real isolated copy (Git + tar), real diff, scope enforcement ----
 import { existsSync } from "node:fs";
-import type { DeveloperResult } from "@/lib/engine/types";
+import type { DeveloperResult, QAResult, QASnapshot } from "@/lib/engine/types";
 
 const developerSheet = (over = {}) => member("developer", { connection: "claude_code", tools: { read: true, edit: true, terminal: false }, brief: "# Desenvolvedor\nFicha salva do Desenvolvedor.", budget: 48000, ...over });
 const devReq = (planId: string, taskId = "t3", over = {}) => ({ idempotencyKey: `h:${Math.random().toString(36).slice(2, 12)}`, directorRunId: planId, taskId, agent: developerSheet(), ...over });
@@ -886,12 +900,12 @@ function makeDevRepo(root: string) {
  * `repo.base`, using their own scripted service (kept apart from whatever service the caller tests the
  * Developer hand-off with). Shares `s` so the resulting rows are visible to the caller's own service.
  */
-async function localChainWithAnalyses(repo: { dir: string; base: string }, s: RunStore) {
+async function localChainWithAnalyses(repo: { dir: string; base: string }, s: RunStore, plan_ = chainPlan()) {
   const { svc } = service(
     [reply(analysis()), reply(analysis({ recommendation: { summary: "Serializador puro, sem alterar tipos.", rationale: "Menor risco, mais fácil de testar." }, developer_guidance: ["Criar src/serializador.ts", "Alterar src/botao.tsx"] }))],
     { s, localRepos: [repo.dir] },
   );
-  const plan = await directorPlan(chainPlan(), s, "plan_ready");
+  const plan = await directorPlan(plan_, s, "plan_ready");
   const detail = (await s.detail(plan))!;
   await s.update(plan, { context: { ...(detail.context as Extract<RunDetail["context"], { kind: "github" }>)!, commit: repo.base } });
   const local = { via: "local_git" as const, commit: repo.base };
@@ -1211,13 +1225,187 @@ describe("Desenvolvedor: esclarecimento resolvido fora do modelo (nunca reescrev
     expect(body<{ error: { code: string } }>(await svc.resolveClarificationLocally(run.id, RESOLUTION)).error.code).toBe("not_awaiting_clarification");
   });
 
-  it("não libera nenhuma regra de dependência: uma tarefa dependente do Desenvolvedor continua bloqueada categoricamente (HANDOFF_TARGETS só inclui o Arquiteto)", async () => {
-    // developerBlocker only ever treats an Architect dependency as satisfiable; a Developer-assigned
-    // dependency is refused regardless of status — resolving a clarification locally does not, and must
-    // not, change that categorical rule (localResolution is never consulted by it, on purpose).
+  it("Desenvolvedor → Desenvolvedor: bloqueado enquanto não há entrega real, liberado só por evidência (execução concluída OU esclarecimento validado) — nunca por localResolution sozinho", async () => {
     const t3: PlanTask = { id: "t3", step_id: "s1", assignee: "developer", title: "t3", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: [] };
     const t4: PlanTask = { id: "t4", step_id: "s2", assignee: "developer", title: "t4", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: ["t3"] };
-    const blocker = developerBlocker(t4, [t3, t4], () => []);
-    expect(blocker).toBe("Depende de t3 (developer), que ainda não executa nesta fase.");
+    const noCompletions = () => [] as TaskCompletion[];
+    // Nothing sent yet: blocked, not a categorical "developer doesn't execute" message anymore.
+    expect(dependencyBlocker(t4, [t3, t4], () => [], noCompletions)).toBe("Depende de t3: ainda não foi enviado a ninguém.");
+    // A real completed run satisfies it (the coherent rule the user asked for: any assignee, any assignee).
+    const doneRun = { id: "r1", status: "implementation_ready" } as unknown as RunRecord;
+    expect(dependencyBlocker(t4, [t3, t4], (id: string) => (id === "t3" ? [doneRun] : []), noCompletions)).toBeNull();
+    // Asked for clarification, answered, but NOT validated: still blocked, with a distinct message —
+    // this is exactly the case the user called out: a question answered is not a code delivery.
+    const waitingRun = { id: "r2", status: "awaiting_clarification", localResolution: { at: "x", by: "orchestrator", note: "n", commit: "c", testFile: null, testCount: null } } as unknown as RunRecord;
+    expect(dependencyBlocker(t4, [t3, t4], (id: string) => (id === "t3" ? [waitingRun] : []), noCompletions)).toContain("não há entrega local validada");
+    // Now with a matching, validated TaskCompletion: satisfied.
+    const completion = { id: "c1", demandId: "d", parentRunId: "p", taskId: "t3", kind: "resolved_clarification", sourceRunId: "r2", commit: "c", files: [], verification: { typecheck: null, lint: null, tests: null, build: null }, note: "n", validatedBy: "orchestrator", validatedAt: "x", createdAt: "x" } as TaskCompletion;
+    expect(dependencyBlocker(t4, [t3, t4], (id: string) => (id === "t3" ? [waitingRun] : []), (id: string) => (id === "t3" ? [completion] : []))).toBeNull();
+  });
+
+  it("detecta dependência inexistente e dependência circular", () => {
+    const a: PlanTask = { id: "a", step_id: "s", assignee: "developer", title: "a", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: ["ghost"] };
+    expect(dependencyBlocker(a, [a], () => [], () => [])).toBe('Depende de "ghost", que não existe neste plano.');
+    const b: PlanTask = { id: "b", step_id: "s", assignee: "developer", title: "b", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: ["c"] };
+    const c: PlanTask = { id: "c", step_id: "s", assignee: "developer", title: "c", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: ["b"] };
+    expect(dependencyBlocker(b, [b, c], () => [], () => [])).toContain("Dependência circular detectada");
+    const { missing, cycles } = findDependencyIssues([a, b, c]);
+    expect(missing).toEqual([{ task: "a", dep: "ghost" }]);
+    expect(cycles.length).toBeGreaterThan(0);
+  });
+});
+
+// ---- QA: hand-off, real dependency evidence (transitive), token budget, criterion classification ----
+const qaSheet = (over = {}) => member("qa", { connection: "claude_code", brief: "# QA\nFicha salva do QA.", budget: 48000, ...over });
+const qaReq = (planId: string, taskId = "t5", over = {}) => ({ idempotencyKey: `h:${Math.random().toString(36).slice(2, 12)}`, directorRunId: planId, taskId, agent: qaSheet(), ...over });
+const qaResult = (over: Partial<QAResult> = {}): QAResult => ({
+  outcome: "done", summary: "Revisado contra os critérios da demanda.",
+  criteria: [{ criterion: "Botão azul", verdict: "approved", evidence: "O diff real de t3 mostra a classe azul aplicada em src/botao.tsx." }],
+  questions: [], not_verified: [], recommendation: "ready_for_review", ...over,
+});
+/** The client always sends every field of the schema (empty string where N/A) — this mirrors that shape for validateQAResult's zod parse, which requires the keys to exist. */
+const qaResultRaw = (over: Partial<QAResult> = {}) => {
+  const r = qaResult(over);
+  return {
+    ...r,
+    criteria: r.criteria.map(c => ({
+      criterion: c.criterion, verdict: c.verdict,
+      steps: c.rejected?.steps ?? "", expected: c.rejected?.expected ?? "", observed: c.rejected?.observed ?? "", impact: c.rejected?.impact ?? "",
+      notVerifiedReason: c.notVerifiedReason ?? "", evidence: c.evidence ?? "",
+    })),
+  };
+};
+
+/** t1/t2 analyses done, t3 (Developer) implementation_ready for real, in a plan that also has t5 (QA) depending on t3. */
+async function chainWithRealImplementation(repo: { dir: string; base: string }, s: RunStore) {
+  const { plan } = await localChainWithAnalyses(repo, s, qaChainPlan());
+  const { svc } = service(
+    [async (c: AgentCall) => { writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const toMarkdown = () => \"\";\n"); return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "Novo módulo puro." }] })); }],
+    { s, localRepos: [repo.dir] },
+  );
+  const t3 = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+  await svc.approve(t3.id, { snapshotHash: t3.snapshotHash });
+  await svc.idle();
+  return { plan };
+}
+
+describe("QA: preparar o envio (dependência real, transitiva, jamais por chamada direta indevida)", () => {
+  it("recusa quando a dependência (Desenvolvedor) ainda não tem entrega concluída — inclusive por chamada direta ao serviço", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store, qaChainPlan()); // t3 NOT sent to the Developer yet
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareQA(qaReq(plan, "t5"));
+    expect(body<{ error: { code: string; details?: string[] } }>(r).error).toMatchObject({ code: "dependency_pending" });
+  });
+
+  it("recusa ficha sem conexão; recusa tarefa que não é do QA", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    expect(body<{ error: { code: string } }>(await svc.prepareQA(qaReq(plan, "t5", { agent: qaSheet({ connection: "none" }) }))).error.code).toBe("no_connection");
+    expect(body<{ error: { code: string } }>(await svc.prepareQA(qaReq(plan, "t3"))).error.code).toBe("not_qa_task");
+  });
+
+  it("uma vez satisfeita a dependência, congela a revisão com as entregas reais e as análises da cadeia — sem chamar o modelo", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const { svc, calls } = service([], { s: store, localRepos: [repo.dir] });
+    const r = body<{ run: RunDetail; created: boolean }>(await svc.prepareQA(qaReq(plan, "t5")));
+    expect(r.created).toBe(true);
+    expect(r.run.status).toBe("awaiting_approval");
+    const snap = r.run.snapshot as QASnapshot;
+    expect(snap.deliverables.map(d => d.taskId)).toContain("t3");
+    const t3d = snap.deliverables.find(d => d.taskId === "t3")!;
+    expect(t3d.origin).toBe("run_completed");
+    expect(t3d.diffText).toContain("serializador");
+    expect(snap.analyses.map(a => a.taskId).sort()).toEqual(["t1", "t2"]); // whole chain, not just the direct dependency
+    expect(snap.tools.every(t => !t.allowed)).toBe(true); // QA: no live tools at all
+    expect(snap.contextBudget.estimatedInputTokens).toBeGreaterThan(0);
+    await svc.idle();
+    expect(calls).toHaveLength(0); // preparing never calls the model
+  });
+});
+
+describe("QA: aprovação, execução real (simulada) e classificação dos critérios", () => {
+  it("execução completa: cada critério da demanda classificado, review_ready, uma única chamada", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const { svc, calls } = service([reply(qaResultRaw())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+    const done = (await store.detail(run.id))!;
+    expect(done.status).toBe("review_ready");
+    expect(done.qa?.criteria).toMatchObject([{ criterion: "Botão azul", verdict: "approved" }]);
+    expect(done.qa?.recommendation).toBe("ready_for_review");
+  });
+
+  it("reprova a resposta do modelo quando falta classificar um critério da demanda, quando falta evidência de aprovação, ou quando reprovação vem sem steps/expected/observed/impact", async () => {
+    // Two full real materialized-copy Developer runs in one test (two independent repos/stores) — heavier than most.
+    const repo = makeDevRepo(work);
+    const { plan: p1 } = await chainWithRealImplementation(repo, store);
+    const { svc: s1, calls: c1 } = service([reply(qaResultRaw({ criteria: [] })), reply(qaResultRaw({ criteria: [] }))], { s: store, localRepos: [repo.dir] });
+    const r1 = body<{ run: RunDetail }>(await s1.prepareQA(qaReq(p1, "t5"))).run;
+    await s1.approve(r1.id, { snapshotHash: r1.snapshotHash });
+    await s1.idle();
+    expect(c1).toHaveLength(2); // one correction attempt, per the standard policy
+    expect((await store.get(r1.id))!.status).toBe("failed");
+
+    const root2 = mkdtempSync(path.join(os.tmpdir(), "ayla-hand2-"));
+    const repo2 = makeDevRepo(root2);
+    const store2 = new RunStore(sqliteDriver(":memory:"));
+    const { plan: p2 } = await chainWithRealImplementation(repo2, store2);
+    const bad = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "approved", evidence: "" }] });
+    const { svc: s2 } = service([reply(bad), reply(bad)], { s: store2, localRepos: [repo2.dir] });
+    const r2 = body<{ run: RunDetail }>(await s2.prepareQA(qaReq(p2, "t5"))).run;
+    await s2.approve(r2.id, { snapshotHash: r2.snapshotHash });
+    await s2.idle();
+    expect((await store2.get(r2.id))!.status).toBe("failed");
+    rmSync(root2, { recursive: true, force: true });
+  }, 20000);
+
+  it("build/lint/teste passando não é aceito como prova funcional só por afirmação: recommendation ready_for_review exige todos os critérios aprovados", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const bad = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "not_verified", notVerifiedReason: "Sem terminal para rodar." }], recommendation: "ready_for_review" });
+    const { svc, calls } = service([reply(bad), reply(bad)], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(2);
+    expect((await store.get(run.id))!.status).toBe("failed");
+  });
+
+  it("clique repetido na confirmação enfileira uma única vez; cancelamento antes da confirmação não chama o modelo", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const { svc: sPending } = service([], { s: store, localRepos: [repo.dir] });
+    const runPending = body<{ run: RunDetail }>(await sPending.prepareQA(qaReq(plan, "t5"))).run;
+    const discarded = await sPending.cancel(runPending.id);
+    expect(body<{ canceled: boolean }>(discarded).canceled).toBe(true);
+    await sPending.idle();
+
+    const { svc, calls } = service([reply(qaResultRaw())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
+    const [a, b] = await Promise.all([svc.approve(run.id, { snapshotHash: run.snapshotHash }), svc.approve(run.id, { snapshotHash: run.snapshotHash })]);
+    expect([a, b].filter(r => body<{ approved: boolean }>(r).approved)).toHaveLength(1);
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("persistência: o parecer do QA reabre do banco exatamente como gravado (kind qa_task)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const { svc } = service([reply(qaResultRaw())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    const detail = (await store.detail(run.id))!;
+    expect(detail.kind).toBe("qa_task");
+    expect(detail.qa?.outcome).toBe("done");
+    expect(detail.developer).toBeNull();
+    expect(detail.analysis).toBeNull();
+    expect((await store.get(run.id))!.qa?.outcome).toBe("done");
   });
 });

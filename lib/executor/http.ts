@@ -81,6 +81,10 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "POST" && r) return await service.approve(r[1], await readJson(req));
     r = /^\/v1\/runs\/([0-9a-f-]{36})\/resolve-locally$/.exec(p);
     if (m === "POST" && r) return await service.resolveClarificationLocally(r[1], await readJson(req));
+    r = /^\/v1\/runs\/([0-9a-f-]{36})\/completions$/.exec(p);
+    if (m === "GET" && r) return await service.listCompletions(r[1]);
+    if (m === "POST" && p === "/v1/qa-handoffs") return await service.prepareQA(await readJson(req));
+    if (m === "POST" && p === "/v1/task-completions") return await service.recordTaskCompletion(await readJson(req));
     if (m === "POST" && p === "/v1/handoffs") return await service.prepare(await readJson(req));
     if (m === "GET" && p === "/v1/handoffs/source-options") return await service.sourceOptions(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");
     if (m === "GET" && p === "/v1/developer-preview") return await service.developerPreview(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");

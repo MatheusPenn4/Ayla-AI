@@ -15,6 +15,7 @@ import { HandoffRefused, HandoffZ, prepareHandoff, sourceOptions } from "./hando
 import { listLocalRepos } from "./local-git";
 import { processRun } from "./planner";
 import type { Runner } from "./proc";
+import { QAHandoffZ, prepareQAHandoff } from "./qa";
 import { EXECUTABLE_AGENTS, buildNewRun, parseStartRequest } from "./runs-service";
 import type { RunStore } from "./store";
 import type { EnvVars } from "./proc";
@@ -270,18 +271,50 @@ export class ExecutorService {
     }
   }
 
-  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). Architect or Developer. */
+  // ---- hand-off to QA -----------------------------------------------------
+
+  /**
+   * Step 1: validate against the executor's own records — every dependency of this task, transitively, must
+   * have real, validated evidence (see lib/engine/dependency.ts) — and freeze what will be sent. QA gets no
+   * live tools at all (read_only mode); nothing is called here.
+   */
+  async prepareQA(body: unknown): Promise<Reply> {
+    const parsed = QAHandoffZ.safeParse(body);
+    if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
+    const req = parsed.data;
+    if (req.agent.connection !== "none" && !READ_ONLY[req.agent.connection].safe) {
+      return err(409, "adapter_not_read_only", "Esta conexão não pode ser restrita a somente leitura e está bloqueada para o QA. Escolha a outra conexão na ficha dele.");
+    }
+    if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
+      return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
+    }
+    try {
+      const { run, created } = await prepareQAHandoff(req, this.handoffDeps());
+      return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
+    } catch (e) {
+      if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
+      throw e;
+    }
+  }
+
+  /** Every validated task-completion of a plan — used by the UI to show "entrega local validada" vs. a bare model result. */
+  async listCompletions(parentRunId: string): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(parentRunId)) return err(400, "invalid_request", "Plano inválido.");
+    return { status: 200, body: { completions: await this.store.taskCompletionsForPlan(parentRunId) } };
+  }
+
+  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). Architect, Developer or QA. */
   async approve(id: string, body: unknown): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
     const hash = (body as { snapshotHash?: unknown } | null)?.snapshotHash;
     const run = await this.store.get(id);
-    if (!run || (run.kind !== "architect_task" && run.kind !== "developer_task")) return err(404, "not_found", "Encaminhamento não encontrado.");
+    if (!run || (run.kind !== "architect_task" && run.kind !== "developer_task" && run.kind !== "qa_task")) return err(404, "not_found", "Encaminhamento não encontrado.");
     if (run.status !== "awaiting_approval") return { status: 200, body: { run, approved: false } };
     if (typeof hash !== "string" || hash !== run.snapshotHash) return err(409, "content_changed", "O conteúdo confirmado não corresponde ao encaminhamento preparado. Abra a revisão de novo.");
     const parent = run.parentRunId ? await this.store.get(run.parentRunId) : null;
     if (!parent || parent.status !== "plan_ready") return err(409, "plan_not_ready", "O plano do Diretor desta tarefa não está mais disponível.");
     if (!(await this.store.approve(id))) return { status: 200, body: { run: await this.store.get(id), approved: false } };
-    await this.store.event(id, "approved", run.kind === "developer_task" ? "Envio confirmado por você. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora." : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
+    await this.store.event(id, "approved", run.kind === "developer_task" ? "Envio confirmado por você. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora." : run.kind === "qa_task" ? "Envio confirmado por você. O QA entrou na fila do executor local." : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
     this.enqueue(id);
     return { status: 202, body: { run: await this.store.get(id), approved: true } };
   }
@@ -306,6 +339,49 @@ export class ExecutorService {
     const resolution: LocalResolution = { at: new Date().toISOString(), by: "orchestrator", note: b.note.trim(), commit: b.commit, testFile: (b.testFile as string | undefined) ?? null, testCount: (b.testCount as number | undefined) ?? null };
     if (!(await this.store.resolveClarificationLocally(id, resolution))) return err(409, "conflict", "Não foi possível registrar: a execução mudou de estado.");
     return { status: 200, body: { run: await this.store.get(id) } };
+  }
+
+  /**
+   * Records validated evidence that a task's real deliverable exists — the only thing dependencyEvidence()
+   * accepts as "done" besides a genuinely completed run (see lib/engine/dependency.ts). Not a general
+   * user-facing action: no UI button calls this; it exists so the orchestrator's own verification work
+   * (typecheck/lint/tests/build actually run, files actually committed) is durable and auditable, and so a
+   * dependent task's block is lifted only by real evidence, never by a bare LocalResolution existing.
+   */
+  async recordTaskCompletion(body: unknown): Promise<Reply> {
+    const b = body as {
+      demandId?: unknown; parentRunId?: unknown; taskId?: unknown; kind?: unknown; sourceRunId?: unknown;
+      commit?: unknown; files?: unknown; verification?: unknown; note?: unknown;
+    } | null;
+    if (typeof b?.parentRunId !== "string" || !/^[0-9a-f-]{36}$/.test(b.parentRunId)) return err(400, "invalid_body", "parentRunId inválido.");
+    if (typeof b.taskId !== "string" || !b.taskId.trim()) return err(400, "invalid_body", "Informe taskId.");
+    if (b.kind !== "resolved_clarification" && b.kind !== "direct_implementation") return err(400, "invalid_body", "kind deve ser resolved_clarification ou direct_implementation.");
+    if (typeof b.commit !== "string" || !/^[0-9a-f]{40}$/.test(b.commit)) return err(400, "invalid_body", "Informe o commit (hash de 40 caracteres).");
+    if (!Array.isArray(b.files) || !b.files.every(f => typeof f === "string")) return err(400, "invalid_body", "files deve ser uma lista de caminhos.");
+    if (typeof b.note !== "string" || !b.note.trim()) return err(400, "invalid_body", "Informe note.");
+    const checkOk = (c: unknown) => c === null || (typeof c === "object" && c !== null && typeof (c as { ran?: unknown }).ran === "boolean" && typeof (c as { command?: unknown }).command === "string" && typeof (c as { result?: unknown }).result === "string" && typeof (c as { at?: unknown }).at === "string");
+    const v = b.verification as { typecheck?: unknown; lint?: unknown; tests?: unknown; build?: unknown } | null;
+    if (!v || !checkOk(v.typecheck) || !checkOk(v.lint) || !checkOk(v.tests) || !checkOk(v.build)) return err(400, "invalid_body", "verification deve ter typecheck/lint/tests/build, cada um nulo ou {ran, command, result, at}.");
+    const plan = await this.store.get(b.parentRunId);
+    if (!plan || plan.kind !== "director_plan" || !plan.result) return err(404, "plan_not_found", "Plano do Diretor não encontrado ou sem resultado.");
+    const task = plan.result.tasks.find(t => t.id === b.taskId);
+    if (!task) return err(404, "task_not_found", `A tarefa "${b.taskId}" não existe neste plano.`);
+    let sourceRunId: string | null = null;
+    if (b.kind === "resolved_clarification") {
+      if (typeof b.sourceRunId !== "string" || !/^[0-9a-f-]{36}$/.test(b.sourceRunId)) return err(400, "invalid_body", "resolved_clarification exige sourceRunId (a execução com o esclarecimento resolvido).");
+      const source = await this.store.get(b.sourceRunId);
+      if (!source || source.kind !== "developer_task" || source.taskId !== b.taskId) return err(404, "source_run_not_found", "sourceRunId não corresponde a uma execução do Desenvolvedor desta tarefa.");
+      if (source.status !== "awaiting_clarification" || !source.localResolution) return err(409, "no_local_resolution", "A execução indicada não tem um esclarecimento resolvido localmente (localResolution) para validar.");
+      if (source.localResolution.commit !== b.commit) return err(409, "commit_mismatch", "O commit informado não é o mesmo do localResolution da execução indicada.");
+      sourceRunId = b.sourceRunId;
+    } else if (b.sourceRunId !== undefined && b.sourceRunId !== null) {
+      return err(400, "invalid_body", "direct_implementation não usa sourceRunId (não há execução de origem).");
+    }
+    const completion = await this.store.recordTaskCompletion({
+      demandId: plan.demandId, parentRunId: b.parentRunId, taskId: b.taskId, kind: b.kind, sourceRunId,
+      commit: b.commit, files: b.files as string[], verification: v as never, note: b.note.trim(), validatedBy: "orchestrator", validatedAt: new Date().toISOString(),
+    });
+    return { status: 201, body: { completion } };
   }
 
   private enqueue(id: string) {

@@ -16,6 +16,7 @@ import path from "node:path";
 import { GithubError } from "./github";
 import { clientEnv, type Runner } from "./proc";
 import { resolveGit, type GitDeps } from "./local-git";
+import { redactSecrets } from "./redact";
 import type { DeveloperDiffFile } from "@/lib/engine/types";
 
 const MAX_DIFF_CHARS = 40_000;
@@ -89,24 +90,6 @@ export async function materializeCommit(opts: { sourceDir: string; commit: strin
 }
 
 const STATUS: Record<string, DeveloperDiffFile["status"]> = { A: "added", M: "modified", D: "deleted" };
-
-// Defense in depth: the diff comes from a git-archived commit (never .env/.dev.vars/node_modules) plus the
-// model's own edits, so a real credential should not normally appear — but the diff is kept even when the
-// run is rejected, so anything that looks like one is redacted before it is ever persisted or shown.
-const SECRET_PATTERNS: RegExp[] = [
-  /-----BEGIN[ A-Z]*PRIVATE KEY-----[\s\S]*?-----END[ A-Z]*PRIVATE KEY-----/g,
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
-  /\bBearer\s+[A-Za-z0-9._-]{10,}/g,
-];
-// "API_KEY = \"...\"" style assignments: keep the name and quotes, redact only the value.
-const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*\s*[:=]\s*)(['"]?)([^\s'"]{6,})\2/gi;
-export function redactSecrets(text: string): string {
-  let out = SECRET_PATTERNS.reduce((t, re) => t.replace(re, "[REDACTED]"), text);
-  out = out.replace(ASSIGNMENT_PATTERN, "$1$2[REDACTED]$2");
-  return out;
-}
 
 /** Stages everything and diffs against the base commit made by materializeCommit. Read-only from the model's edits. */
 export async function diffWorktree(m: Pick<Materialized, "workDir" | "hooksDir">, deps: GitDeps): Promise<{ files: DeveloperDiffFile[]; diffText: string; diffTruncated: boolean }> {

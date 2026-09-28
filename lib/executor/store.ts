@@ -1,7 +1,8 @@
 // Durable run storage behind a tiny SQL driver interface.
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
-import type { DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext } from "@/lib/engine/types";
+import { randomUUID } from "node:crypto";
+import type { DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -59,10 +60,29 @@ const SCHEMA = [
     code TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS ayla_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  // Validated evidence that a task's real deliverable exists, beyond a bare LocalResolution or the model's
+  // own reply — the only thing dependencyEvidence() (lib/engine/dependency.ts) accepts as "done". Append-only:
+  // never updated in place, so earlier validations stay in the history even if a later one is recorded.
+  `CREATE TABLE IF NOT EXISTS task_completions (
+    id TEXT PRIMARY KEY,
+    demand_id TEXT NOT NULL,
+    parent_run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_run_id TEXT,
+    commit_hash TEXT NOT NULL,
+    files_json TEXT NOT NULL,
+    verification_json TEXT NOT NULL,
+    note TEXT NOT NULL,
+    validated_by TEXT NOT NULL,
+    validated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS task_completions_by_task ON task_completions (parent_run_id, task_id, created_at)`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection. */
-export const SCHEMA_VERSION = 4;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence. */
+export const SCHEMA_VERSION = 5;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
@@ -76,8 +96,8 @@ const ADDED_COLUMNS: [string, string][] = [
 const INDEXES = [
   // At most one active Director plan per demand (no duplicate runs on double click / refresh).
   `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_plan ON director_runs (demand_id) WHERE kind = 'director_plan' AND status IN ('queued', 'planning')`,
-  // At most one pending/active hand-off per task of a plan, whether to the Architect or the Developer.
-  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind IN ('architect_task', 'developer_task') AND status IN ('awaiting_approval', 'queued', 'planning')`,
+  // At most one pending/active hand-off per task of a plan, whether to the Architect, the Developer or QA.
+  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind IN ('architect_task', 'developer_task', 'qa_task') AND status IN ('awaiting_approval', 'queued', 'planning')`,
   `CREATE INDEX IF NOT EXISTS runs_by_parent ON director_runs (parent_run_id, task_id, created_at)`,
 ];
 
@@ -88,7 +108,7 @@ const parse = <T>(v: unknown): T | null => (typeof v === "string" && v ? (JSON.p
 const nowIso = () => new Date().toISOString();
 
 function toRecord(r: Row): RunRecord {
-  const kind = ((r.kind === "architect_task" || r.kind === "developer_task") ? r.kind : "director_plan") as RunRecord["kind"];
+  const kind = ((r.kind === "architect_task" || r.kind === "developer_task" || r.kind === "qa_task") ? r.kind : "director_plan") as RunRecord["kind"];
   return {
     id: String(r.id), kind, demandId: String(r.demand_id), agentId: String(r.agent_id), status: r.status as RunStatus,
     parentRunId: (r.parent_run_id as string) ?? null, taskId: (r.task_id as string) ?? null,
@@ -100,10 +120,20 @@ function toRecord(r: Row): RunRecord {
     result: kind === "director_plan" ? parse<RunRecord["result"]>(r.result_json) : null,
     analysis: kind === "architect_task" ? parse<RunRecord["analysis"]>(r.result_json) : null,
     developer: kind === "developer_task" ? parse<RunRecord["developer"]>(r.result_json) : null,
+    qa: kind === "qa_task" ? parse<RunRecord["qa"]>(r.result_json) : null,
     rejectedDiff: kind === "developer_task" ? parse<DeveloperDiff>(r.rejected_diff_json) : null,
     localResolution: parse<LocalResolution>(r.local_resolution_json),
     error: parse<RunError>(r.error_json),
     previousRunId: (r.previous_run_id as string) ?? null,
+  };
+}
+
+function toCompletion(r: Row): TaskCompletion {
+  return {
+    id: String(r.id), demandId: String(r.demand_id), parentRunId: String(r.parent_run_id), taskId: String(r.task_id),
+    kind: r.kind as TaskCompletion["kind"], sourceRunId: (r.source_run_id as string) ?? null, commit: String(r.commit_hash),
+    files: parse<string[]>(r.files_json) ?? [], verification: parse<Verification>(r.verification_json)!,
+    note: String(r.note), validatedBy: r.validated_by as TaskCompletion["validatedBy"], validatedAt: String(r.validated_at), createdAt: String(r.created_at),
   };
 }
 
@@ -150,10 +180,10 @@ export class RunStore {
 
   /** True when the file was written by an older schema (used to take a backup before migrating). */
   async needsMigration() {
-    const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'director_runs'`);
-    if (!tables.length) return false;
+    const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`);
+    if (!tables.some(t => t.name === "director_runs")) return false;
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
-    return ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c));
+    return ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || !tables.some(t => t.name === "task_completions");
   }
 
   /** Consistent copy of the whole database (SQLite VACUUM INTO). */
@@ -185,7 +215,7 @@ export class RunStore {
     const kind = input.kind ?? "director_plan";
     const byKey = await this.db.all(`SELECT * FROM director_runs WHERE idempotency_key = ?`, [input.idempotencyKey]);
     if (byKey[0]) return { run: toRecord(byKey[0]), created: false };
-    const openRun = () => (kind === "architect_task" || kind === "developer_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
+    const openRun = () => (kind === "architect_task" || kind === "developer_task" || kind === "qa_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
     const active = await openRun();
     if (active) return { run: active, created: false };
     const t = nowIso();
@@ -207,7 +237,9 @@ export class RunStore {
       ? "Encaminhamento preparado para o Arquiteto. Nada será executado antes da sua confirmação."
       : kind === "developer_task"
         ? "Encaminhamento preparado para o Desenvolvedor. Nenhuma cópia de trabalho foi criada e nada será executado antes da sua confirmação."
-        : "Execução criada e colocada na fila do executor local.");
+        : kind === "qa_task"
+          ? "Encaminhamento preparado para o QA. Nada será executado antes da sua confirmação."
+          : "Execução criada e colocada na fila do executor local.");
     return { run: (await this.get(input.id))!, created: true };
   }
 
@@ -229,7 +261,7 @@ export class RunStore {
 
   /** The user's confirmation: awaiting_approval → queued, atomically (a repeated click changes nothing). */
   async approve(id: string) {
-    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind IN ('architect_task', 'developer_task') AND status = 'awaiting_approval'`, [nowIso(), id]);
+    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind IN ('architect_task', 'developer_task', 'qa_task') AND status = 'awaiting_approval'`, [nowIso(), id]);
     return changes === 1;
   }
 
@@ -248,6 +280,38 @@ export class RunStore {
     );
     if (changes === 1) await this.event(id, "clarification_resolved_locally", `Esclarecimento resolvido fora do modelo: ${resolution.note}`, resolution);
     return changes === 1;
+  }
+
+  /**
+   * Appends a validated TaskCompletion — the only thing dependencyEvidence() (lib/engine/dependency.ts)
+   * accepts as "this task is done" besides a real completed run. Append-only: never updates a row in place,
+   * so an earlier validation is never silently replaced. Also records an immutable event on the plan run
+   * (parentRunId), since a direct_implementation completion has no run of its own to attach to.
+   */
+  async recordTaskCompletion(input: Omit<TaskCompletion, "id" | "createdAt">): Promise<TaskCompletion> {
+    await this.ensureSchema();
+    const row: TaskCompletion = { ...input, id: randomUUID(), createdAt: nowIso() };
+    await this.db.run(
+      `INSERT INTO task_completions (id, demand_id, parent_run_id, task_id, kind, source_run_id, commit_hash, files_json, verification_json, note, validated_by, validated_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.id, row.demandId, row.parentRunId, row.taskId, row.kind, row.sourceRunId, row.commit, JSON.stringify(row.files), JSON.stringify(row.verification), row.note, row.validatedBy, row.validatedAt, row.createdAt],
+    );
+    await this.event(row.parentRunId, "task_completion_recorded", `Entrega validada de ${row.taskId} (${row.kind === "direct_implementation" ? "implementada diretamente, fora do encaminhamento" : "esclarecimento resolvido e validado"}): commit ${row.commit.slice(0, 12)}, ${row.files.length} arquivo(s), validado por ${row.validatedBy}.`, row);
+    return row;
+  }
+
+  /** Every validated completion of one task, newest first. */
+  async taskCompletions(parentRunId: string, taskId: string): Promise<TaskCompletion[]> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM task_completions WHERE parent_run_id = ? AND task_id = ? ORDER BY created_at DESC`, [parentRunId, taskId]);
+    return rows.map(toCompletion);
+  }
+
+  /** Every validated completion of every task of one plan, newest first — one query for the whole dependency graph. */
+  async taskCompletionsForPlan(parentRunId: string): Promise<TaskCompletion[]> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM task_completions WHERE parent_run_id = ? ORDER BY created_at DESC`, [parentRunId]);
+    return rows.map(toCompletion);
   }
 
   async activeForDemand(demandId: string) {

@@ -3,7 +3,7 @@
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
 import type { DeveloperPreview } from "./developer-preview";
-import type { ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, SourceComparison, StartRunRequest, TeamMemberInput } from "./types";
+import type { ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -85,6 +85,11 @@ export const engineApi = {
   /** Developer hand-off step 1: freezes the review. No working copy is built and no model is called here. */
   prepareDeveloperHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; source?: { commit: string }; revisionReason?: string }) =>
     call<{ run: RunDetail; created: boolean }>("/api/developer-handoffs", { method: "POST", body: JSON.stringify(req) }),
-  /** Hand-off step 2: the user's confirmation of exactly that content (Architect or Developer). */
+  /** QA hand-off step 1: freezes the review. No model is called here. */
+  prepareQAHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput }) =>
+    call<{ run: RunDetail; created: boolean }>("/api/qa-handoffs", { method: "POST", body: JSON.stringify(req) }),
+  /** Hand-off step 2: the user's confirmation of exactly that content (Architect, Developer or QA). */
   approve: (id: string, snapshotHash: string) => call<{ run: RunRecord; approved: boolean }>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify({ snapshotHash }) }),
+  /** Every validated task-completion of a plan (evidence dependencyEvidence() accepts as "done" beyond a completed run). */
+  listCompletions: (planRunId: string) => call<{ completions: TaskCompletion[] }>(`/api/runs/${planRunId}/completions`),
 };

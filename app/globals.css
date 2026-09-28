@@ -608,6 +608,7 @@ svg { flex: none; }
 .basis { font-family: var(--font-mono); font-size: 10.5px; padding: 2px 6px; border-radius: 5px; white-space: nowrap; }
 .basis.b-read { color: #b5f0cf; background: #0f261d; border: 1px solid #2a6a4c; }
 .basis.b-inferred { color: #ffe0a8; background: #2a2012; border: 1px solid #7a5a2a; }
+.basis.b-bad { color: #ffd6dd; background: #2a1520; border: 1px solid #6d2839; }
 .kv { margin: 0; display: grid; grid-template-columns: 150px 1fr; gap: 6px 12px; font-size: 12.5px; }
 .kv dt { color: var(--dim); }
 .kv dd { margin: 0; color: #d7def8; }

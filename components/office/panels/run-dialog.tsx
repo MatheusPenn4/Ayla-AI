@@ -13,10 +13,12 @@ import { UsagePanel } from "./usage-panel";
 import { engineApi, type HandoffFollowUp } from "@/lib/engine/client";
 import { ANALYSIS_JSON_SCHEMA } from "@/lib/engine/analysis-schema";
 import { DEVELOPER_JSON_SCHEMA } from "@/lib/engine/developer-schema";
+import { QA_JSON_SCHEMA } from "@/lib/engine/qa-schema";
 import { PLAN_JSON_SCHEMA } from "@/lib/engine/plan-schema";
 import { connectionLabel } from "@/lib/engine/connections";
-import { TASK_STATE_LABEL, developerBlocker, handoffBlocker, isExecutableAssignee, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
-import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
+import { TASK_STATE_LABEL, isExecutableAssignee, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
+import { dependencyBlocker, dependencyEvidence, evidenceLabel } from "@/lib/engine/dependency";
+import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type QASnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
 import { directorPlanToMarkdown, planMarkdownFilename, type PlanMarkdownStep, type PlanMarkdownTask } from "@/lib/engine/plan-markdown";
 import { downloadTextFile } from "@/lib/utils";
 import type { Agent } from "@/lib/office/types";
@@ -52,6 +54,8 @@ type DialogProps = {
   onHandoffDeveloper: (planRunId: string, taskId: string) => void;
   /** Opens the review of a just-prepared Developer hand-off (kind known at the call site, unlike onReview). */
   onReviewDeveloper: (handoffRunId: string) => void;
+  /** “Enviar ao QA” on a task of a Director plan (prepares the hand-off and opens the review). */
+  onHandoffQA: (planRunId: string, taskId: string) => void;
   /** Reopens the review of a prepared hand-off (Architect or Developer — resolved by the run's kind). */
   onReview: (handoffRunId: string) => void;
   /** Resolution of the Architect's questions (prepares a new hand-off for review). */
@@ -94,6 +98,7 @@ function RunBody(props: DialogProps & { runId: string }) {
   if (!run) return <div className="run-loading">{error ?? <><Loader2 size={16} className="spin" /> Carregando execução…</>}</div>;
   if (run.kind === "architect_task") return <ArchitectBody {...props} run={run} active={active} />;
   if (run.kind === "developer_task") return <DeveloperBody {...props} run={run} active={active} />;
+  if (run.kind === "qa_task") return <QABody {...props} run={run} active={active} />;
   return <DirectorBody {...props} run={run} active={active} />;
 }
 
@@ -162,7 +167,7 @@ function Meta({ run }: { run: RunDetail }) {
 
 // ---- Director plan ---------------------------------------------------------
 
-function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff, onHandoffDeveloper, onReview, onReviewDeveloper, onOpenRun }: BodyProps) {
+function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff, onHandoffDeveloper, onReviewDeveloper, onHandoffQA, onReview, onOpenRun }: BodyProps) {
   const [tab, setTab] = useState("plan");
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const res = run.result;
@@ -171,21 +176,23 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   const name = (id: string) => who(id)?.name ?? snap.team.find(t => t.id === id)?.name ?? id;
   const architectTasks = res?.tasks.filter(t => isHandoffTarget(t.assignee)) ?? [];
   const runsOf = (taskId: string) => runs.taskRunsFor(run.id, taskId);
+  const completionsOf = (taskId: string) => runs.completionsFor(run.id, taskId);
+  useEffect(() => { void runs.loadCompletions(run.id); }, [run.id, runs]);
   const [sendFor, setSendFor] = useState<string | null>(null);
   const [previewFor, setPreviewFor] = useState<string | null>(null);
 
-  // Every field here comes from data already loaded for this dialog (run.result, taskState/runsOf) — no extra
-  // fetch per task. stateLabel/architectSummary reflect the REAL state the UI already shows elsewhere (same
-  // TASK_STATE_LABEL, same run.analysis already present on the plain RunRecord); a clarification resolved
-  // outside the model (run.localResolution) is named as such, never folded into "implementation done".
+  // Every field here comes from data already loaded for this dialog (run.result, taskState/runsOf/completionsOf)
+  // — no extra fetch per task. stateLabel/architectSummary reflect the REAL state the UI already shows
+  // elsewhere; a clarification asked isn't enough for "resolvido" here — only a VALIDATED TaskCompletion
+  // (dependencyEvidence) is, so this never claims more than the dependency rule itself accepts.
   const downloadPlanMarkdown = () => {
     if (!res) return;
     const steps: PlanMarkdownStep[] = res.steps.map(s => ({ step: s, ownerName: name(s.owner) }));
     const tasks: PlanMarkdownTask[] = res.tasks.map(t => {
       const st = taskState(t, runsOf(t.id));
       const base = TASK_STATE_LABEL[st.key];
-      const lr = st.run?.localResolution;
-      const stateLabel = lr ? `${base} — esclarecimento resolvido fora do modelo (commit ${lr.commit.slice(0, 8)}${lr.testCount != null ? `, ${lr.testCount} teste(s)` : ""}): ${lr.note}` : base;
+      const ev = dependencyEvidence(t, runsOf, completionsOf);
+      const stateLabel = ev.kind === "resolved_clarification_validated" || ev.kind === "direct_implementation_validated" ? `${base} — ${evidenceLabel(ev)}` : base;
       const architectSummary = isHandoffTarget(t.assignee) && st.run?.analysis ? st.run.analysis.recommendation.summary : null;
       return { task: t, assigneeName: name(t.assignee), stateLabel, architectSummary, architectSummaryNote: null };
     });
@@ -251,7 +258,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
               const tr = runsOf(t.id);
               const st = taskState(t, tr);
               const canSend = st.key === "proposed" || st.key === "failed" || st.key === "canceled";
-              const blocker = canSend ? handoffBlocker(t, res.tasks, runsOf) : null;
+              const blocker = canSend ? dependencyBlocker(t, res.tasks, runsOf, completionsOf) : null;
               const sending = runs.pending.has(`${run.id}:${t.id}`);
               return (
                 <article key={t.id} className={`task-card ${isHandoffTarget(t.assignee) ? "is-handoff" : ""}`}>
@@ -282,7 +289,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                   )}
                   {!isExecutableAssignee(t.assignee) && <small className="muted">Proposta registrada. {name(t.assignee)} ainda não executa nesta fase; nada foi delegado.</small>}
                   {t.assignee === "developer" && run.status === "plan_ready" && (() => {
-                    const devBlocker = developerBlocker(t, res.tasks, runsOf);
+                    const devBlocker = dependencyBlocker(t, res.tasks, runsOf, completionsOf);
                     return (
                       <div className="task-actions">
                         {canSend && (
@@ -300,6 +307,23 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                     );
                   })()}
                   {previewFor === t.id && <DeveloperPreviewPanel planRunId={run.id} taskId={t.id} agents={agents} runs={runs} onOpenRun={onOpenRun} onReview={id => { setPreviewFor(null); onReviewDeveloper(id); }} onClose={() => setPreviewFor(null)} />}
+                  {t.assignee === "qa" && run.status === "plan_ready" && (() => {
+                    const qaBlocker = dependencyBlocker(t, res.tasks, runsOf, completionsOf);
+                    return (
+                      <div className="task-actions">
+                        {canSend && (
+                          <button className="btn-primary small" disabled={!!qaBlocker || sending || !runs.status?.executionEnabled} title={qaBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffQA(run.id, t.id)}>
+                            {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><Send size={13} /> {st.key === "proposed" ? "Enviar ao QA" : "Enviar ao QA novamente"}</>}
+                          </button>
+                        )}
+                        {st.key === "awaiting_approval" && st.run && <button className="btn-primary small" onClick={() => onReview(st.run!.id)}><ShieldCheck size={13} /> Revisar e confirmar envio</button>}
+                        {st.run && st.key !== "awaiting_approval" && <button className="btn-secondary small" onClick={() => onOpenRun(st.run!.id)}>{st.key === "review_ready" ? "Ver revisão do QA" : st.key === "awaiting_clarification" ? "Ver dúvidas do QA" : "Ver execução do QA"}</button>}
+                        {(st.key === "queued" || st.key === "working") && st.run && <button className="btn-ghost small" onClick={() => onCancel(st.run!.id)}>Cancelar</button>}
+                        {qaBlocker && <span className="run-hint">{qaBlocker}</span>}
+                        {tr.length > 1 && <span className="run-history">Histórico: {tr.map(r => <button key={r.id} className="chip" onClick={() => (r.status === "awaiting_approval" ? onReview(r.id) : onOpenRun(r.id))} title={time(r.createdAt)}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>}
+                      </div>
+                    );
+                  })()}
                 </article>
               );
             }) ?? <p className="muted">Sem tarefas.</p>}
@@ -605,6 +629,108 @@ function DeveloperBody({ run, active, agents, onCancel, onOpenRun, onReview }: B
           <Tabs.Content value="events" className="run-pane"><Events run={run} /></Tabs.Content>
           <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="Desenvolvedor" prompt={run.prompt} schemaChars={JSON.stringify(DEVELOPER_JSON_SCHEMA).length} /></Tabs.Content>
           <Tabs.Content value="input" className="run-pane"><Input run={run} systemTitle="Instruções (protocolo do Desenvolvedor + ficha do Desenvolvedor)" /></Tabs.Content>
+        </div>
+      </Tabs.Root>
+    </>
+  );
+}
+
+function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProps) {
+  const [tab, setTab] = useState("review");
+  const snap = run.snapshot as QASnapshot;
+  const q = run.qa;
+  const qaAgent = agents.find(x => x.id === run.agentId);
+  const verdictLabel: Record<string, string> = { approved: "aprovado", rejected: "reprovado", not_verified: "não verificado" };
+
+  return (
+    <>
+      <DialogHeader>
+        <span className="eyebrow">QA · TAREFA {snap.task.id} · EXECUÇÃO {run.id.slice(0, 8).toUpperCase()}</span>
+        <DialogTitle className="run-title">{snap.task.title}</DialogTitle>
+        <DialogDescription asChild>
+          <div>
+            <Meta run={run} />
+            <div className="run-origin">
+              {qaAgent && <Avatar look={qaAgent.look} color={qaAgent.color} size={22} />}
+              <span>Demanda “{snap.demand.title}” · tarefa {snap.task.id}</span>
+              {run.parentRunId && <button className="btn-ghost small" onClick={() => onOpenRun(run.parentRunId!)}><ArrowLeft size={13} /> Ver plano do Diretor</button>}
+            </div>
+          </div>
+        </DialogDescription>
+      </DialogHeader>
+      {run.status === "awaiting_approval" && (
+        <div className="run-live">Envio preparado e aguardando sua aprovação. Nenhuma chamada foi feita ainda.<button className="btn-primary small" onClick={() => onReview(run.id)}><ShieldCheck size={13} /> Revisar e confirmar</button></div>
+      )}
+      {active && (
+        <div className="run-live"><Loader2 size={15} className="spin" /> {run.status === "queued" ? "Na fila do executor local." : `QA revisando via ${connectionLabel(run.connection)}, sem ferramenta alguma.`} Esta janela atualiza sozinha.
+          <button className="btn-ghost" onClick={() => onCancel(run.id)}>Cancelar</button>
+        </div>
+      )}
+      <ErrorBox run={run} />
+
+      <Tabs.Root value={tab} onValueChange={setTab} className="run-tabs">
+        <Tabs.List className="tab-list" aria-label="Detalhes da revisão de QA">
+          <Tabs.Trigger value="review">Parecer {q ? `(${q.criteria.filter(c => c.verdict === "approved").length}/${q.criteria.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="questions">Dúvidas {q?.questions.length ? `(${q.questions.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="deliverables">Entregas revisadas {snap.deliverables.length ? `(${snap.deliverables.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="events">Eventos</Tabs.Trigger>
+          <Tabs.Trigger value="tokens">Tokens</Tabs.Trigger>
+          <Tabs.Trigger value="input">Entrada</Tabs.Trigger>
+        </Tabs.List>
+        <div className="dialog-scroll run-scroll">
+          <Tabs.Content value="review" className="run-pane">
+            {!q && <p className="pane-intro">{active ? "O parecer aparecerá aqui quando o QA terminar." : run.status === "awaiting_approval" ? "O QA ainda não foi acionado." : "Esta execução não produziu um parecer."}</p>}
+            {q && (
+              <>
+                {q.outcome === "needs_clarification" && <div className="notice">O QA não concluiu: ele precisa de respostas (aba Dúvidas).</div>}
+                <section className="run-sec"><h4>Resumo</h4><p>{q.summary || "—"}</p></section>
+                <section className="run-sec"><h4>Recomendação geral</h4><p><span className={`basis ${q.recommendation === "ready_for_review" ? "b-read" : "b-inferred"}`}>{q.recommendation === "ready_for_review" ? "pronto para o Revisor" : q.recommendation === "blocked" ? "bloqueado" : "falta trabalho"}</span></p></section>
+                <section className="run-sec"><h4>Critérios de aceite da demanda</h4>
+                  <table className="ctx-table"><thead><tr><th>Critério</th><th>Veredito</th><th>Evidência / motivo</th></tr></thead>
+                    <tbody>{q.criteria.map((c, i) => (
+                      <tr key={i}>
+                        <td>{c.criterion}</td>
+                        <td><span className={`basis ${c.verdict === "approved" ? "b-read" : c.verdict === "rejected" ? "b-bad" : "b-inferred"}`}>{verdictLabel[c.verdict]}</span></td>
+                        <td>
+                          {c.verdict === "approved" && c.evidence}
+                          {c.verdict === "rejected" && c.rejected && <><b>Passos:</b> {c.rejected.steps}<br /><b>Esperado:</b> {c.rejected.expected}<br /><b>Observado:</b> {c.rejected.observed}<br /><b>Impacto:</b> {c.rejected.impact}</>}
+                          {c.verdict === "not_verified" && c.notVerifiedReason}
+                        </td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </section>
+                <section className="run-sec"><h4>Não verificado, fora dos critérios</h4>{q.not_verified.length ? <ul>{q.not_verified.map((x, i) => <li key={i}>{x}</li>)}</ul> : <p className="muted">—</p>}</section>
+                <section className="run-sec limits"><h4>Limitações desta execução</h4><ul>{q.limitations.map((r, i) => <li key={i}>{r}</li>)}</ul></section>
+                {run.status === "review_ready" && <p className="form-note">Revisão de QA concluída e registrada. Nada foi aplicado, publicado ou enviado ao Revisor a partir daqui — isso depende de uma aprovação separada sua.</p>}
+              </>
+            )}
+          </Tabs.Content>
+
+          <Tabs.Content value="questions" className="run-pane">
+            {!q?.questions.length && <p className="muted">Nenhuma pergunta.</p>}
+            {!!q?.questions.length && (
+              <>
+                <p className="pane-intro">Perguntas registradas nesta execução. Responder a elas ainda não tem formulário dedicado nesta versão; prepare um novo envio manualmente se precisar prosseguir.</p>
+                {q.questions.map((qq, i) => <div key={i} className="question"><b>{i + 1}. {qq.question}</b><small>Por que bloqueia: {qq.why_it_blocks || "—"}</small></div>)}
+              </>
+            )}
+          </Tabs.Content>
+
+          <Tabs.Content value="deliverables" className="run-pane">
+            <p className="pane-intro">Análises e entregas reais que estavam no contexto desta revisão, exatamente como o QA recebeu.</p>
+            {!!snap.analyses.length && <section className="run-sec"><h4>Análises do Arquiteto</h4>{snap.analyses.map(a => <div key={a.runId} className="question"><b>{a.taskId} · {a.title}</b><small>{a.recommendation.summary}</small></div>)}</section>}
+            {snap.deliverables.map(d => (
+              <section key={d.taskId} className="run-sec"><h4>{d.taskId} · {d.title}</h4>
+                <p className="muted">{d.note}</p>
+                {d.commit && <p><code>{d.commit}</code> · {d.files.length} arquivo(s)</p>}
+                {d.diffText && <details className="raw"><summary>Ver diff{d.diffTruncated ? " (cortado)" : ""}</summary><pre className="brief">{d.diffText}</pre></details>}
+              </section>
+            ))}
+          </Tabs.Content>
+          <Tabs.Content value="events" className="run-pane"><Events run={run} /></Tabs.Content>
+          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="QA" prompt={run.prompt} schemaChars={JSON.stringify(QA_JSON_SCHEMA).length} /></Tabs.Content>
+          <Tabs.Content value="input" className="run-pane"><Input run={run} systemTitle="Instruções (protocolo do QA + ficha do QA)" /></Tabs.Content>
         </div>
       </Tabs.Root>
     </>

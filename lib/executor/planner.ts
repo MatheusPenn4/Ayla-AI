@@ -13,13 +13,15 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { ANALYSIS_JSON_SCHEMA, partialTexts, validateAnalysis } from "@/lib/engine/analysis-schema";
 import { DEVELOPER_JSON_SCHEMA, validateDeveloperResult } from "@/lib/engine/developer-schema";
+import { QA_JSON_SCHEMA, validateQAResult } from "@/lib/engine/qa-schema";
 import { PLAN_JSON_SCHEMA, validatePlan } from "@/lib/engine/plan-schema";
 import { buildSystemPrompt, buildUserMessage } from "@/lib/engine/prompt";
-import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DeveloperDiff, type DeveloperSnapshot, type DirectorSnapshot, type EditScopeEntry, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
+import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DeveloperDiff, type DeveloperSnapshot, type DirectorSnapshot, type EditScopeEntry, type QASnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
 import { LOGIN_STEPS } from "./clients";
 import { AgentError, type AgentAdapter, type AgentErrorCode, type AgentProgress } from "./adapters/types";
 import { GithubError, readGithubContext, shrinkGithubText } from "./github";
 import { listLocalRepos, type GitDeps } from "./local-git";
+import { KNOWN_LIMITATIONS } from "./qa";
 import type { RunStore } from "./store";
 import { destroyWorktree, diffWorktree, materializeCommit } from "./worktree";
 
@@ -107,6 +109,8 @@ type Prepared = {
   system: string; user: string; context: SourceContext | null; readPaths: string[]; answered?: string[]; partial?: Record<string, string>;
   /** Developer only: where the isolated working copy lives, how to diff it, and what it may touch. */
   runId?: string; workDir?: string; hooksDir?: string; gitDeps?: GitDeps; editScope?: EditScopeEntry[]; baseCommit?: string;
+  /** QA only: the demand's own acceptance criteria, verbatim — every one must be classified exactly once. */
+  qaExpectedCriteria?: string[];
 };
 type Outcome = { status: RunStatus; result: object; message: string };
 /** Developer only: `diff` on the failure branch carries the real diff even when it was rejected, so it can be kept for inspection. */
@@ -198,6 +202,35 @@ function architectSpec(deps: PlannerDeps): Spec {
   };
 }
 
+function qaLimitations(budget: RunBudget) {
+  return [
+    "QA não teve nenhuma ferramenta nesta execução: não leu o repositório, não editou, não rodou comando nem acessou a rede. Tudo o que classificou veio do texto de entregas reais preparado pelo executor.",
+    "Um build, typecheck, lint ou teste automatizado passando não é, por si só, validação funcional de um critério de aceite do usuário — só evidência de qualidade de código.",
+    ...KNOWN_LIMITATIONS,
+    ...usageNotes(budget),
+  ];
+}
+
+function qaSpec(deps: PlannerDeps): Spec {
+  return {
+    who: "QA",
+    schema: QA_JSON_SCHEMA as unknown as Record<string, unknown>,
+    blockOverBudget: false,
+    async prepare(run) {
+      const detail = (await deps.store.detail(run.id))!;
+      if (!detail.prompt) fail({ code: "handoff_incomplete", message: "O encaminhamento não tem a entrada congelada na aprovação. Prepare o envio novamente.", retryable: false, recovery: ["Abra a tarefa e clique em “Enviar ao QA” de novo."] });
+      const snap = detail.snapshot as QASnapshot;
+      return { system: detail.prompt!.system, user: detail.prompt!.user, context: null, readPaths: [], qaExpectedCriteria: snap.demand.acceptanceCriteria };
+    },
+    validate(output, p, budget) {
+      const v = validateQAResult(output, p.qaExpectedCriteria ?? []);
+      if (!v.ok) return v;
+      const status = v.result.outcome === "needs_clarification" ? "awaiting_clarification" : "review_ready";
+      return { ok: true, outcome: { status, result: { ...v.result, limitations: qaLimitations(budget) }, message: status === "review_ready" ? `Revisão de QA concluída: ${v.result.criteria.filter(c => c.verdict === "approved").length}/${v.result.criteria.length} critério(s) aprovado(s).` : `O QA precisa de esclarecimento: ${v.result.questions.length} pergunta(s).` } };
+    },
+  };
+}
+
 function developerLimitations(diff: DeveloperDiff, budget: RunBudget) {
   const out = [
     "Nenhum comando foi executado nesta execução: sem ferramenta de terminal nesta versão, tipos, lint, testes e build continuam sem verificação real.",
@@ -253,8 +286,8 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
   if (!(await store.claim(runId, deps.limits.leaseMs))) return;
   const run = (await store.get(runId))!;
   const snap = (await store.snapshot(runId)) as RunDetail["snapshot"];
-  const spec = run.kind === "architect_task" ? architectSpec(deps) : run.kind === "developer_task" ? developerSpec(deps) : directorSpec(deps, snap as DirectorSnapshot);
-  await store.event(runId, "started", run.kind === "architect_task" ? "O executor local iniciou a análise do Arquiteto." : "O executor local iniciou o planejamento.");
+  const spec = run.kind === "architect_task" ? architectSpec(deps) : run.kind === "developer_task" ? developerSpec(deps) : run.kind === "qa_task" ? qaSpec(deps) : directorSpec(deps, snap as DirectorSnapshot);
+  await store.event(runId, "started", run.kind === "architect_task" ? "O executor local iniciou a análise do Arquiteto." : run.kind === "qa_task" ? "O executor local iniciou a revisão do QA." : "O executor local iniciou o planejamento.");
   const budget: RunBudget = { ...run.budget, calls: [], reportedTotalTokens: null, exceeded: false };
   const record = (u: CallUsage | null) => {
     if (!u) return;
@@ -304,7 +337,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
           if (p.kind === "model_output") lastOutputEvent = Date.now();
           void store.event(runId, `client_${p.kind}`, p.message, p.data);
         };
-        const label = attempt === 1 ? (run.kind === "architect_task" ? "análise" : run.kind === "developer_task" ? "implementação" : "planejamento") : "correção";
+        const label = attempt === 1 ? (run.kind === "architect_task" ? "análise" : run.kind === "developer_task" ? "implementação" : run.kind === "qa_task" ? "revisão" : "planejamento") : "correção";
         const mode = run.kind === "developer_task" ? "developer_write" : "read_only";
         reply = await adapter.call({ label, system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, scratchDir, onProgress, mode });
       } catch (err) {

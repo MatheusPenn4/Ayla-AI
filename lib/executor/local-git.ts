@@ -9,9 +9,13 @@
 // - structured arguments, no shell, time limit, output cap.
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { SourceComparison, SourceContext } from "@/lib/engine/types";
+import type { DeveloperDiffFile, SourceComparison, SourceContext } from "@/lib/engine/types";
 import { ARCHITECT_GITHUB_LIMITS, GithubError, assembleContext, type RequestedFile, type TreeEntry } from "./github";
 import { clientEnv, type EnvVars, type Runner } from "./proc";
+import { redactSecrets } from "./redact";
+
+const MAX_COMMIT_DIFF_CHARS = 40_000;
+const COMMIT_STATUS: Record<string, DeveloperDiffFile["status"]> = { A: "added", M: "modified", D: "deleted" };
 
 export type LocalRepoInfo = { dir: string; dirName: string; owner: string; repo: string; head: string; headSubject: string };
 
@@ -107,6 +111,38 @@ export async function listTreeEntries(dir: string, commit: string, deps: GitDeps
     if (m) entries.push({ path: m[4], type: m[1], size: m[3] === "-" ? 0 : Number(m[3]), blob: m[2] });
   }
   return entries;
+}
+
+/**
+ * Real diff of exactly one commit against its parent (`git show`), from an authorized local clone — for QA,
+ * reviewing a commit that was applied directly (no Developer run of its own to reuse a diff from). Read-only:
+ * only committed objects, no checkout, no working-tree access. Redacted the same way as the Developer's own
+ * diff (worktree.ts#redactSecrets), and capped the same way.
+ */
+export async function readCommitDiff(dir: string, commit: string, deps: GitDeps): Promise<{ files: DeveloperDiffFile[]; diffText: string; diffTruncated: boolean }> {
+  if (!/^[0-9a-f]{40}$/.test(commit)) throw new GithubError("invalid_repo", "Commit inválido (use o hash completo de 40 caracteres).");
+  const g = resolveGit(deps);
+  if (!g) throw new GithubError("github_unavailable", "Git não encontrado neste computador.");
+  const nameStatus = await git(deps, g, dir, ["show", "--format=", "--name-status", commit], 4_000_000);
+  const numstat = await git(deps, g, dir, ["show", "--format=", "--numstat", commit], 4_000_000);
+  const counts = new Map<string, { add: number | null; del: number | null }>();
+  if (numstat.code === 0) {
+    for (const line of numstat.stdout.split(/\r?\n/).filter(Boolean)) {
+      const m = /^(-|\d+)\t(-|\d+)\t(.+)$/.exec(line);
+      if (m) counts.set(m[3], { add: m[1] === "-" ? null : Number(m[1]), del: m[2] === "-" ? null : Number(m[2]) });
+    }
+  }
+  const files: DeveloperDiffFile[] = [];
+  if (nameStatus.code === 0) {
+    for (const line of nameStatus.stdout.split(/\r?\n/).filter(Boolean)) {
+      const m = /^([AMD])\d*\t(.+)$/.exec(line);
+      if (m) files.push({ path: m[2], status: COMMIT_STATUS[m[1]] ?? "modified", additions: counts.get(m[2])?.add ?? null, deletions: counts.get(m[2])?.del ?? null, inScope: true });
+    }
+  }
+  const patch = await git(deps, g, dir, ["show", "--format=", commit], 6_000_000);
+  const raw = redactSecrets(patch.code === 0 ? patch.stdout : "");
+  const diffTruncated = raw.length > MAX_COMMIT_DIFF_CHARS;
+  return { files, diffText: diffTruncated ? `${raw.slice(0, MAX_COMMIT_DIFF_CHARS)}\n[… diff cortado em ${MAX_COMMIT_DIFF_CHARS} caracteres]` : raw, diffTruncated };
 }
 
 /** Reads a commit of an authorized clone with the same selection and limits as the GitHub reader. */

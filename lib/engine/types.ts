@@ -9,6 +9,7 @@ export type RunStatus =
   | "plan_ready" // Director: plan done
   | "analysis_ready" // Architect: analysis done
   | "implementation_ready" // Developer: edits done, diff computed and in scope
+  | "review_ready" // QA: every criterion classified (approved/rejected/not_verified), real evidence attached
   | "failed" | "canceled";
 export const ACTIVE_STATUSES: RunStatus[] = ["queued", "planning"];
 export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
@@ -19,17 +20,20 @@ export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   plan_ready: "Plano pronto",
   analysis_ready: "Análise concluída",
   implementation_ready: "Implementação pronta (não aplicada)",
+  review_ready: "Revisão de QA concluída",
   failed: "Falha",
   canceled: "Cancelada",
 };
 
-/** Director planning, one Director task handed off (with approval) to the Architect, or to the Developer. */
-export type RunKind = "director_plan" | "architect_task" | "developer_task";
+/** Director planning, one Director task handed off (with approval) to the Architect, the Developer, or QA. */
+export type RunKind = "director_plan" | "architect_task" | "developer_task" | "qa_task";
 
 /** Collaborators that can receive a read-only hand-off in this phase (see HandoffTargets for the Architect flow). */
 export const HANDOFF_TARGETS = ["architect"] as const;
 /** The Developer's hand-off is a separate, write-capable flow (see lib/executor/developer.ts); not merged into HANDOFF_TARGETS. */
 export const DEVELOPER_ASSIGNEE = "developer";
+/** QA's hand-off is a separate, read-only flow (see lib/executor/qa.ts); not merged into HANDOFF_TARGETS either. */
+export const QA_ASSIGNEE = "qa";
 
 /**
  * How a collaborator reaches a model: through an official client installed and
@@ -370,6 +374,98 @@ export type LocalResolution = {
   testCount: number | null;
 };
 
+/** How a task's dependency requirement was satisfied — evidence-based, never assumed just because a field exists. */
+export type TaskCompletionKind = "resolved_clarification" | "direct_implementation";
+
+/** One real, controlled check the orchestrator ran (never claimed without having actually run it). */
+export type VerificationCheck = { ran: boolean; command: string; result: string; at: string } | null;
+export type Verification = { typecheck: VerificationCheck; lint: VerificationCheck; tests: VerificationCheck; build: VerificationCheck };
+
+/**
+ * Validated evidence that a task's real deliverable exists and was checked, beyond the model's own reply —
+ * this, never a bare `LocalResolution`, is what other tasks' dependencies are allowed to consult (see
+ * lib/engine/dependency.ts). `kind: "resolved_clarification"` requires `sourceRunId` to point at a run that
+ * itself carries a matching `LocalResolution` (the raw, narrower fact); `kind: "direct_implementation"`
+ * covers work implemented directly by the orchestrator outside any hand-off, with no source run at all.
+ */
+export type TaskCompletion = {
+  id: string;
+  demandId: string;
+  parentRunId: string;
+  taskId: string;
+  kind: TaskCompletionKind;
+  sourceRunId: string | null;
+  commit: string;
+  files: string[];
+  verification: Verification;
+  note: string;
+  validatedBy: "orchestrator";
+  validatedAt: string;
+  createdAt: string;
+};
+
+/** What the executor lets this QA run do (enforced by client flags, not by the prompt) — read-only, like the Architect. */
+export type QATool = { label: string; allowed: boolean; how: string };
+
+/** One task's real, delivered evidence, as QA receives it — never the model's self-report alone. */
+export type QADeliverable = {
+  taskId: string;
+  title: string;
+  assignee: string;
+  /** How this deliverable came to exist — mirrors DependencyEvidence's own distinctions (lib/engine/dependency.ts). */
+  origin: "run_completed" | "resolved_clarification_validated" | "direct_implementation_validated";
+  commit: string | null;
+  files: string[];
+  verification: Verification | null;
+  diffText: string | null;
+  diffTruncated: boolean;
+  note: string;
+};
+
+export type QACriterionVerdict = "approved" | "rejected" | "not_verified";
+export type QACriterionJudgement = {
+  criterion: string;
+  verdict: QACriterionVerdict;
+  /** Required for "rejected": what was done, what was expected, what was observed, and the impact. */
+  rejected?: { steps: string; expected: string; observed: string; impact: string };
+  /** Required for "not_verified": why it could not be checked. */
+  notVerifiedReason?: string;
+  /** Required for "approved": the real evidence that justifies it (a file, a test result, a diff line...). */
+  evidence?: string;
+};
+
+/** The QA's own structured report — self-reported, cross-checked against the real deliverables it was given, never against a live re-run it has no tool to make. */
+export type QAResult = {
+  outcome: "done" | "needs_clarification";
+  summary: string;
+  /** One entry per acceptance criterion of the DEMAND (not of the QA task itself). */
+  criteria: QACriterionJudgement[];
+  questions: PlanQuestion[];
+  not_verified: string[];
+  recommendation: "ready_for_review" | "blocked" | "needs_more_work";
+};
+
+/**
+ * Frozen at "Enviar ao QA" (prepare). QA gets no live tools at all (read_only mode, like the Architect):
+ * everything it can see is pasted as text below — the real commits, diffs, analyses and verification
+ * results already computed by the orchestrator, never a live shell, never write access.
+ */
+export type QASnapshot = {
+  kind: "qa_task";
+  agent: TeamMemberInput;
+  team: Pick<TeamMemberInput, "id" | "name" | "role" | "specialty" | "connection">[];
+  demand: StartRunRequest["demand"];
+  task: HandoffTask;
+  plan: { objective_summary: string; step: PlanStep | null; dependents: { id: string; title: string; assignee: string }[] };
+  /** Architect analyses along the whole dependency chain (not just direct deps), for context. */
+  analyses: (DependencyAnalysis & { taskId: string; title: string })[];
+  /** Real, validated deliverables along the whole dependency chain: commits, files, verification, diffs. */
+  deliverables: QADeliverable[];
+  tools: QATool[];
+  /** Estimated size of the frozen text, and what was left out to keep the context proportional to what's needed. */
+  contextBudget: { estimatedInputTokens: number; omitted: string[] };
+};
+
 export type DirectorSnapshot = {
   kind?: "director_plan";
   director: TeamMemberInput;
@@ -443,6 +539,8 @@ export type RunRecord = {
   analysis: (ArchitectAnalysis & { limitations: string[] }) | null;
   /** Developer implementation (kind developer_task): its own report plus the diff the executor computed. */
   developer: (DeveloperResult & { limitations: string[]; diff: DeveloperDiff | null }) | null;
+  /** QA review (kind qa_task): per-criterion verdicts, cross-checked against real deliverables, never a live re-run. */
+  qa: (QAResult & { limitations: string[] }) | null;
   /** Developer only: the real diff computed even when it was rejected (out-of-scope edit, invalid response). Kept for inspection; never applied to the project. Null on success (the diff then lives in `developer.diff`) or when the run never reached a computed diff. */
   rejectedDiff: DeveloperDiff | null;
   /** Set only when a clarification question was resolved outside the model (see LocalResolution). Null otherwise. */
@@ -454,7 +552,7 @@ export type RunRecord = {
 export type RunDetail = RunRecord & {
   events: RunEvent[];
   /** Exactly what the collaborator received (frozen at run creation). */
-  snapshot: DirectorSnapshot | ArchitectSnapshot | DeveloperSnapshot;
+  snapshot: DirectorSnapshot | ArchitectSnapshot | DeveloperSnapshot | QASnapshot;
   prompt: { system: string; user: string } | null;
   rawOutput: string | null;
 };
