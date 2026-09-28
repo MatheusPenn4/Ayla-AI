@@ -43,9 +43,9 @@ export type PlannerDeps = {
 export const estimateTokens = (text: string) => Math.ceil(text.length / 3.5);
 
 export class RunFailure extends Error {
-  constructor(public err: RunError) { super(err.message); }
+  constructor(public err: RunError, public rejectedDiff?: DeveloperDiff | null) { super(err.message); }
 }
-const fail = (err: RunError): never => { throw new RunFailure(err); };
+const fail = (err: RunError, rejectedDiff?: DeveloperDiff | null): never => { throw new RunFailure(err, rejectedDiff); };
 
 function recoveryFor(code: AgentErrorCode | string, conn: ConnectionStatus | null, who: string, timeoutMs = 0): string[] {
   const id = conn?.id ?? "claude_code";
@@ -109,7 +109,8 @@ type Prepared = {
   runId?: string; workDir?: string; hooksDir?: string; gitDeps?: GitDeps; editScope?: EditScopeEntry[]; baseCommit?: string;
 };
 type Outcome = { status: RunStatus; result: object; message: string };
-type ValidateResult = { ok: true; outcome: Outcome } | { ok: false; errors: string[] };
+/** Developer only: `diff` on the failure branch carries the real diff even when it was rejected, so it can be kept for inspection. */
+type ValidateResult = { ok: true; outcome: Outcome } | { ok: false; errors: string[]; diff?: DeveloperDiff };
 type Spec = {
   who: string;
   schema: Record<string, unknown>;
@@ -237,9 +238,9 @@ function developerSpec(deps: PlannerDeps): Spec {
       const outOfScope = touched.filter(t => !editable.has(t));
       const files = d.files.map(f => ({ ...f, inScope: !outOfScope.includes(f.path) }));
       await deps.store.event(p.runId!, "diff", `Diff real da cópia isolada: ${files.length} arquivo(s) tocado(s) (${files.filter(f => f.status === "added").length} criado(s), ${files.filter(f => f.status === "modified").length} alterado(s), ${files.filter(f => f.status === "deleted").length} removido(s))${outOfScope.length ? `; FORA DO ESCOPO APROVADO: ${outOfScope.join(", ")}` : "; todos dentro do escopo aprovado"}.`, { files, diffTruncated: d.diffTruncated });
-      const v = validateDeveloperResult(output, touched, outOfScope);
-      if (!v.ok) return v;
       const diff: DeveloperDiff = { baseCommit: p.baseCommit!, files, diffText: d.diffText, diffTruncated: d.diffTruncated, outOfScope };
+      const v = validateDeveloperResult(output, touched, outOfScope);
+      if (!v.ok) return { ok: false, errors: v.errors, diff };
       const status = v.result.outcome === "needs_clarification" ? "awaiting_clarification" : "implementation_ready";
       return { ok: true, outcome: { status, result: { ...v.result, diff, limitations: developerLimitations(diff, budget) }, message: status === "implementation_ready" ? `Implementação pronta na cópia isolada: ${files.length} arquivo(s) tocado(s). Nada foi aplicado ao projeto original.` : `O Desenvolvedor precisa de esclarecimento: ${v.result.questions.length} pergunta(s).` } };
     },
@@ -263,6 +264,10 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
     budget.exceeded = budget.sheetTokens > 0 && (budget.reportedTotalTokens ?? 0) > budget.sheetTokens;
   };
   const workDir = path.join(deps.workRoot, runId);
+  // Always a sibling of workDir, never inside it: for the Developer, workDir IS the isolated copy that gets
+  // diffed afterwards, and a file the executor writes there (system prompt, output schema) would otherwise be
+  // mistaken for an out-of-scope edit (see lib/executor/adapters/claude.ts and worktree.ts).
+  const scratchDir = path.join(deps.workRoot, `${runId}.prompt`);
   const lease = setInterval(() => { void store.renewLease(runId, deps.limits.leaseMs); }, Math.max(1000, Math.floor(deps.limits.leaseMs / 3)));
   let conn: ConnectionStatus | null = null;
 
@@ -285,6 +290,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
 
     // 3. Call through the official client, validate, at most one correction.
     mkdirSync(workDir, { recursive: true });
+    mkdirSync(scratchDir, { recursive: true });
     let prompt = prepared.user;
     for (let attempt = 1; attempt <= 2; attempt++) {
       if (deps.signal?.aborted) return;
@@ -300,7 +306,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
         };
         const label = attempt === 1 ? (run.kind === "architect_task" ? "análise" : run.kind === "developer_task" ? "implementação" : "planejamento") : "correção";
         const mode = run.kind === "developer_task" ? "developer_write" : "read_only";
-        reply = await adapter.call({ label, system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, onProgress, mode });
+        reply = await adapter.call({ label, system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, scratchDir, onProgress, mode });
       } catch (err) {
         if (err instanceof AgentError) {
           record((err as AgentError & { usage?: CallUsage | null }).usage ?? null);
@@ -325,7 +331,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
         return;
       }
       await store.event(runId, "invalid_response", `Resposta inválida (${v.errors.length} problema(s)).`, { errors: v.errors });
-      if (attempt === 2) fail({ code: "invalid_response", message: "O modelo não produziu uma resposta válida após uma tentativa de correção.", detail: v.errors.join(" | "), retryable: true, recovery: ["Tente novamente. Se repetir, simplifique a demanda ou revise a ficha."] });
+      if (attempt === 2) fail({ code: "invalid_response", message: "O modelo não produziu uma resposta válida após uma tentativa de correção.", detail: v.errors.join(" | "), retryable: true, recovery: ["Tente novamente. Se repetir, simplifique a demanda ou revise a ficha."] }, v.diff ?? null);
       prompt = `${prepared.user}\n\n<resposta_anterior_invalida>\n${reply.text.slice(0, 20000)}\n</resposta_anterior_invalida>\nA resposta anterior não passou na validação do Setor IA:\n- ${v.errors.join("\n- ")}\nEnvie a resposta completa corrigida no mesmo formato. Não invente informações para preencher campos.`;
       const next = estimateTokens(prepared.system + prompt);
       if (spec.blockOverBudget && budget.sheetTokens > 0 && (budget.reportedTotalTokens ?? 0) + next >= budget.sheetTokens) {
@@ -336,12 +342,16 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
   } catch (err) {
     const e: RunError = err instanceof RunFailure ? err.err
       : { code: "internal", message: "Falha interna do executor.", retryable: true, detail: (err as Error)?.message, recovery: ["Tente novamente. Se repetir, veja o terminal do executor."] };
+    const rejectedDiff = err instanceof RunFailure ? (err.rejectedDiff ?? null) : null;
     const current = await store.get(runId);
     if (current?.status === "canceled") return;
-    await store.update(runId, { status: "failed", error: e, finishedAt: new Date().toISOString(), leaseUntil: null, budget }, ["planning"]);
+    // The rejected diff (if any) is kept even though the copy it came from is destroyed right after this:
+    // it is the only way to inspect what the model actually wrote when the run is rejected, not applied anywhere.
+    await store.update(runId, { status: "failed", error: e, rejectedDiff, finishedAt: new Date().toISOString(), leaseUntil: null, budget }, ["planning"]);
     await store.event(runId, "failed", e.message, e.detail ? { detail: e.detail } : undefined);
   } finally {
     clearInterval(lease);
     destroyWorktree(workDir);
+    destroyWorktree(scratchDir);
   }
 }

@@ -9,15 +9,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { refPath, validateAnalysis } from "@/lib/engine/analysis-schema";
 import { handoffBlocker, taskState } from "@/lib/engine/handoff-state";
 import { reportedTotal, type ArchitectAnalysis, type ArchitectSnapshot, type DirectorPlan, type RunDetail } from "@/lib/engine/types";
-import { claudeArgs, claudeUsage } from "@/lib/executor/adapters/claude";
-import { codexArgs, parseCodexEvents } from "@/lib/executor/adapters/codex";
+import { claudeArgs, claudeUsage, claudeAdapter } from "@/lib/executor/adapters/claude";
+import { codexArgs, parseCodexEvents, codexAdapter } from "@/lib/executor/adapters/codex";
 import { AgentError, type AgentCall } from "@/lib/executor/adapters/types";
 import { expandTerms, extractPathMentions, scorePath, shrinkGithubText, termGroups } from "@/lib/executor/github";
 import { buildNewRun, parseStartRequest } from "@/lib/executor/runs-service";
 import { ExecutorService, type ExecutorConfig } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
 import { RunStore } from "@/lib/executor/store";
-import { runProcess } from "@/lib/executor/proc";
+import { runProcess, type Runner } from "@/lib/executor/proc";
+import { redactSecrets } from "@/lib/executor/worktree";
 import { excerptFile } from "@/lib/executor/github";
 import { questionSimilarity } from "@/lib/engine/analysis-schema";
 import { promptComposition } from "@/lib/engine/composition";
@@ -923,6 +924,53 @@ describe("Desenvolvedor: comandos e caminhos permitidos (verificação real dos 
   });
 });
 
+describe("Adaptadores: o arquivo de apoio do cliente (prompt de sistema / schema) nunca vai para dentro de workDir quando há scratchDir", () => {
+  const inv = { command: "cliente-fake", prefix: [], source: "cliente-fake" };
+  const okRunner: Runner = async () => ({
+    code: 0, stdout: JSON.stringify({ type: "result", is_error: false, structured_output: { ok: true }, result: JSON.stringify({ ok: true }) }),
+    stderr: "", timedOut: false, aborted: false, truncated: false, spawnError: null,
+  });
+  // Bug corrigido: antes, claude.ts/codex.ts escreviam o arquivo de apoio direto em c.workDir — inofensivo para
+  // o Arquiteto (workDir nunca é diffado), mas para o Desenvolvedor esse MESMO workDir é a cópia isolada que
+  // diffWorktree() depois compara com o commit base, então o arquivo aparecia como uma edição fora do escopo
+  // em toda chamada, independente do que o modelo fizesse (caso real: task-3, execução 352a1344, 28/09/2026).
+  it("claude: com scratchDir definido, system-prompt.txt vai só para scratchDir", async () => {
+    const workDir = path.join(work, "copia-isolada"); mkdirSync(workDir);
+    const scratchDir = path.join(work, "copia-isolada.prompt"); mkdirSync(scratchDir);
+    await claudeAdapter(inv, okRunner).call({ label: "x", system: "PROMPT-DE-SISTEMA", user: "u", schema: {}, model: "", effort: "", timeoutMs: 1000, workDir, scratchDir, mode: "developer_write" });
+    expect(existsSync(path.join(workDir, "system-prompt.txt"))).toBe(false);
+    expect(readFileSync(path.join(scratchDir, "system-prompt.txt"), "utf8")).toBe("PROMPT-DE-SISTEMA");
+  });
+  it("claude: sem scratchDir (Arquiteto), cai de volta em workDir — comportamento antigo preservado", async () => {
+    const workDir = path.join(work, "pasta-vazia"); mkdirSync(workDir);
+    await claudeAdapter(inv, okRunner).call({ label: "x", system: "PROMPT", user: "u", schema: {}, model: "", effort: "", timeoutMs: 1000, workDir });
+    expect(readFileSync(path.join(workDir, "system-prompt.txt"), "utf8")).toBe("PROMPT");
+  });
+  it("codex: com scratchDir definido, output-schema.json vai só para scratchDir", async () => {
+    const workDir = path.join(work, "copia-isolada-codex"); mkdirSync(workDir);
+    const scratchDir = path.join(work, "copia-isolada-codex.prompt"); mkdirSync(scratchDir);
+    const codexRunner: Runner = async () => ({ code: 0, stdout: "", stderr: "", timedOut: false, aborted: false, truncated: false, spawnError: null });
+    await codexAdapter(inv, codexRunner).call({ label: "x", system: "s", user: "u", schema: { type: "object" }, model: "", effort: "", timeoutMs: 1000, workDir, scratchDir }).catch(() => {}); // empty stdout fails parsing; only the file placement is under test
+    expect(existsSync(path.join(workDir, "output-schema.json"))).toBe(false);
+    expect(JSON.parse(readFileSync(path.join(scratchDir, "output-schema.json"), "utf8"))).toEqual({ type: "object" });
+  });
+});
+
+describe("redactSecrets: o diff nunca guarda um segredo reconhecível, mas não mutila código comum", () => {
+  it("apaga padrões reconhecíveis de credencial", () => {
+    expect(redactSecrets('const k = "AKIAABCDEFGHIJ12345K";')).not.toContain("AKIAABCDEFGHIJ12345K");
+    expect(redactSecrets("const k = 'sk-ant-" + "b".repeat(30) + "';")).not.toContain("b".repeat(30));
+    expect(redactSecrets("const t = 'ghp_" + "c".repeat(30) + "';")).not.toContain("c".repeat(30));
+    expect(redactSecrets("Authorization: Bearer abcdef0123456789ghij")).not.toContain("abcdef0123456789ghij");
+    expect(redactSecrets('API_KEY = "abcdefghij123456"')).toBe('API_KEY = "[REDACTED]"');
+    expect(redactSecrets("-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----")).not.toContain("Zm9v");
+  });
+  it("não mexe em código comum sem nada que pareça credencial", () => {
+    const code = "export function soma(a: number, b: number) { return a + b; }\nconst token = 1;\n";
+    expect(redactSecrets(code)).toBe(code);
+  });
+});
+
 describe("Desenvolvedor: preparar o envio (nada é construído ou chamado)", () => {
   it("recusa quando as dependências (Arquiteto) não estão concluídas", async () => {
     const { svc } = service([reply(analysis())]);
@@ -992,15 +1040,19 @@ describe("Desenvolvedor: aprovação, execução real (materializada) e diff", (
   it("execução real (Claude Code simulado, escrita de verdade na cópia isolada): materializa, valida e calcula o diff — nada toca o repositório de origem", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await localChainWithAnalyses(repo, store);
-    let seenWorkDir = "";
+    let seenWorkDir = "", seenScratchDir = "";
     const { svc, calls } = service(
       [async (c: AgentCall) => {
-        seenWorkDir = c.workDir;
+        seenWorkDir = c.workDir; seenScratchDir = c.scratchDir!;
         expect(c.mode).toBe("developer_write");
         // Simulates the model's Edit/Write tool: real writes, confined by the real client's own flags (not by this test).
         expect(existsSync(path.join(c.workDir, "src", "botao.tsx"))).toBe(true);
         expect(existsSync(path.join(c.workDir, ".git"))).toBe(true); // the throwaway diff-base repo, not the real project's
         expect(existsSync(path.join(c.workDir, "node_modules"))).toBe(false);
+        // Regression check for the real task-3 failure (28/09/2026): the planner must hand the Developer a
+        // scratchDir separate from the isolated copy, so the client's own support files never pollute the diff.
+        expect(c.scratchDir).toBeTruthy();
+        expect(c.scratchDir).not.toBe(c.workDir);
         writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const toMarkdown = () => \"\";\n");
         writeFileSync(path.join(c.workDir, "src", "botao.tsx"), "export const Botao = () => null // usa o serializador\n");
         return reply(devResult());
@@ -1010,7 +1062,7 @@ describe("Desenvolvedor: aprovação, execução real (materializada) e diff", (
     const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
     await svc.approve(run.id, { snapshotHash: run.snapshotHash });
     await svc.idle();
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(1); // one call: no false out-of-scope violation, no wasted correction attempt
     const done = (await store.detail(run.id))!;
     expect(done.status).toBe("implementation_ready");
     const dev = done.developer!;
@@ -1018,28 +1070,33 @@ describe("Desenvolvedor: aprovação, execução real (materializada) e diff", (
     const byPath = Object.fromEntries(dev.diff!.files.map(f => [f.path, f]));
     expect(byPath["src/serializador.ts"]).toMatchObject({ status: "added", inScope: true });
     expect(byPath["src/botao.tsx"]).toMatchObject({ status: "modified", inScope: true });
+    expect(dev.diff!.files.map(f => f.path)).not.toContain("system-prompt.txt"); // the regression itself
     expect(dev.changes.map(c => c.path).sort()).toEqual(["src/botao.tsx", "src/serializador.ts"]);
     expect(dev.limitations.join(" ")).toContain("Nenhum comando foi executado");
-    // Isolation, proven for real: the isolated copy is gone, and the SOURCE repo was never touched.
+    // Isolation, proven for real: the isolated copy AND the scratch dir are gone, and the SOURCE repo was never touched.
     expect(existsSync(seenWorkDir)).toBe(false);
+    expect(existsSync(seenScratchDir)).toBe(false);
     expect(repo.status()).toBe("");
     expect(existsSync(path.join(repo.dir, "src", "serializador.ts"))).toBe(false);
   });
 
-  it("pedido adversarial: escreve fora do escopo aprovado dentro da própria cópia — reprovado pelo diff real, não pelo que o modelo relata", async () => {
+  it("pedido adversarial: escreve fora do escopo aprovado dentro da própria cópia — reprovado pelo diff real, não pelo que o modelo relata; o diff rejeitado fica gravado (com segredos tratados) e a cópia é destruída mesmo assim", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await localChainWithAnalyses(repo, store);
+    const SECRET = "sk-ant-" + "a".repeat(32);
+    let seenWorkDir = "";
     const { svc, calls } = service(
       [
         async (c: AgentCall) => {
+          seenWorkDir = c.workDir;
           writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const x = 1;\n");
-          // Out of scope: package.json is not in editScope for this task at all.
-          writeFileSync(path.join(c.workDir, "package.json"), '{"name":"x","tampered":true}');
+          // Out of scope: package.json is not in editScope for this task at all — and it leaks something secret-shaped.
+          writeFileSync(path.join(c.workDir, "package.json"), `{"name":"x","tampered":true,"leak":"${SECRET}"}`);
           return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "ok" }] }));
         },
         async (c: AgentCall) => {
-          // Second attempt (correction): still out of scope — must fail for good, not be silently accepted.
-          writeFileSync(path.join(c.workDir, "package.json"), '{"name":"x","tampered":"again"}');
+          // Second attempt (correction): still out of scope (and still leaking) — must fail for good, not be silently accepted.
+          writeFileSync(path.join(c.workDir, "package.json"), `{"name":"x","tampered":"again","leak":"${SECRET}"}`);
           return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "ok" }] }));
         },
       ],
@@ -1048,11 +1105,22 @@ describe("Desenvolvedor: aprovação, execução real (materializada) e diff", (
     const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
     await svc.approve(run.id, { snapshotHash: run.snapshotHash });
     await svc.idle();
-    expect(calls).toHaveLength(2); // one retry, per the standard correction policy
+    expect(calls).toHaveLength(2); // one retry, per the standard correction policy — a genuine model violation, unlike the fixed false positive above
     const done = (await store.get(run.id))!;
     expect(done.status).toBe("failed"); // never "implementation_ready" for an out-of-scope diff
     const events = (await store.detail(run.id))!.events;
     expect(events.some(e => e.kind === "diff" && e.message.includes("FORA DO ESCOPO") && e.message.includes("package.json"))).toBe(true);
+    // The real, rejected diff is kept for inspection — never turned into an exception, never applied anywhere.
+    const rd = done.rejectedDiff!;
+    expect(rd.baseCommit).toBe(repo.base);
+    expect(rd.outOfScope).toEqual(["package.json"]);
+    expect(rd.files.some(f => f.path === "package.json" && !f.inScope)).toBe(true);
+    expect(rd.files.some(f => f.path === "src/serializador.ts" && f.inScope)).toBe(true);
+    expect(rd.diffText).not.toContain(SECRET);
+    expect(rd.diffText).toContain("[REDACTED]");
+    expect(done.developer).toBeNull(); // rejected, not a developer result
+    // Isolation still holds even on failure: the copy is destroyed, the source repo untouched.
+    expect(existsSync(seenWorkDir)).toBe(false);
     expect(repo.status()).toBe("");
   });
 

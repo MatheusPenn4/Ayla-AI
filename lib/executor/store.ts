@@ -1,7 +1,7 @@
 // Durable run storage behind a tiny SQL driver interface.
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
-import type { RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext } from "@/lib/engine/types";
+import type { DeveloperDiff, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -31,6 +31,7 @@ const SCHEMA = [
     prompt_json TEXT,
     context_json TEXT,
     result_json TEXT,
+    rejected_diff_json TEXT,
     error_json TEXT,
     budget_json TEXT NOT NULL,
     raw_output TEXT,
@@ -59,14 +60,15 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS ayla_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links. */
-export const SCHEMA_VERSION = 2;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection. */
+export const SCHEMA_VERSION = 3;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
   ["kind", "TEXT NOT NULL DEFAULT 'director_plan'"],
   ["parent_run_id", "TEXT"],
   ["task_id", "TEXT"],
+  ["rejected_diff_json", "TEXT"],
 ];
 
 const INDEXES = [
@@ -96,6 +98,7 @@ function toRecord(r: Row): RunRecord {
     result: kind === "director_plan" ? parse<RunRecord["result"]>(r.result_json) : null,
     analysis: kind === "architect_task" ? parse<RunRecord["analysis"]>(r.result_json) : null,
     developer: kind === "developer_task" ? parse<RunRecord["developer"]>(r.result_json) : null,
+    rejectedDiff: kind === "developer_task" ? parse<DeveloperDiff>(r.rejected_diff_json) : null,
     error: parse<RunError>(r.error_json),
     previousRunId: (r.previous_run_id as string) ?? null,
   };
@@ -116,6 +119,8 @@ export type NewRun = {
 export type RunPatch = Partial<{
   status: RunStatus; startedAt: string | null; finishedAt: string | null; leaseUntil: string | null; attempt: number;
   prompt: RunDetail["prompt"]; context: SourceContext | null; result: RunRecord["result"] | RunRecord["analysis"] | RunRecord["developer"]; error: RunError | null; budget: RunBudget; rawOutput: string | null;
+  /** Developer only: the real diff kept when the run failed after one was computed. */
+  rejectedDiff: DeveloperDiff | null;
 }>;
 
 const COLUMN: Record<keyof RunPatch, [string, (v: unknown) => unknown]> = {
@@ -123,6 +128,7 @@ const COLUMN: Record<keyof RunPatch, [string, (v: unknown) => unknown]> = {
   attempt: ["attempt", v => v], prompt: ["prompt_json", v => (v == null ? null : JSON.stringify(v))], context: ["context_json", v => (v == null ? null : JSON.stringify(v))],
   result: ["result_json", v => (v == null ? null : JSON.stringify(v))], error: ["error_json", v => (v == null ? null : JSON.stringify(v))],
   budget: ["budget_json", v => JSON.stringify(v)], rawOutput: ["raw_output", v => v],
+  rejectedDiff: ["rejected_diff_json", v => (v == null ? null : JSON.stringify(v))],
 };
 
 export class RunStore {

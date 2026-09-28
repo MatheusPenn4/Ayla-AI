@@ -4,11 +4,10 @@
 // - read-only sandbox in an empty folder, shell and extra tools disabled,
 //   web search off, user config ignored, session not persisted;
 // - the whole prompt goes through stdin ("-"), the schema as a file.
-import { writeFileSync } from "node:fs";
-import path from "node:path";
 import type { CallUsage } from "@/lib/engine/types";
 import type { Invocation } from "../clients";
 import { clientEnv, type Runner, type EnvVars } from "../proc";
+import { writeScratchFile } from "../worktree";
 import { AgentError, ERROR_MESSAGE, classifyClientError, type AgentAdapter, type AgentCall, type AgentReply } from "./types";
 
 const MODEL_RE = /^[A-Za-z0-9._-]{1,80}$/;
@@ -82,8 +81,8 @@ export function codexAdapter(inv: Invocation, runner: Runner, env: EnvVars = pro
   return {
     id: "codex",
     async call(c: AgentCall): Promise<AgentReply> {
-      const schemaFile = path.join(c.workDir, "output-schema.json");
-      writeFileSync(schemaFile, JSON.stringify(c.schema), "utf8");
+      // Written to scratchDir, never to workDir — see the comment in claude.ts's own call().
+      const schemaFile = writeScratchFile(c.scratchDir ?? c.workDir, "output-schema.json", JSON.stringify(c.schema));
       const args = [...inv.prefix, ...codexArgs(c, schemaFile)];
       const onStdoutLine = (line: string) => {
         if (!c.onProgress || !line.trim().startsWith("{")) return;

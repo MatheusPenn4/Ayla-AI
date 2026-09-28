@@ -5,11 +5,10 @@
 //   customizations (--safe-mode, --setting-sources ""), no session saved;
 // - the system prompt is passed as a file, the demand through stdin;
 // - never --bare: bare mode ignores the subscription login.
-import { writeFileSync } from "node:fs";
-import path from "node:path";
 import type { CallUsage } from "@/lib/engine/types";
 import type { Invocation } from "../clients";
 import { clientEnv, type Runner, type EnvVars } from "../proc";
+import { writeScratchFile } from "../worktree";
 import { AgentError, ERROR_MESSAGE, classifyClientError, type AgentAdapter, type AgentCall, type AgentReply } from "./types";
 
 type ClaudeIteration = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
@@ -156,8 +155,9 @@ export function claudeAdapter(inv: Invocation, runner: Runner, env: EnvVars = pr
   return {
     id: "claude_code",
     async call(c: AgentCall): Promise<AgentReply> {
-      const systemFile = path.join(c.workDir, "system-prompt.txt");
-      writeFileSync(systemFile, c.system, "utf8");
+      // Written to scratchDir, never to workDir: for "developer_write", workDir IS the isolated copy that
+      // gets diffed afterwards, and a file the executor itself wrote there would look like an out-of-scope edit.
+      const systemFile = writeScratchFile(c.scratchDir ?? c.workDir, "system-prompt.txt", c.system);
       const tracker = claudeStreamTracker(c.label, c.onProgress);
       const res = await runner({ command: inv.command, args: [...inv.prefix, ...claudeArgs(c, systemFile)], cwd: c.workDir, stdin: c.user, env: clientEnv(env), timeoutMs: c.timeoutMs, signal: c.signal, onStdoutLine: tracker.onLine });
       if (res.spawnError) throw new AgentError("not_installed", ERROR_MESSAGE.not_installed, false, res.spawnError);

@@ -16,6 +16,12 @@ export type AgentCall = {
   signal?: AbortSignal;
   /** Working directory owned by this call: empty for "read_only", the Developer's isolated copy for "developer_write". */
   workDir: string;
+  /**
+   * Where the adapter's own supporting files (system prompt, output schema) are written. Defaults to `workDir`
+   * when absent. Must be set to a directory OUTSIDE `workDir` whenever `workDir` is itself diffed afterwards
+   * (the Developer's isolated copy) — otherwise the adapter's own file is mistaken for an out-of-scope edit.
+   */
+  scratchDir?: string;
   /** Progress reported by the client while it runs (streaming clients only). */
   onProgress?: (p: AgentProgress) => void;
   /**

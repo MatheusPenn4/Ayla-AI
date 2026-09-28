@@ -425,6 +425,8 @@ export type RunRecord = {
   analysis: (ArchitectAnalysis & { limitations: string[] }) | null;
   /** Developer implementation (kind developer_task): its own report plus the diff the executor computed. */
   developer: (DeveloperResult & { limitations: string[]; diff: DeveloperDiff | null }) | null;
+  /** Developer only: the real diff computed even when it was rejected (out-of-scope edit, invalid response). Kept for inspection; never applied to the project. Null on success (the diff then lives in `developer.diff`) or when the run never reached a computed diff. */
+  rejectedDiff: DeveloperDiff | null;
   error: RunError | null;
   previousRunId: string | null;
 };

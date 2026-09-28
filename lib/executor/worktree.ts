@@ -90,6 +90,24 @@ export async function materializeCommit(opts: { sourceDir: string; commit: strin
 
 const STATUS: Record<string, DeveloperDiffFile["status"]> = { A: "added", M: "modified", D: "deleted" };
 
+// Defense in depth: the diff comes from a git-archived commit (never .env/.dev.vars/node_modules) plus the
+// model's own edits, so a real credential should not normally appear — but the diff is kept even when the
+// run is rejected, so anything that looks like one is redacted before it is ever persisted or shown.
+const SECRET_PATTERNS: RegExp[] = [
+  /-----BEGIN[ A-Z]*PRIVATE KEY-----[\s\S]*?-----END[ A-Z]*PRIVATE KEY-----/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+  /\bBearer\s+[A-Za-z0-9._-]{10,}/g,
+];
+// "API_KEY = \"...\"" style assignments: keep the name and quotes, redact only the value.
+const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*\s*[:=]\s*)(['"]?)([^\s'"]{6,})\2/gi;
+export function redactSecrets(text: string): string {
+  let out = SECRET_PATTERNS.reduce((t, re) => t.replace(re, "[REDACTED]"), text);
+  out = out.replace(ASSIGNMENT_PATTERN, "$1$2[REDACTED]$2");
+  return out;
+}
+
 /** Stages everything and diffs against the base commit made by materializeCommit. Read-only from the model's edits. */
 export async function diffWorktree(m: Pick<Materialized, "workDir" | "hooksDir">, deps: GitDeps): Promise<{ files: DeveloperDiffFile[]; diffText: string; diffTruncated: boolean }> {
   const g = resolveGit(deps);
@@ -125,7 +143,7 @@ export async function diffWorktree(m: Pick<Materialized, "workDir" | "hooksDir">
     }
   }
   const diff = await git(deps, g, m.workDir, m.hooksDir, ["diff", "--cached"], { maxStdoutBytes: 6_000_000 });
-  const raw = diff.code === 0 ? diff.stdout : "";
+  const raw = redactSecrets(diff.code === 0 ? diff.stdout : "");
   const diffTruncated = raw.length > MAX_DIFF_CHARS;
   return { files, diffText: diffTruncated ? `${raw.slice(0, MAX_DIFF_CHARS)}\n[… diff cortado em ${MAX_DIFF_CHARS} caracteres]` : raw, diffTruncated };
 }

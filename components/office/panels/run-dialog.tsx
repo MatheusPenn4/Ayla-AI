@@ -508,7 +508,7 @@ function DeveloperBody({ run, active, agents, onCancel, onOpenRun, onReview }: B
       <Tabs.Root value={tab} onValueChange={setTab} className="run-tabs">
         <Tabs.List className="tab-list" aria-label="Detalhes da implementação">
           <Tabs.Trigger value="implementation">Implementação</Tabs.Trigger>
-          <Tabs.Trigger value="diff">Diff {d?.diff?.files.length ? `(${d.diff.files.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="diff">Diff {d?.diff?.files.length ? `(${d.diff.files.length})` : run.rejectedDiff?.files.length ? `(${run.rejectedDiff.files.length} rejeitado)` : ""}</Tabs.Trigger>
           <Tabs.Trigger value="questions">Dúvidas {d?.questions.length ? `(${d.questions.length})` : ""}</Tabs.Trigger>
           <Tabs.Trigger value="task">Tarefa</Tabs.Trigger>
           <Tabs.Trigger value="events">Eventos</Tabs.Trigger>
@@ -540,12 +540,20 @@ function DeveloperBody({ run, active, agents, onCancel, onOpenRun, onReview }: B
           </Tabs.Content>
 
           <Tabs.Content value="diff" className="run-pane">
-            {!d?.diff && <p className="muted">Nenhum diff calculado ainda.</p>}
+            {!d?.diff && !run.rejectedDiff && <p className="muted">Nenhum diff calculado ainda.</p>}
             {d?.diff && (
               <>
                 <p className="pane-intro">Calculado pelo executor (git diff dentro da cópia isolada), independente do que o modelo relatou. Commit de base: <code>{d.diff.baseCommit.slice(0, 12)}</code>.</p>
                 <DiffTable files={d.diff.files} />
                 <details className="raw"><summary>Ver o diff completo{d.diff.diffTruncated ? " (cortado por tamanho)" : ""}</summary><pre className="brief">{d.diff.diffText || "(vazio)"}</pre></details>
+              </>
+            )}
+            {!d?.diff && run.rejectedDiff && (
+              <>
+                <div className="run-error" role="alert"><AlertTriangle size={16} /><div><b>Diff rejeitado — nunca aplicado a lugar nenhum.</b><small>{run.rejectedDiff.outOfScope.length ? `Fora do escopo aprovado: ${run.rejectedDiff.outOfScope.join(", ")}` : "A execução falhou antes de produzir um resultado válido."}</small></div></div>
+                <p className="pane-intro">Calculado pelo executor (git diff dentro da cópia isolada) antes da falha, independente do que o modelo relatou. Commit de base: <code>{run.rejectedDiff.baseCommit.slice(0, 12)}</code>. A cópia isolada já foi destruída; isto é só o registro do diff.</p>
+                <DiffTable files={run.rejectedDiff.files} />
+                <details className="raw"><summary>Ver o diff completo{run.rejectedDiff.diffTruncated ? " (cortado por tamanho)" : ""}</summary><pre className="brief">{run.rejectedDiff.diffText || "(vazio)"}</pre></details>
               </>
             )}
           </Tabs.Content>
