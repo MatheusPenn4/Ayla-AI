@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import { ClipboardList, Download, Gauge, Home as HomeIcon, LayoutGrid, Menu, Minus, Plus, RotateCcw, RotateCw, Send, Users, UsersRound, X } from "lucide-react";
+import { ClipboardList, Download, Gauge, Home as HomeIcon, LayoutGrid, Menu, Minus, Plug, Plus, RotateCcw, RotateCw, Send, Users, UsersRound, X } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import type { SceneControls } from "@/components/office/office-scene";
 import { AgentSheet } from "@/components/office/panels/agent-sheet";
@@ -11,6 +11,8 @@ import { HireDialog } from "@/components/office/panels/hire-dialog";
 import { CharacterCard, Roster } from "@/components/office/panels/roster";
 import { DeveloperHandoffDialog } from "@/components/office/panels/developer-handoff-dialog";
 import { QAHandoffDialog } from "@/components/office/panels/qa-handoff-dialog";
+import { ReviewerHandoffDialog } from "@/components/office/panels/reviewer-handoff-dialog";
+import { ConnectionsScreen } from "@/components/office/panels/connections-screen";
 import { HandoffDialog } from "@/components/office/panels/handoff-dialog";
 import { RunDialog } from "@/components/office/panels/run-dialog";
 import { DemandQueue, TeamScreen } from "@/components/office/panels/screens";
@@ -31,7 +33,7 @@ const OfficeScene = dynamic(() => import("@/components/office/office-scene"), {
   loading: () => <div className="scene-loading"><span className="loader-mark" aria-hidden /> Montando o escritório…</div>,
 });
 
-type Screen = "office" | "team" | "demands";
+type Screen = "office" | "team" | "demands" | "settings";
 const JUMPS: ZoneId[] = ["director", "dev", "qa", "meeting"];
 
 function useViewport() {
@@ -54,6 +56,7 @@ export default function Home() {
   const [handoffId, setHandoffId] = useState<string | null>(null);
   const [devHandoffId, setDevHandoffId] = useState<string | null>(null);
   const [qaHandoffId, setQAHandoffId] = useState<string | null>(null);
+  const [reviewerHandoffId, setReviewerHandoffId] = useState<string | null>(null);
   const vw = useViewport();
   const [screen, setScreen] = useState<Screen>("office");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -98,7 +101,10 @@ export default function Home() {
   const openReview = (id: string) => {
     setRunId(null);
     const kind = runs.runs.find(r => r.id === id)?.kind;
-    if (kind === "developer_task") setDevHandoffId(id); else if (kind === "qa_task") setQAHandoffId(id); else setHandoffId(id);
+    if (kind === "developer_task") setDevHandoffId(id);
+    else if (kind === "qa_task") setQAHandoffId(id);
+    else if (kind === "reviewer_task") setReviewerHandoffId(id);
+    else setHandoffId(id);
   };
   const handoff = async (planRunId: string, taskId: string, followUp?: HandoffFollowUp) => {
     const r = await runs.prepareHandoff(planRunId, taskId, agents, followUp);
@@ -114,6 +120,11 @@ export default function Home() {
   const handoffQA = async (planRunId: string, taskId: string) => {
     const r = await runs.prepareQAHandoff(planRunId, taskId, agents);
     if (r.ok) { setRunId(null); setQAHandoffId(r.run.id); }
+    else toast.error(r.error, { duration: 9000 });
+  };
+  const handoffReviewer = async (planRunId: string, taskId: string) => {
+    const r = await runs.prepareReviewerHandoff(planRunId, taskId, agents);
+    if (r.ok) { setRunId(null); setReviewerHandoffId(r.run.id); }
     else toast.error(r.error, { duration: 9000 });
   };
   const replan = async (run: RunDetail, answers?: { question: string; answer: string }[]) => {
@@ -154,7 +165,7 @@ export default function Home() {
     downloadTextFile("setor-ia-configuracoes.json", JSON.stringify({ ...serializeOffice({ agents, demands }), exportedAt: new Date().toISOString() }, null, 2), "application/json");
   };
 
-  const title = screen === "office" ? "Escritório" : screen === "team" ? "Funcionários" : "Fila de demandas";
+  const title = screen === "office" ? "Escritório" : screen === "team" ? "Funcionários" : screen === "settings" ? "Conexões de IA" : "Fila de demandas";
   const overlayOpen = sheetOpen || hire.open || demandOpen;
 
   return (
@@ -171,6 +182,7 @@ export default function Home() {
           <button className={`rail-link ${screen === "office" ? "selected" : ""}`} aria-current={screen === "office" ? "page" : undefined} onClick={() => nav("office")}><LayoutGrid size={17} />Escritório</button>
           <button className={`rail-link ${screen === "team" ? "selected" : ""}`} aria-current={screen === "team" ? "page" : undefined} onClick={() => nav("team")}><Users size={17} />Funcionários<span className="count">{agents.length}/{CAPACITY}</span></button>
           <button className={`rail-link ${screen === "demands" ? "selected" : ""}`} aria-current={screen === "demands" ? "page" : undefined} onClick={() => nav("demands")}><ClipboardList size={17} />Demandas<span className="count">{demands.length}</span></button>
+          <button className={`rail-link ${screen === "settings" ? "selected" : ""}`} aria-current={screen === "settings" ? "page" : undefined} onClick={() => nav("settings")}><Plug size={17} />Conexões de IA</button>
         </nav>
         <div className="rail-section" id="roster">EQUIPE <small>↑ ↓ para navegar</small></div>
         <Roster agents={agents} selectedId={selectedIdLive} demandCounts={demandCounts} onSelect={select} onHover={setHoveredId} />
@@ -248,8 +260,9 @@ export default function Home() {
               />
             )}
           </div>
-          {screen === "team" && <TeamScreen agents={agents} connections={runs.status?.connections} onOpen={(a: Agent) => openSheet(a.id)} onReview={(a: Agent) => openSheet(a.id, "instructions", true)} onHire={() => openHire()} />}
+          {screen === "team" && <TeamScreen agents={agents} status={runs.status ?? undefined} onOpen={(a: Agent) => openSheet(a.id)} onReview={(a: Agent) => openSheet(a.id, "instructions", true)} onHire={() => openHire()} />}
           {screen === "demands" && <DemandQueue demands={demands} agents={agents} runs={runs} onNew={() => openDemand("director")} onRemove={id => { office.removeDemand(id); toast.success("Demanda removida da fila local."); }} onOpenAgent={id => openSheet(id)} onPlan={d => void plan(d)} onOpenRun={setRunId} />}
+          {screen === "settings" && <ConnectionsScreen agents={agents} runs={runs} />}
         </main>
 
         <footer className="stage-footer">
@@ -271,7 +284,7 @@ export default function Home() {
         onClose={() => { setSheetOpen(false); setCompareOnOpen(false); }}
         onSave={draft => { const r = office.saveAgent(draft); if (r.ok) toast.success("Ficha salva neste navegador."); return r.ok ? null : r.error; }}
         onDemand={id => openDemand(id)}
-        engine={{ status: runs.status, statusError: runs.statusError, verify: runs.verify, probe: runs.probe }}
+        engine={{ status: runs.status, statusError: runs.statusError, verify: runs.verify, probe: runs.probe, verifyApiConnection: runs.verifyApiConnection }}
         onRemove={id => { office.removeAgent(id); setSelectedId(null); toast.success("Funcionário dispensado. A estação ficou livre."); }}
       />
       <HireDialog
@@ -306,6 +319,7 @@ export default function Home() {
         onHandoffDeveloper={(planRunId, taskId) => void handoffDeveloper(planRunId, taskId)}
         onReviewDeveloper={id => { setRunId(null); setDevHandoffId(id); }}
         onHandoffQA={(planRunId, taskId) => void handoffQA(planRunId, taskId)}
+        onHandoffReviewer={(planRunId, taskId) => void handoffReviewer(planRunId, taskId)}
         onAnswerArchitect={(run, followUp) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { ...followUp, previousRunId: run.id }); }}
       />
       <HandoffDialog
@@ -319,6 +333,10 @@ export default function Home() {
       <QAHandoffDialog
         runId={qaHandoffId} agents={agents} runs={runs} onClose={() => setQAHandoffId(null)}
         onApproved={id => { setQAHandoffId(null); setRunId(id); toast.success("Envio confirmado. O QA entrou na fila do executor local."); }}
+      />
+      <ReviewerHandoffDialog
+        runId={reviewerHandoffId} agents={agents} runs={runs} onClose={() => setReviewerHandoffId(null)}
+        onApproved={id => { setReviewerHandoffId(null); setRunId(id); toast.success("Envio confirmado. O Revisor entrou na fila do executor local."); }}
       />
       <Toaster position="top-center" offset={78} theme="dark" toastOptions={{ className: "game-toast" }} />
     </div>

@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { createExecutorServer } from "@/lib/executor/http";
 import { runProcess } from "@/lib/executor/proc";
+import { randomMachineKeyB64 } from "@/lib/executor/secret-store";
 import { ExecutorService } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
 import { RunStore, SCHEMA_VERSION } from "@/lib/executor/store";
@@ -47,6 +48,17 @@ if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) {
   createdToken = true;
 }
 
+// Machine key that encrypts API-connection secrets at rest (see lib/executor/secret-store.ts). Same
+// gitignored, mode-0600 file as the executor token above; generated once and kept across restarts.
+let secretKeyB64 = vars.AYLA_SECRET_KEY ?? "";
+if (!/^[A-Za-z0-9+/]{40,50}=*$/.test(secretKeyB64)) {
+  secretKeyB64 = randomMachineKeyB64();
+  const current = existsSync(devVarsPath) ? readFileSync(devVarsPath, "utf8") : "";
+  const kept = current.split(/\r?\n/).filter(l => !/^\s*AYLA_SECRET_KEY\s*=/.test(l)).join("\n").trim();
+  writeFileSync(devVarsPath, `${kept ? kept + "\n" : ""}AYLA_SECRET_KEY=${secretKeyB64}\n`, { encoding: "utf8", mode: 0o600 });
+  console.log("[executor] chave local de criptografia das conexões de API criada em .dev.vars.");
+}
+
 const dataDir = path.join(root, ".ayla");
 const storePath = path.join(dataDir, "runs.sqlite");
 const driver = sqliteDriver(storePath);
@@ -71,6 +83,7 @@ const service = new ExecutorService(
     },
     // Read-only access to local clones must be granted explicitly, one absolute folder per entry (";"-separated).
     localRepos: (vars.AYLA_LOCAL_REPOS ?? "").split(";").map(x => x.trim()).filter(x => path.isAbsolute(x)),
+    secretKeyB64,
     github: {
       token: process.env.GITHUB_TOKEN?.trim() || vars.GITHUB_TOKEN || undefined,
       apiBase: vars.AYLA_GITHUB_API_BASE || undefined,

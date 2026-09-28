@@ -7,7 +7,7 @@ import { Avatar } from "../avatar";
 import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
 import { CAPACITY, WORK_ZONES, zoneCapacity } from "@/lib/office/layout";
 import { buildDemandPayload, formatBytes } from "@/lib/integration/contracts";
-import { CONNECTION_STATE_LABEL, connectionLabel } from "@/lib/engine/connections";
+import { CONNECTION_STATE_LABEL, connectionLabel, connectionStatusFor } from "@/lib/engine/connections";
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type EngineStatus } from "@/lib/engine/types";
 import type { useRuns } from "@/hooks/use-runs";
 import { StatusBadge } from "./run-dialog";
@@ -22,8 +22,8 @@ const when = (iso: string) => {
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString("pt-BR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 };
 
-export function TeamScreen({ agents, connections, onOpen, onReview, onHire }: { agents: Agent[]; connections?: EngineStatus["connections"]; onOpen: (a: Agent) => void; onReview: (a: Agent) => void; onHire: () => void }) {
-  const connected = agents.filter(a => a.connection !== "none" && connections?.[a.connection]?.state === "connected").length;
+export function TeamScreen({ agents, status, onOpen, onReview, onHire }: { agents: Agent[]; status?: Pick<EngineStatus, "connections" | "apiConnections">; onOpen: (a: Agent) => void; onReview: (a: Agent) => void; onHire: () => void }) {
+  const connected = agents.filter(a => connectionStatusFor(a.connection, status)?.state === "connected").length;
   const updates = agents.filter(a => presetUpdate(a));
   const pending = updates.filter(a => !presetUpdate(a)!.dismissed);
   return (
@@ -61,7 +61,7 @@ export function TeamScreen({ agents, connections, onOpen, onReview, onHire }: { 
             <h3>{a.name}</h3>
             <p>{a.description}</p>
             <span className="tile-tools" title="Permissões planejadas">{TOOL_INFO.filter(t => a.tools[t.key]).map(t => <i key={t.key}>{t.label}</i>)}</span>
-            <span className="tile-bottom">{connectionLabel(a.connection)}{a.modelName ? ` · ${a.modelName}` : ""}{a.connection !== "none" && connections?.[a.connection] ? ` · ${CONNECTION_STATE_LABEL[connections[a.connection]!.state].toLowerCase()}` : ""}<ArrowRight size={16} /></span>
+            <span className="tile-bottom">{connectionLabel(a.connection, status?.apiConnections)}{a.modelName ? ` · ${a.modelName}` : ""}{connectionStatusFor(a.connection, status) ? ` · ${CONNECTION_STATE_LABEL[connectionStatusFor(a.connection, status)!.state].toLowerCase()}` : ""}<ArrowRight size={16} /></span>
           </button>
         ))}
       </div>
@@ -71,7 +71,7 @@ export function TeamScreen({ agents, connections, onOpen, onReview, onHire }: { 
 
 function EngineBanner({ runs, director, onOpenDirector }: { runs: RunsApi; director: Agent | undefined; onOpenDirector: () => void }) {
   const st = runs.status;
-  const conn = director && director.connection !== "none" ? st?.connections[director.connection] : undefined;
+  const conn = director ? connectionStatusFor(director.connection, st) : undefined;
   const items: { ok: boolean; label: string; hint?: string; steps?: string[] }[] = st
     ? [
         { ok: st.executor.reachable, label: st.executor.reachable ? `Executor local ativo${st.executor.version ? ` (v${st.executor.version})` : ""}` : "Executor local indisponível", hint: st.executor.reachable ? undefined : st.executor.message ?? st.disabledReason ?? undefined },

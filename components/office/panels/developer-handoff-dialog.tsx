@@ -5,7 +5,7 @@ import { AlertTriangle, CheckCircle2, FileText, Loader2, Lock, RefreshCw, Shield
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { useRuns } from "@/hooks/use-runs";
 import { toTeamInput } from "@/lib/engine/client";
-import { CONNECTION_STATE_LABEL, connectionLabel } from "@/lib/engine/connections";
+import { CONNECTION_STATE_LABEL, connectionLabel, connectionStatusFor } from "@/lib/engine/connections";
 import type { DeveloperSnapshot } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
 import { useRunDetail } from "./run-dialog";
@@ -35,7 +35,7 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
   const [msg, setMsg] = useState<string | null>(null);
   if (!run) return <div className="run-loading">{error ?? <><Loader2 size={16} className="spin" /> Carregando o envio preparado…</>}</div>;
   const snap = run.snapshot as DeveloperSnapshot;
-  const conn = runs.status?.connections[run.connection];
+  const conn = connectionStatusFor(run.connection, runs.status);
   const executorUp = !!runs.status?.executionEnabled;
   const current = agents.find(a => a.id === snap.agent.id);
   const cur = current ? toTeamInput(current, agents) : null;

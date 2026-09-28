@@ -5,15 +5,19 @@
 // run state belongs to the executor.
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { RunBudget, RunDetail, StartRunRequest } from "@/lib/engine/types";
+import type { AgentConnectionRef, RunBudget, RunDetail, StartRunRequest } from "@/lib/engine/types";
 import type { NewRun } from "./store";
 
 const s = (max: number) => z.string().max(max);
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+const connectionZ = z.custom<AgentConnectionRef | "none">(
+  v => v === "none" || v === "claude_code" || v === "codex" || (typeof v === "string" && /^api:[0-9a-f-]{8,64}$/.test(v)),
+  "conexão inválida",
+);
 
 export const MemberZ = z.object({
   id, name: s(40), role: s(50), specialty: s(2000),
-  connection: z.enum(["claude_code", "codex", "none"]),
+  connection: connectionZ,
   modelName: z.string().max(80).regex(/^[A-Za-z0-9._\-[\]]*$/, "nome de modelo com caracteres inválidos"),
   effort: z.string().max(12).regex(/^[a-z]*$/, "nível de esforço inválido"),
   budget: z.number().finite(), handoffTo: z.array(id).max(20), returnTo: z.array(z.string().max(64)).max(20),

@@ -163,7 +163,7 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
         <div className="sheet-id">
           <span className="eyebrow">FICHA DO COLABORADOR · {ZONE_LABEL[draft.zone].toUpperCase()}</span>
           <SheetTitle className="sheet-title">{draft.name || "Sem nome"}</SheetTitle>
-          <SheetDescription className="sheet-sub">{draft.role || "Sem função"} · {connectionLabel(draft.connection)}{draft.modelName ? ` / ${draft.modelName}` : ""}</SheetDescription>
+          <SheetDescription className="sheet-sub">{draft.role || "Sem função"} · {connectionLabel(draft.connection, engine?.status?.apiConnections)}{draft.modelName ? ` / ${draft.modelName}` : ""}</SheetDescription>
         </div>
         <dl className="sheet-stats">
           <div><dt>Permissões planejadas</dt><dd>{plannedTools}/{TOOL_INFO.length}</dd></div>
@@ -210,7 +210,7 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
             </div>
             <ConnectionPanel
               connection={draft.connection} modelName={draft.modelName} effort={draft.effort} legacyProvider={String(draft.model)}
-              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id) ? "starts" : (engine?.status?.handoffTargets ?? ["architect"]).includes(draft.id) ? "handoff" : draft.id === "developer" ? "handoff_write" : "none"}
+              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id) ? "starts" : (engine?.status?.handoffTargets ?? ["architect"]).includes(draft.id) || draft.id === "qa" || draft.id === "reviewer" ? "handoff" : draft.id === "developer" ? "handoff_write" : "none"}
               engine={engine}
               onChange={part => update(part)}
             />

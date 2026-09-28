@@ -2,7 +2,7 @@
 // the executor's records of that task's hand-offs.
 import { HANDOFF_TARGETS, type PlanTask, type RunRecord } from "./types";
 
-export type TaskStateKey = "proposed" | "not_executable" | "awaiting_approval" | "queued" | "working" | "analysis_ready" | "implementation_ready" | "review_ready" | "awaiting_clarification" | "failed" | "canceled";
+export type TaskStateKey = "proposed" | "not_executable" | "awaiting_approval" | "queued" | "working" | "analysis_ready" | "implementation_ready" | "review_ready" | "concluded" | "awaiting_clarification" | "failed" | "canceled";
 
 export const TASK_STATE_LABEL: Record<TaskStateKey, string> = {
   proposed: "Proposta pelo Diretor",
@@ -13,14 +13,15 @@ export const TASK_STATE_LABEL: Record<TaskStateKey, string> = {
   analysis_ready: "Análise concluída",
   implementation_ready: "Implementação pronta (não aplicada)",
   review_ready: "Revisão de QA concluída",
+  concluded: "Revisão final concluída",
   awaiting_clarification: "Aguardando esclarecimento",
   failed: "Falha",
   canceled: "Cancelada",
 };
 
 export const isHandoffTarget = (assignee: string) => (HANDOFF_TARGETS as readonly string[]).includes(assignee);
-/** Architect (read-only), Developer (write, own flow) or QA (read-only review, own flow) — the assignees with a real hand-off in this phase. */
-export const isExecutableAssignee = (assignee: string) => isHandoffTarget(assignee) || assignee === "developer" || assignee === "qa";
+/** Architect (read-only), Developer (write, own flow), QA (read-only review) or Reviewer (read-only final parecer) — the assignees with a real hand-off in this phase. */
+export const isExecutableAssignee = (assignee: string) => isHandoffTarget(assignee) || assignee === "developer" || assignee === "qa" || assignee === "reviewer";
 
 /** @param taskRuns hand-offs of this task, newest first. */
 export function taskState(task: PlanTask, taskRuns: RunRecord[]): { key: TaskStateKey; run: RunRecord | null } {
@@ -32,7 +33,7 @@ export function taskState(task: PlanTask, taskRuns: RunRecord[]): { key: TaskSta
   if (waiting && (latest.status === "failed" || latest.status === "canceled")) return { key: "awaiting_clarification", run: waiting };
   const map: Record<RunRecord["status"], TaskStateKey> = {
     awaiting_approval: "awaiting_approval", queued: "queued", planning: "working", analysis_ready: "analysis_ready",
-    implementation_ready: "implementation_ready", review_ready: "review_ready",
+    implementation_ready: "implementation_ready", review_ready: "review_ready", concluded: "concluded",
     awaiting_clarification: "awaiting_clarification", failed: "failed", canceled: "canceled", plan_ready: "analysis_ready",
   };
   return { key: map[latest.status], run: latest };

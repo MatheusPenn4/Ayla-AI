@@ -10,6 +10,7 @@ export type RunStatus =
   | "analysis_ready" // Architect: analysis done
   | "implementation_ready" // Developer: edits done, diff computed and in scope
   | "review_ready" // QA: every criterion classified (approved/rejected/not_verified), real evidence attached
+  | "concluded" // Reviewer: final verdict recorded (facts/inferences/limitations separated)
   | "failed" | "canceled";
 export const ACTIVE_STATUSES: RunStatus[] = ["queued", "planning"];
 export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
@@ -21,12 +22,13 @@ export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   analysis_ready: "Análise concluída",
   implementation_ready: "Implementação pronta (não aplicada)",
   review_ready: "Revisão de QA concluída",
+  concluded: "Revisão final concluída",
   failed: "Falha",
   canceled: "Cancelada",
 };
 
-/** Director planning, one Director task handed off (with approval) to the Architect, the Developer, or QA. */
-export type RunKind = "director_plan" | "architect_task" | "developer_task" | "qa_task";
+/** Director planning, one Director task handed off (with approval) to the Architect, the Developer, QA, or the Reviewer. */
+export type RunKind = "director_plan" | "architect_task" | "developer_task" | "qa_task" | "reviewer_task";
 
 /** Collaborators that can receive a read-only hand-off in this phase (see HandoffTargets for the Architect flow). */
 export const HANDOFF_TARGETS = ["architect"] as const;
@@ -34,6 +36,8 @@ export const HANDOFF_TARGETS = ["architect"] as const;
 export const DEVELOPER_ASSIGNEE = "developer";
 /** QA's hand-off is a separate, read-only flow (see lib/executor/qa.ts); not merged into HANDOFF_TARGETS either. */
 export const QA_ASSIGNEE = "qa";
+/** The Reviewer's hand-off is a separate, read-only flow (see lib/executor/reviewer.ts): examines the demand, the real deliverables and QA's own parecer, and separates facts, inferences and limitations. */
+export const REVIEWER_ASSIGNEE = "reviewer";
 
 /**
  * How a collaborator reaches a model: through an official client installed and
@@ -41,6 +45,32 @@ export const QA_ASSIGNEE = "qa";
  */
 export type ConnectionId = "claude_code" | "codex";
 export type ConnectionState = "not_installed" | "disconnected" | "connected" | "expired" | "unavailable";
+
+/** Provider of an API-key connection (billed separately from the Claude/ChatGPT subscriptions). */
+export type ApiProvider = "anthropic" | "openai";
+export type ApiConnectionState = "unchecked" | "connected" | "invalid" | "error";
+/**
+ * A connection the user configured with their own API key instead of an official client's subscription
+ * login. Stored encrypted at rest (see lib/executor/secret-store.ts); the key itself never leaves the
+ * executor process and is never returned by any HTTP response — only this masked record is.
+ */
+export type ApiConnectionRecord = {
+  id: string;
+  provider: ApiProvider;
+  /** Name the user gave this connection (e.g. "Minha chave Anthropic"). */
+  label: string;
+  /** Model name sent to the API ("" = a safe built-in default for the provider). */
+  model: string;
+  effort: string;
+  /** Last 4 characters of the key, for display only. */
+  last4: string;
+  state: ApiConnectionState;
+  message: string | null;
+  checkedAt: string | null;
+  createdAt: string;
+};
+/** A sheet or run's connection: an official client, or a configured API-key connection (`api:<id>`). */
+export type AgentConnectionRef = ConnectionId | `api:${string}`;
 
 /** What the browser sends to start a run. The server re-validates everything. */
 export type StartRunRequest = {
@@ -69,8 +99,8 @@ export type TeamMemberInput = {
   name: string;
   role: string;
   specialty: string;
-  /** Official client chosen in the sheet ("none" = not chosen). */
-  connection: ConnectionId | "none";
+  /** Official client or API connection chosen in the sheet ("none" = not chosen). */
+  connection: AgentConnectionRef | "none";
   modelName: string;
   effort: string;
   budget: number;
@@ -220,7 +250,7 @@ export type HandoffTask = PlanTask;
 /** Part of the Director's plan the Architect receives (a verifiable excerpt, not the whole plan). */
 export type PlanExcerpt = {
   directorRunId: string;
-  directorConnection: ConnectionId;
+  directorConnection: AgentConnectionRef;
   objective_summary: string;
   flow: { type: DirectorPlan["flow"]["type"]; rationale: string };
   step: PlanStep | null;
@@ -466,6 +496,55 @@ export type QASnapshot = {
   contextBudget: { estimatedInputTokens: number; omitted: string[] };
 };
 
+/** One statement the Reviewer verified directly against real evidence (never the model's own say-so). */
+export type ReviewerFact = { statement: string; evidence: string };
+/** One conclusion the Reviewer drew without a directly cited fact — must say what it is based on. */
+export type ReviewerInference = { statement: string; basis: string };
+export type ReviewerVerdict = "aprovado" | "aprovado_com_ressalvas" | "reprovado";
+
+/**
+ * The Reviewer's own structured parecer — like QA, self-reported and cross-checked against real evidence
+ * it was given, never against a live re-run it has no tool to make. Unlike QA (which classifies the
+ * demand's own criteria one by one), the Reviewer separates what it verified directly (facts), what it
+ * concluded without a directly cited fact (inferences), and what stays unverified, then states one overall
+ * verdict. It never overrides QA's own criterion verdicts — "aprovado" here is refused when the QA parecer
+ * still has a rejected or not_verified criterion (see lib/engine/reviewer-schema.ts).
+ */
+export type ReviewerResult = {
+  outcome: "done" | "needs_clarification";
+  summary: string;
+  facts: ReviewerFact[];
+  inferences: ReviewerInference[];
+  not_verified: string[];
+  questions: PlanQuestion[];
+  verdict: ReviewerVerdict;
+};
+
+/** What the executor lets this Reviewer run do (enforced by client flags, not by the prompt) — read-only, like QA. */
+export type ReviewerTool = { label: string; allowed: boolean; how: string };
+
+/**
+ * Frozen at "Enviar ao Revisor" (prepare). The Reviewer gets no live tools at all (read_only mode): it
+ * reuses exactly what QA itself was given and QA's own concluded parecer — never a live shell, never write
+ * access, never a second, parallel evidence-gathering pass over the repository.
+ */
+export type ReviewerSnapshot = {
+  kind: "reviewer_task";
+  agent: TeamMemberInput;
+  team: Pick<TeamMemberInput, "id" | "name" | "role" | "specialty" | "connection">[];
+  demand: StartRunRequest["demand"];
+  task: HandoffTask;
+  plan: { objective_summary: string; step: PlanStep | null; dependents: { id: string; title: string; assignee: string }[] };
+  /** The QA task this one depends on, and its own concluded parecer. */
+  qa: { taskId: string; runId: string; result: QAResult };
+  /** Architect analyses QA itself had in context (reused, not re-derived). */
+  analyses: (DependencyAnalysis & { taskId: string; title: string })[];
+  /** Real, validated deliverables QA itself had in context (reused, not re-derived). */
+  deliverables: QADeliverable[];
+  tools: ReviewerTool[];
+  contextBudget: { estimatedInputTokens: number; omitted: string[] };
+};
+
 export type DirectorSnapshot = {
   kind?: "director_plan";
   director: TeamMemberInput;
@@ -517,8 +596,8 @@ export type RunRecord = {
   parentRunId: string | null;
   /** Architect task: the task id inside the parent plan. */
   taskId: string | null;
-  /** Official client used by this run. */
-  connection: ConnectionId;
+  /** Official client or API connection used by this run. */
+  connection: AgentConnectionRef;
   /** Model requested in the sheet ("" = the client's default). */
   model: string;
   /** Reasoning effort requested in the sheet ("" = the client's default). */
@@ -541,6 +620,8 @@ export type RunRecord = {
   developer: (DeveloperResult & { limitations: string[]; diff: DeveloperDiff | null }) | null;
   /** QA review (kind qa_task): per-criterion verdicts, cross-checked against real deliverables, never a live re-run. */
   qa: (QAResult & { limitations: string[] }) | null;
+  /** Reviewer's final parecer (kind reviewer_task): facts, inferences and an overall verdict, built on QA's own evidence. */
+  reviewer: (ReviewerResult & { limitations: string[] }) | null;
   /** Developer only: the real diff computed even when it was rejected (out-of-scope edit, invalid response). Kept for inspection; never applied to the project. Null on success (the diff then lives in `developer.diff`) or when the run never reached a computed diff. */
   rejectedDiff: DeveloperDiff | null;
   /** Set only when a clarification question was resolved outside the model (see LocalResolution). Null otherwise. */
@@ -552,7 +633,7 @@ export type RunRecord = {
 export type RunDetail = RunRecord & {
   events: RunEvent[];
   /** Exactly what the collaborator received (frozen at run creation). */
-  snapshot: DirectorSnapshot | ArchitectSnapshot | DeveloperSnapshot | QASnapshot;
+  snapshot: DirectorSnapshot | ArchitectSnapshot | DeveloperSnapshot | QASnapshot | ReviewerSnapshot;
   prompt: { system: string; user: string } | null;
   rawOutput: string | null;
 };
@@ -560,13 +641,14 @@ export type RunDetail = RunRecord & {
 export type ModelOption = { value: string; label: string; efforts: string[]; defaultEffort: string | null };
 
 export type ConnectionStatus = {
-  id: ConnectionId;
-  /** Name of the official client. */
+  /** "api" for a synthetic status built from an ApiConnectionRecord (see lib/executor/service.ts). */
+  id: ConnectionId | "api";
+  /** Name of the official client, or "API <provider> (<label>)" for an API connection. */
   client: string;
   state: ConnectionState;
   /** Client version reported by the client itself. */
   version: string | null;
-  /** Kind of account the client says it is using (e.g. "Claude Team", "ChatGPT"). No e-mail. */
+  /** Kind of account the client says it is using (e.g. "Claude Team", "ChatGPT"). No e-mail. Masked key tail for API connections. */
   account: string | null;
   message: string;
   /** Exact steps for the user, in their own terminal, when action is needed. */
@@ -577,6 +659,8 @@ export type ConnectionStatus = {
   modelsSource: string | null;
   /** Effort levels the client accepts when no model-specific list exists. */
   efforts: string[];
+  /** Set only for a synthetic status built from an API connection — the record it came from. */
+  apiConnectionId?: string;
 };
 
 export type EngineStatus = {
@@ -587,6 +671,8 @@ export type EngineStatus = {
   disabledReason: string | null;
   store: { ok: boolean; kind: string; path: string | null; message: string | null };
   connections: Partial<Record<ConnectionId, ConnectionStatus>>;
+  /** API-key connections the user configured (masked; the key itself never leaves the executor). */
+  apiConnections: ApiConnectionRecord[];
   github: { mode: "public-only"; tokenConfigured: boolean };
   limits: { maxRunsPerHour: number; maxConcurrentRuns: number; callTimeoutMs: number };
   /** Collaborators that may run in this phase. */

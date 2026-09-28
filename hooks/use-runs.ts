@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EngineApiError, buildStartRequest, engineApi, toTeamInput, type HandoffFollowUp } from "@/lib/engine/client";
-import { ACTIVE_STATUSES, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
+import { ACTIVE_STATUSES, type ApiProvider, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
 import type { Agent, Demand } from "@/lib/office/types";
 
 const message = (e: unknown, fallback: string) => (e instanceof EngineApiError ? `${e.message}${e.details?.length ? ` (${e.details.join("; ")})` : ""}` : fallback);
@@ -72,7 +72,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     prevActive.current = anyActive;
   }, [anyActive, refreshStatus]);
 
-  const isHandoff = (r: RunRecord) => r.kind === "architect_task" || r.kind === "developer_task" || r.kind === "qa_task";
+  const isHandoff = (r: RunRecord) => r.kind === "architect_task" || r.kind === "developer_task" || r.kind === "qa_task" || r.kind === "reviewer_task";
   // Director plans of a demand (the queue card) and hand-offs of a plan's tasks (Architect or Developer) are kept apart.
   const latestFor = useCallback((demandId: string) => runs.find(r => r.demandId === demandId && !isHandoff(r)) ?? null, [runs]);
   const historyFor = useCallback((demandId: string) => runs.filter(r => r.demandId === demandId && !isHandoff(r)), [runs]);
@@ -172,6 +172,49 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     }
   }, []);
 
+  /**
+   * "Enviar ao Revisor": asks the executor to prepare (validate + freeze) the hand-off. Calls no model — that
+   * only happens after approve().
+   */
+  const preparingReviewer = useRef(new Set<string>());
+  const prepareReviewerHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[]) => {
+    const key = `${planRunId}:${taskId}`;
+    if (preparingReviewer.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
+    const reviewer = agents.find(a => a.id === "reviewer");
+    if (!reviewer) return { ok: false as const, error: "O Revisor não está na equipe." };
+    preparingReviewer.current.add(key);
+    setPending(s => new Set(s).add(key));
+    try {
+      const { run } = await engineApi.prepareReviewerHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(reviewer, agents) });
+      setRuns(list => [run, ...list.filter(r => r.id !== run.id)]);
+      return { ok: true as const, run };
+    } catch (e) {
+      return { ok: false as const, error: message(e, "Falha ao preparar o envio ao Revisor.") };
+    } finally {
+      preparingReviewer.current.delete(key);
+      setPending(s => { const n = new Set(s); n.delete(key); return n; });
+    }
+  }, []);
+
+  /** API-key connections (Configurações → Conexões de IA): create, verify (real minimal call) and remove. List comes from engine status. */
+  const createApiConnection = useCallback(async (req: { provider: ApiProvider; label: string; apiKey: string; model?: string; effort?: string }) => {
+    try { const { apiConnection } = await engineApi.createApiConnection(req); await refreshStatus(true); return { ok: true as const, apiConnection }; }
+    catch (e) { return { ok: false as const, error: message(e, "Falha ao cadastrar a conexão de API.") }; }
+  }, [refreshStatus]);
+  const verifyApiConnection = useCallback(async (id: string) => {
+    try {
+      const r = await engineApi.verifyApiConnection(id);
+      setStatus(s => (s ? { ...s, apiConnections: s.apiConnections.map(a => (a.id === id ? r.apiConnection : a)) } : s));
+      return { ok: r.ok, message: r.ok ? r.message : `${r.message}${r.detail ? ` — ${r.detail}` : ""}` };
+    } catch (e) {
+      return { ok: false, message: message(e, "Falha ao testar a conexão de API.") };
+    }
+  }, []);
+  const deleteApiConnection = useCallback(async (id: string) => {
+    try { await engineApi.deleteApiConnection(id); setStatus(s => (s ? { ...s, apiConnections: s.apiConnections.filter(a => a.id !== id) } : s)); return { ok: true as const }; }
+    catch (e) { return { ok: false as const, error: message(e, "Falha ao remover a conexão de API.") }; }
+  }, []);
+
   /** Validated task-completions of one plan (dependencyEvidence's only source besides a completed run). Fetched on demand, not polled. */
   const loadCompletions = useCallback(async (planRunId: string) => {
     try { const { completions: list } = await engineApi.listCompletions(planRunId); setCompletions(s => ({ ...s, [planRunId]: list })); }
@@ -198,5 +241,5 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     try { const { run } = await engineApi.cancel(runId); setRuns(list => list.map(r => (r.id === run.id ? run : r))); } catch { /* shown on next refresh */ }
   }, []);
 
-  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, loadCompletions, completionsFor, approve, cancel, refresh, refreshStatus, verify, probe };
+  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, prepareReviewerHandoff, loadCompletions, completionsFor, approve, cancel, refresh, refreshStatus, verify, probe, createApiConnection, verifyApiConnection, deleteApiConnection };
 }

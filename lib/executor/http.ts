@@ -84,7 +84,14 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     r = /^\/v1\/runs\/([0-9a-f-]{36})\/completions$/.exec(p);
     if (m === "GET" && r) return await service.listCompletions(r[1]);
     if (m === "POST" && p === "/v1/qa-handoffs") return await service.prepareQA(await readJson(req));
+    if (m === "POST" && p === "/v1/reviewer-handoffs") return await service.prepareReviewer(await readJson(req));
     if (m === "POST" && p === "/v1/task-completions") return await service.recordTaskCompletion(await readJson(req));
+    if (m === "GET" && p === "/v1/api-connections") return await service.listApiConnections();
+    if (m === "POST" && p === "/v1/api-connections") return await service.createApiConnection(await readJson(req));
+    r = /^\/v1\/api-connections\/([0-9a-f-]{36})$/.exec(p);
+    if (m === "DELETE" && r) return await service.deleteApiConnection(r[1]);
+    r = /^\/v1\/api-connections\/([0-9a-f-]{36})\/verify$/.exec(p);
+    if (m === "POST" && r) return await service.verifyApiConnection(r[1]);
     if (m === "POST" && p === "/v1/handoffs") return await service.prepare(await readJson(req));
     if (m === "GET" && p === "/v1/handoffs/source-options") return await service.sourceOptions(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");
     if (m === "GET" && p === "/v1/developer-preview") return await service.developerPreview(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");

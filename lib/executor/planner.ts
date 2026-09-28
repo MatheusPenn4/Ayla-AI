@@ -14,9 +14,10 @@ import path from "node:path";
 import { ANALYSIS_JSON_SCHEMA, partialTexts, validateAnalysis } from "@/lib/engine/analysis-schema";
 import { DEVELOPER_JSON_SCHEMA, validateDeveloperResult } from "@/lib/engine/developer-schema";
 import { QA_JSON_SCHEMA, validateQAResult } from "@/lib/engine/qa-schema";
+import { REVIEWER_JSON_SCHEMA, validateReviewerResult } from "@/lib/engine/reviewer-schema";
 import { PLAN_JSON_SCHEMA, validatePlan } from "@/lib/engine/plan-schema";
 import { buildSystemPrompt, buildUserMessage } from "@/lib/engine/prompt";
-import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DeveloperDiff, type DeveloperSnapshot, type DirectorSnapshot, type EditScopeEntry, type QASnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
+import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionId, type ConnectionStatus, type DeveloperDiff, type DeveloperSnapshot, type DirectorSnapshot, type EditScopeEntry, type QAResult, type QASnapshot, type ReviewerSnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
 import { LOGIN_STEPS } from "./clients";
 import { AgentError, type AgentAdapter, type AgentErrorCode, type AgentProgress } from "./adapters/types";
 import { GithubError, readGithubContext, shrinkGithubText } from "./github";
@@ -50,7 +51,16 @@ export class RunFailure extends Error {
 const fail = (err: RunError, rejectedDiff?: DeveloperDiff | null): never => { throw new RunFailure(err, rejectedDiff); };
 
 function recoveryFor(code: AgentErrorCode | string, conn: ConnectionStatus | null, who: string, timeoutMs = 0): string[] {
-  const id = conn?.id ?? "claude_code";
+  if (conn?.id === "api") {
+    switch (code) {
+      case "not_connected": return ["A chave de API foi recusada (inválida ou revogada).", "Abra Configurações → Conexões de IA, corrija ou substitua a chave e teste a sessão."];
+      case "usage_limit": return ["A API recusou por limite de uso/taxa (a cobrança é separada das assinaturas Claude/ChatGPT).", `Aguarde e tente novamente, ou escolha outra conexão na ficha do ${who}.`];
+      case "model_unavailable": return [`Na ficha do ${who} (aba Perfil), deixe o modelo em branco (padrão) ou use um nome de modelo válido para o provedor.`];
+      case "output_too_large": return ["A resposta foi cortada pelo limite de tokens de saída desta versão (sem streaming). Simplifique a demanda/tarefa ou escolha outra conexão."];
+      default: return ["Verifique a chave em Configurações → Conexões de IA e tente novamente."];
+    }
+  }
+  const id = (conn?.id ?? "claude_code") as ConnectionId;
   switch (code) {
     case "not_installed": return LOGIN_STEPS[id].install;
     case "not_connected": return LOGIN_STEPS[id].login;
@@ -111,6 +121,8 @@ type Prepared = {
   runId?: string; workDir?: string; hooksDir?: string; gitDeps?: GitDeps; editScope?: EditScopeEntry[]; baseCommit?: string;
   /** QA only: the demand's own acceptance criteria, verbatim — every one must be classified exactly once. */
   qaExpectedCriteria?: string[];
+  /** Reviewer only: the QA parecer this review is built on — the verdict may never contradict it. */
+  reviewerQaResult?: QAResult;
 };
 type Outcome = { status: RunStatus; result: object; message: string };
 /** Developer only: `diff` on the failure branch carries the real diff even when it was rejected, so it can be kept for inspection. */
@@ -231,6 +243,35 @@ function qaSpec(deps: PlannerDeps): Spec {
   };
 }
 
+function reviewerLimitations(budget: RunBudget) {
+  return [
+    "O Revisor não teve nenhuma ferramenta nesta execução: não leu o repositório, não editou, não rodou comando nem acessou a rede. Reaproveitou exatamente o parecer do QA e as entregas reais que o próprio QA recebeu, sem uma segunda leitura independente do repositório.",
+    "Um build, typecheck, lint ou teste automatizado passando não é, por si só, validação funcional de um critério de aceite do usuário — só evidência de qualidade de código.",
+    ...KNOWN_LIMITATIONS,
+    ...usageNotes(budget),
+  ];
+}
+
+function reviewerSpec(deps: PlannerDeps): Spec {
+  return {
+    who: "Revisor",
+    schema: REVIEWER_JSON_SCHEMA as unknown as Record<string, unknown>,
+    blockOverBudget: false,
+    async prepare(run) {
+      const detail = (await deps.store.detail(run.id))!;
+      if (!detail.prompt) fail({ code: "handoff_incomplete", message: "O encaminhamento não tem a entrada congelada na aprovação. Prepare o envio novamente.", retryable: false, recovery: ["Abra a tarefa e clique em “Enviar ao Revisor” de novo."] });
+      const snap = detail.snapshot as ReviewerSnapshot;
+      return { system: detail.prompt!.system, user: detail.prompt!.user, context: null, readPaths: [], reviewerQaResult: snap.qa.result };
+    },
+    validate(output, p, budget) {
+      const v = validateReviewerResult(output, p.reviewerQaResult!);
+      if (!v.ok) return v;
+      const status = v.result.outcome === "needs_clarification" ? "awaiting_clarification" : "concluded";
+      return { ok: true, outcome: { status, result: { ...v.result, limitations: reviewerLimitations(budget) }, message: status === "concluded" ? `Parecer final concluído: ${v.result.verdict}.` : `O Revisor precisa de esclarecimento: ${v.result.questions.length} pergunta(s).` } };
+    },
+  };
+}
+
 function developerLimitations(diff: DeveloperDiff, budget: RunBudget) {
   const out = [
     "Nenhum comando foi executado nesta execução: sem ferramenta de terminal nesta versão, tipos, lint, testes e build continuam sem verificação real.",
@@ -286,8 +327,8 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
   if (!(await store.claim(runId, deps.limits.leaseMs))) return;
   const run = (await store.get(runId))!;
   const snap = (await store.snapshot(runId)) as RunDetail["snapshot"];
-  const spec = run.kind === "architect_task" ? architectSpec(deps) : run.kind === "developer_task" ? developerSpec(deps) : run.kind === "qa_task" ? qaSpec(deps) : directorSpec(deps, snap as DirectorSnapshot);
-  await store.event(runId, "started", run.kind === "architect_task" ? "O executor local iniciou a análise do Arquiteto." : run.kind === "qa_task" ? "O executor local iniciou a revisão do QA." : "O executor local iniciou o planejamento.");
+  const spec = run.kind === "architect_task" ? architectSpec(deps) : run.kind === "developer_task" ? developerSpec(deps) : run.kind === "qa_task" ? qaSpec(deps) : run.kind === "reviewer_task" ? reviewerSpec(deps) : directorSpec(deps, snap as DirectorSnapshot);
+  await store.event(runId, "started", run.kind === "architect_task" ? "O executor local iniciou a análise do Arquiteto." : run.kind === "qa_task" ? "O executor local iniciou a revisão do QA." : run.kind === "reviewer_task" ? "O executor local iniciou a revisão final do Revisor." : run.kind === "developer_task" ? "O executor local iniciou a implementação do Desenvolvedor." : "O executor local iniciou o planejamento.");
   const budget: RunBudget = { ...run.budget, calls: [], reportedTotalTokens: null, exceeded: false };
   const record = (u: CallUsage | null) => {
     if (!u) return;
@@ -337,7 +378,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
           if (p.kind === "model_output") lastOutputEvent = Date.now();
           void store.event(runId, `client_${p.kind}`, p.message, p.data);
         };
-        const label = attempt === 1 ? (run.kind === "architect_task" ? "análise" : run.kind === "developer_task" ? "implementação" : run.kind === "qa_task" ? "revisão" : "planejamento") : "correção";
+        const label = attempt === 1 ? (run.kind === "architect_task" ? "análise" : run.kind === "developer_task" ? "implementação" : run.kind === "qa_task" ? "revisão" : run.kind === "reviewer_task" ? "revisão final" : "planejamento") : "correção";
         const mode = run.kind === "developer_task" ? "developer_write" : "read_only";
         reply = await adapter.call({ label, system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, scratchDir, onProgress, mode });
       } catch (err) {

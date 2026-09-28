@@ -28,7 +28,7 @@ async function startRun(req = request(), deps: Partial<PlannerDeps> & { adapter?
   if (!parsed.ok) throw new Error(parsed.errors.join("; "));
   const { run } = await store.create(buildNewRun(parsed.value));
   await processRun(run.id, {
-    store, connection: async () => connected(run.connection), adapter: null,
+    store, connection: async () => connected(run.connection as "claude_code" | "codex"), adapter: null,
     limits: { callTimeoutMs: 1000, leaseMs: 60000 }, github: { permitted: true }, workRoot: work, ...deps,
   });
   return (await store.detail(run.id))!;

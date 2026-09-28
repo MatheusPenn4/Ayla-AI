@@ -2,9 +2,11 @@
 // concurrency, cancellation, connection status. State lives in the RunStore
 // (SQLite file); in-memory maps only track processes of this executor.
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { CONNECTION_IDS } from "@/lib/engine/connections";
-import { HANDOFF_TARGETS, type ConnectionId, type ConnectionStatus, type DirectorSnapshot, type EngineStatus, type LocalResolution, type RunRecord } from "@/lib/engine/types";
+import { apiConnectionIdOf, apiConnectionStatus, CONNECTION_IDS, isApiConnectionRef } from "@/lib/engine/connections";
+import { HANDOFF_TARGETS, type AgentConnectionRef, type ConnectionId, type ConnectionStatus, type DirectorSnapshot, type EngineStatus, type LocalResolution, type RunRecord } from "@/lib/engine/types";
+import { apiAdapter } from "./adapters/api";
 import { claudeAdapter } from "./adapters/claude";
 import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
@@ -16,7 +18,9 @@ import { listLocalRepos } from "./local-git";
 import { processRun } from "./planner";
 import type { Runner } from "./proc";
 import { QAHandoffZ, prepareQAHandoff } from "./qa";
+import { ReviewerHandoffZ, prepareReviewerHandoff } from "./reviewer";
 import { EXECUTABLE_AGENTS, buildNewRun, parseStartRequest } from "./runs-service";
+import { decryptSecret, encryptSecret, last4, parseBox, parseMachineKeyB64, randomMachineKeyB64, serializeBox } from "./secret-store";
 import type { RunStore } from "./store";
 import type { EnvVars } from "./proc";
 
@@ -29,6 +33,12 @@ export type ExecutorConfig = {
   github: { token?: string; apiBase?: string; rawBase?: string; fetch?: typeof fetch };
   /** Local Git clones the user authorized for read-only reading (AYLA_LOCAL_REPOS, absolute paths). */
   localRepos?: string[];
+  /**
+   * Base64 32-byte key used to encrypt API-connection secrets at rest (see lib/executor/secret-store.ts).
+   * Production (executor/main.ts) always persists one in .dev.vars, mode 0600, gitignored, the same pattern
+   * as the executor's own bearer token. When absent (tests), a fresh one is generated in memory.
+   */
+  secretKeyB64?: string;
 };
 
 export type ServiceDeps = {
@@ -74,6 +84,7 @@ export class ExecutorService {
   private cache = new Map<ConnectionId, { at: number; status: ConnectionStatus }>();
   private checking = new Map<ConnectionId, Promise<ConnectionStatus>>();
   private clientDeps: ClientDeps;
+  private secretKey: Buffer;
 
   constructor(private cfg: ExecutorConfig, private deps: ServiceDeps) {
     mkdirSync(cfg.workRoot, { recursive: true });
@@ -84,6 +95,7 @@ export class ExecutorService {
       exists: deps.exists ?? existsSync,
       cwd: statusDir, nodePath: deps.nodePath ?? process.execPath,
     };
+    this.secretKey = parseMachineKeyB64(cfg.secretKeyB64 ?? randomMachineKeyB64());
   }
 
   get store() { return this.deps.store; }
@@ -133,6 +145,27 @@ export class ExecutorService {
     return id === "claude_code" ? claudeAdapter(inv, this.deps.runner, this.deps.env) : codexAdapter(inv, this.deps.runner, this.deps.env);
   }
 
+  /** Status for any connection a sheet/run may use — an official client (cached, force-refreshable) or a configured API connection (read from its own record; verifying it is a separate, explicit action — verifyApiConnection). */
+  async connectionOrApi(ref: AgentConnectionRef, force = false): Promise<ConnectionStatus> {
+    if (isApiConnectionRef(ref)) return apiConnectionStatus(await this.store.getApiConnectionRecord(apiConnectionIdOf(ref)), apiConnectionIdOf(ref));
+    return this.connection(ref, force);
+  }
+
+  private async adapterForRef(ref: AgentConnectionRef): Promise<AgentAdapter | null> {
+    if (!isApiConnectionRef(ref)) return this.adapterFor(ref);
+    const found = await this.store.getApiConnectionSecret(apiConnectionIdOf(ref));
+    if (!found) return null;
+    return apiAdapter(found.record, decryptSecret(this.secretKey, parseBox(found.secretJson)));
+  }
+
+  private readOnlySafe(ref: AgentConnectionRef): boolean {
+    return isApiConnectionRef(ref) || READ_ONLY[ref].safe;
+  }
+
+  private writeSafe(ref: AgentConnectionRef): boolean {
+    return !isApiConnectionRef(ref) && WRITE_RESTRICTED[ref].safe;
+  }
+
   /**
    * Optional real check of a session with a minimal call (uses a little of the subscription).
    * Only on explicit request from the user.
@@ -163,6 +196,61 @@ export class ExecutorService {
     }
   }
 
+  // ---- API-key connections -------------------------------------------------
+  // Billed separately from the Claude/ChatGPT subscriptions used by the official clients. The key never
+  // leaves this method (or verifyApiConnection/adapterForRef): every reply below returns only the masked
+  // ApiConnectionRecord, never the key itself.
+
+  async createApiConnection(body: unknown): Promise<Reply> {
+    const b = (body ?? {}) as { provider?: unknown; label?: unknown; apiKey?: unknown; model?: unknown; effort?: unknown };
+    if (b.provider !== "anthropic" && b.provider !== "openai") return err(400, "invalid_body", "provider deve ser anthropic ou openai.");
+    if (typeof b.label !== "string" || !b.label.trim() || b.label.length > 80) return err(400, "invalid_body", "Informe um nome para a conexão (até 80 caracteres).");
+    if (typeof b.apiKey !== "string" || b.apiKey.trim().length < 16 || b.apiKey.length > 400) return err(400, "invalid_body", "Chave de API ausente ou com tamanho inválido.");
+    const model = typeof b.model === "string" ? b.model.trim() : "";
+    const effort = typeof b.effort === "string" ? b.effort.trim() : "";
+    if (model && !/^[A-Za-z0-9._-]{1,80}$/.test(model)) return err(400, "invalid_body", "Nome de modelo inválido.");
+    if (effort && !/^[a-z]{2,12}$/.test(effort)) return err(400, "invalid_body", "Nível de esforço inválido.");
+    const key = b.apiKey.trim();
+    const record = await this.store.createApiConnection({
+      id: randomUUID(), provider: b.provider, label: b.label.trim(), model, effort,
+      last4: last4(key), secretJson: serializeBox(encryptSecret(this.secretKey, key)),
+    });
+    return { status: 201, body: { apiConnection: record } };
+  }
+
+  async listApiConnections(): Promise<Reply> {
+    return { status: 200, body: { apiConnections: await this.store.listApiConnections() } };
+  }
+
+  /** Real minimal call through the stored key (uses a little of the API's own paid usage). Only on explicit request. */
+  async verifyApiConnection(id: string): Promise<Reply> {
+    if (typeof id !== "string" || !id) return err(400, "invalid_request", "Conexão inválida.");
+    const found = await this.store.getApiConnectionSecret(id);
+    if (!found) return err(404, "not_found", "Conexão de API não encontrada.");
+    const adapter = apiAdapter(found.record, decryptSecret(this.secretKey, parseBox(found.secretJson)));
+    try {
+      const r = await adapter.call({
+        label: "teste de sessão", system: "Responda apenas no formato pedido.", user: "Responda com ok = true.",
+        schema: { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } },
+        model: "", effort: "", timeoutMs: Math.min(this.cfg.limits.callTimeoutMs, 60000), workDir: this.cfg.workRoot,
+      });
+      await this.store.setApiConnectionCheck(id, "connected", "Chave confirmada com uma chamada real mínima.");
+      return { status: 200, body: { ok: true, apiConnection: await this.store.getApiConnectionRecord(id), message: "Chave confirmada com uma chamada real mínima.", usage: r.usage } };
+    } catch (e) {
+      const code = (e as { code?: string }).code ?? "client_error";
+      const state = code === "not_connected" ? "invalid" : "error";
+      const message = (e as Error).message;
+      await this.store.setApiConnectionCheck(id, state, message);
+      return { status: 200, body: { ok: false, apiConnection: await this.store.getApiConnectionRecord(id), message, code, detail: (e as { detail?: string }).detail } };
+    }
+  }
+
+  async deleteApiConnection(id: string): Promise<Reply> {
+    if (typeof id !== "string" || !id) return err(400, "invalid_request", "Conexão inválida.");
+    const removed = await this.store.deleteApiConnection(id);
+    return { status: 200, body: { removed } };
+  }
+
   async status(force = false): Promise<Omit<EngineStatus, "executionEnabled" | "disabledReason">> {
     let storeOk = true, storeMsg: string | null = null;
     try { await this.store.ensureSchema(); } catch (e) { storeOk = false; storeMsg = (e as Error).message; }
@@ -172,6 +260,7 @@ export class ExecutorService {
       executor: { reachable: true, message: null, version: this.cfg.version },
       store: { ok: storeOk, kind: this.store.kind, path: this.cfg.storePath, message: storeMsg },
       connections,
+      apiConnections: await this.store.listApiConnections(),
       github: { mode: "public-only", tokenConfigured: !!this.cfg.github.token },
       limits: { maxRunsPerHour: this.cfg.limits.maxRunsPerHour, maxConcurrentRuns: this.cfg.limits.maxConcurrentRuns, callTimeoutMs: this.cfg.limits.callTimeoutMs },
       executableAgents: EXECUTABLE_AGENTS,
@@ -213,7 +302,7 @@ export class ExecutorService {
     const parsed = HandoffZ.safeParse(body);
     if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
     const req = parsed.data;
-    if (req.agent.connection !== "none" && !READ_ONLY[req.agent.connection].safe) {
+    if (req.agent.connection !== "none" && !this.readOnlySafe(req.agent.connection as AgentConnectionRef)) {
       return err(409, "adapter_not_read_only", "Esta conexão não pode ser restrita a somente leitura e está bloqueada para o Arquiteto. Escolha a outra conexão na ficha dele.");
     }
     if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
@@ -256,8 +345,8 @@ export class ExecutorService {
     const parsed = DeveloperHandoffZ.safeParse(body);
     if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
     const req = parsed.data;
-    if (req.agent.connection !== "none" && !WRITE_RESTRICTED[req.agent.connection].safe) {
-      return err(409, "adapter_not_write_restricted", "Esta conexão não tem isolamento de escrita comprovado e está bloqueada para o Desenvolvedor. Escolha Claude Code na ficha dele.");
+    if (req.agent.connection !== "none" && !this.writeSafe(req.agent.connection as AgentConnectionRef)) {
+      return err(409, "adapter_not_write_restricted", "Esta conexão não tem isolamento de escrita comprovado e está bloqueada para o Desenvolvedor. Escolha Claude Code na ficha dele — conexões de API não têm ferramenta de arquivo nesta versão.");
     }
     if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
@@ -282,7 +371,7 @@ export class ExecutorService {
     const parsed = QAHandoffZ.safeParse(body);
     if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
     const req = parsed.data;
-    if (req.agent.connection !== "none" && !READ_ONLY[req.agent.connection].safe) {
+    if (req.agent.connection !== "none" && !this.readOnlySafe(req.agent.connection as AgentConnectionRef)) {
       return err(409, "adapter_not_read_only", "Esta conexão não pode ser restrita a somente leitura e está bloqueada para o QA. Escolha a outra conexão na ficha dele.");
     }
     if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
@@ -297,24 +386,54 @@ export class ExecutorService {
     }
   }
 
+  // ---- hand-off to the Reviewer -------------------------------------------
+
+  /**
+   * Step 1: validate against the executor's own records — the task must depend on a QA task that already
+   * reached review_ready — and freeze what will be sent. The Reviewer reuses exactly what QA itself was
+   * given (its frozen snapshot) plus QA's own concluded parecer; no live tools, nothing is called here.
+   */
+  async prepareReviewer(body: unknown): Promise<Reply> {
+    const parsed = ReviewerHandoffZ.safeParse(body);
+    if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
+    const req = parsed.data;
+    if (req.agent.connection !== "none" && !this.readOnlySafe(req.agent.connection as AgentConnectionRef)) {
+      return err(409, "adapter_not_read_only", "Esta conexão não pode ser restrita a somente leitura e está bloqueada para o Revisor. Escolha a outra conexão na ficha dele.");
+    }
+    if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
+      return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
+    }
+    try {
+      const { run, created } = await prepareReviewerHandoff(req, this.handoffDeps());
+      return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
+    } catch (e) {
+      if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
+      throw e;
+    }
+  }
+
   /** Every validated task-completion of a plan — used by the UI to show "entrega local validada" vs. a bare model result. */
   async listCompletions(parentRunId: string): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(parentRunId)) return err(400, "invalid_request", "Plano inválido.");
     return { status: 200, body: { completions: await this.store.taskCompletionsForPlan(parentRunId) } };
   }
 
-  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). Architect, Developer or QA. */
+  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). Architect, Developer, QA or Reviewer. */
   async approve(id: string, body: unknown): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
     const hash = (body as { snapshotHash?: unknown } | null)?.snapshotHash;
     const run = await this.store.get(id);
-    if (!run || (run.kind !== "architect_task" && run.kind !== "developer_task" && run.kind !== "qa_task")) return err(404, "not_found", "Encaminhamento não encontrado.");
+    if (!run || (run.kind !== "architect_task" && run.kind !== "developer_task" && run.kind !== "qa_task" && run.kind !== "reviewer_task")) return err(404, "not_found", "Encaminhamento não encontrado.");
     if (run.status !== "awaiting_approval") return { status: 200, body: { run, approved: false } };
     if (typeof hash !== "string" || hash !== run.snapshotHash) return err(409, "content_changed", "O conteúdo confirmado não corresponde ao encaminhamento preparado. Abra a revisão de novo.");
     const parent = run.parentRunId ? await this.store.get(run.parentRunId) : null;
     if (!parent || parent.status !== "plan_ready") return err(409, "plan_not_ready", "O plano do Diretor desta tarefa não está mais disponível.");
     if (!(await this.store.approve(id))) return { status: 200, body: { run: await this.store.get(id), approved: false } };
-    await this.store.event(id, "approved", run.kind === "developer_task" ? "Envio confirmado por você. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora." : run.kind === "qa_task" ? "Envio confirmado por você. O QA entrou na fila do executor local." : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
+    const approvedMsg = run.kind === "developer_task" ? "Envio confirmado por você. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora."
+      : run.kind === "qa_task" ? "Envio confirmado por você. O QA entrou na fila do executor local."
+      : run.kind === "reviewer_task" ? "Envio confirmado por você. O Revisor entrou na fila do executor local."
+      : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.";
+    await this.store.event(id, "approved", approvedMsg);
     this.enqueue(id);
     return { status: 202, body: { run: await this.store.get(id), approved: true } };
   }
@@ -404,17 +523,18 @@ export class ExecutorService {
     const run = await this.store.get(id);
     if (!snap || !run) return;
     const conn = run.connection;
+    const adapter = await this.adapterForRef(conn);
     await processRun(id, {
       store: this.store,
-      connection: () => this.connection(conn, true),
-      adapter: this.adapterFor(conn),
+      connection: () => this.connectionOrApi(conn, true),
+      adapter,
       limits: { callTimeoutMs: this.cfg.limits.callTimeoutMs, leaseMs: this.cfg.limits.leaseMs },
       github: { ...this.cfg.github, permitted: (snap as DirectorSnapshot).director?.tools.github !== false },
       local: this.cfg.localRepos?.length ? { dirs: this.cfg.localRepos, git: this.gitDeps() } : undefined,
       workRoot: this.cfg.workRoot,
       signal: ac.signal,
     });
-    this.cache.delete(conn);
+    if (!isApiConnectionRef(conn)) this.cache.delete(conn);
   }
 
   async list(demandIds: string[]): Promise<Reply> {

@@ -3,7 +3,7 @@
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
 import type { DeveloperPreview } from "./developer-preview";
-import type { ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
+import type { ApiConnectionRecord, ApiProvider, ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -88,8 +88,18 @@ export const engineApi = {
   /** QA hand-off step 1: freezes the review. No model is called here. */
   prepareQAHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput }) =>
     call<{ run: RunDetail; created: boolean }>("/api/qa-handoffs", { method: "POST", body: JSON.stringify(req) }),
-  /** Hand-off step 2: the user's confirmation of exactly that content (Architect, Developer or QA). */
+  /** Reviewer hand-off step 1: freezes the review. No model is called here. */
+  prepareReviewerHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput }) =>
+    call<{ run: RunDetail; created: boolean }>("/api/reviewer-handoffs", { method: "POST", body: JSON.stringify(req) }),
+  /** Hand-off step 2: the user's confirmation of exactly that content (Architect, Developer, QA or Reviewer). */
   approve: (id: string, snapshotHash: string) => call<{ run: RunRecord; approved: boolean }>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify({ snapshotHash }) }),
   /** Every validated task-completion of a plan (evidence dependencyEvidence() accepts as "done" beyond a completed run). */
   listCompletions: (planRunId: string) => call<{ completions: TaskCompletion[] }>(`/api/runs/${planRunId}/completions`),
+  /** API-key connections configured in Configurações → Conexões de IA — masked; the key itself never reaches the browser. */
+  listApiConnections: () => call<{ apiConnections: ApiConnectionRecord[] }>("/api/api-connections"),
+  createApiConnection: (req: { provider: ApiProvider; label: string; apiKey: string; model?: string; effort?: string }) =>
+    call<{ apiConnection: ApiConnectionRecord }>("/api/api-connections", { method: "POST", body: JSON.stringify(req) }),
+  /** Real minimal call through the stored key (uses a little of the API's own paid usage). Only on explicit request. */
+  verifyApiConnection: (id: string) => call<{ ok: boolean; apiConnection: ApiConnectionRecord; message: string; code?: string; detail?: string }>(`/api/api-connections/${id}/verify`, { method: "POST", body: "{}" }),
+  deleteApiConnection: (id: string) => call<{ removed: boolean }>(`/api/api-connections/${id}`, { method: "DELETE" }),
 };

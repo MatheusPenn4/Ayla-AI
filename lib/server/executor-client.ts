@@ -8,7 +8,7 @@ export type ExecutorReply = { status: number; body: unknown };
 export const EXECUTOR_OFFLINE =
   "O executor local não está respondendo. Em um terminal na pasta do projeto, rode: pnpm executor (e mantenha-o aberto).";
 
-export async function callExecutor(path: string, init: { method?: "GET" | "POST"; body?: unknown; timeoutMs?: number } = {}): Promise<ExecutorReply> {
+export async function callExecutor(path: string, init: { method?: "GET" | "POST" | "DELETE"; body?: unknown; timeoutMs?: number } = {}): Promise<ExecutorReply> {
   const cfg = serverConfig().executor;
   if (!cfg.token) {
     return { status: 503, body: { error: { code: "executor_not_configured", message: "O token do executor local não está configurado. Rode pnpm executor uma vez (ele cria o token em .dev.vars) e reinicie o pnpm dev." } } };

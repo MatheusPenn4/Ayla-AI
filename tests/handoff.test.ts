@@ -1409,3 +1409,181 @@ describe("QA: aprovação, execução real (simulada) e classificação dos crit
     expect((await store.get(run.id))!.qa?.outcome).toBe("done");
   });
 });
+
+// ---- Reviewer: depends on a concluded QA task, reuses QA's own frozen snapshot (no second evidence pass) ----
+import { validateReviewerResult } from "@/lib/engine/reviewer-schema";
+import type { ReviewerResult, ReviewerSnapshot } from "@/lib/engine/types";
+
+/** qaChainPlan plus a Reviewer task (t6) depending on the QA task (t5) — for testing the Reviewer hand-off. */
+const reviewerChainPlan = () => {
+  const p = qaChainPlan();
+  return { ...p, tasks: [...p.tasks, { id: "t6", step_id: "s2", assignee: "reviewer", title: "Formar o parecer final", scope: "Ler o parecer do QA e formar o parecer final", inputs: "t5", deliverable: "Parecer final", acceptance_criteria: ["Botão azul"], depends_on: ["t5"] }] };
+};
+/** A Reviewer task that (wrongly) depends directly on the Developer task, skipping QA. */
+const reviewerWithoutQaDepPlan = () => {
+  const p = chainPlan();
+  return { ...p, tasks: [...p.tasks, { id: "t6", step_id: "s2", assignee: "reviewer", title: "Formar o parecer final", scope: "x", inputs: "t3", deliverable: "Parecer final", acceptance_criteria: ["Botão azul"], depends_on: ["t3"] }] };
+};
+const reviewerSheet = (over = {}) => member("reviewer", { connection: "claude_code", brief: "# Revisor\nFicha salva do Revisor.", budget: 48000, ...over });
+const reviewerReq = (planId: string, taskId = "t6", over = {}) => ({ idempotencyKey: `h:${Math.random().toString(36).slice(2, 12)}`, directorRunId: planId, taskId, agent: reviewerSheet(), ...over });
+const reviewerResultRaw = (over: Partial<ReviewerResult> = {}) => ({
+  outcome: "done" as const, summary: "Parecer final formado a partir do parecer do QA.",
+  facts: [{ statement: "O QA aprovou o único critério da demanda.", evidence: "Critério \"Botão azul\" aprovado pelo QA com evidência do diff real de t3." }],
+  inferences: [] as { statement: string; basis: string }[], not_verified: [] as string[], questions: [] as { question: string; why_it_blocks: string }[], verdict: "aprovado" as const, ...over,
+});
+
+/** t3 (Developer) real, t5 (QA) concluded, in a plan that also has t6 (Reviewer) depending on t5. */
+async function chainWithQAConcluded(repo: { dir: string; base: string }, s: RunStore, qaOverride: Partial<QAResult> = {}) {
+  const { plan } = await localChainWithAnalyses(repo, s, reviewerChainPlan());
+  const { svc: devSvc } = service(
+    [async (c: AgentCall) => { writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const toMarkdown = () => \"\";\n"); return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "Novo módulo puro." }] })); }],
+    { s, localRepos: [repo.dir] },
+  );
+  const t3 = body<{ run: RunDetail }>(await devSvc.prepareDeveloper(devReq(plan, "t3"))).run;
+  await devSvc.approve(t3.id, { snapshotHash: t3.snapshotHash });
+  await devSvc.idle();
+  const { svc: qaSvc } = service([reply(qaResultRaw(qaOverride))], { s, localRepos: [repo.dir] });
+  const t5 = body<{ run: RunDetail }>(await qaSvc.prepareQA(qaReq(plan, "t5"))).run;
+  await qaSvc.approve(t5.id, { snapshotHash: t5.snapshotHash });
+  await qaSvc.idle();
+  return { plan };
+}
+
+describe("validateReviewerResult: o veredito nunca pode contradizer o próprio parecer do QA", () => {
+  it("aceita aprovado quando o QA aprovou tudo e há ao menos um fato", () => {
+    const v = validateReviewerResult(reviewerResultRaw(), qaResult());
+    expect(v.ok).toBe(true);
+  });
+  it("recusa aprovado quando o QA reprovou algum critério", () => {
+    const qa = qaResult({ criteria: [{ criterion: "Botão azul", verdict: "rejected", rejected: { steps: "Abri a tela", expected: "Azul", observed: "Vermelho", impact: "Critério não atendido" } }], recommendation: "blocked" });
+    const v = validateReviewerResult(reviewerResultRaw({ verdict: "aprovado" }), qa);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.errors.join(" ")).toContain("reprovado");
+  });
+  it("recusa aprovado sem ressalvas quando o QA deixou algum critério não verificado", () => {
+    const qa = qaResult({ criteria: [{ criterion: "Botão azul", verdict: "not_verified", notVerifiedReason: "Sem terminal." }] });
+    const v = validateReviewerResult(reviewerResultRaw({ verdict: "aprovado" }), qa);
+    expect(v.ok).toBe(false);
+  });
+  it("exige ao menos um fato quando outcome é done", () => {
+    const v = validateReviewerResult(reviewerResultRaw({ facts: [] }), qaResult());
+    expect(v.ok).toBe(false);
+  });
+  it("needs_clarification exige pelo menos uma pergunta", () => {
+    const v = validateReviewerResult(reviewerResultRaw({ outcome: "needs_clarification", questions: [] }), qaResult());
+    expect(v.ok).toBe(false);
+  });
+});
+
+describe("Revisor: preparar o envio (depende de um QA já concluído; reaproveita o próprio contexto do QA)", () => {
+  it("recusa quando a tarefa não depende de nenhuma tarefa do QA", async () => {
+    const plan = await directorPlan(reviewerWithoutQaDepPlan());
+    const { svc } = service([], { s: store });
+    const r = await svc.prepareReviewer(reviewerReq(plan, "t6"));
+    expect(body<{ error: { code: string } }>(r).error.code).toBe("no_qa_dependency");
+  });
+
+  it("recusa quando o QA ainda não concluiu a revisão — inclusive por chamada direta ao serviço", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store, reviewerChainPlan()); // t3/t5 not sent yet
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareReviewer(reviewerReq(plan, "t6"));
+    expect(body<{ error: { code: string } }>(r).error.code).toBe("dependency_pending");
+  });
+
+  it("recusa ficha sem conexão; recusa tarefa que não é do Revisor", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    expect(body<{ error: { code: string } }>(await svc.prepareReviewer(reviewerReq(plan, "t6", { agent: reviewerSheet({ connection: "none" }) }))).error.code).toBe("no_connection");
+    expect(body<{ error: { code: string } }>(await svc.prepareReviewer(reviewerReq(plan, "t5"))).error.code).toBe("not_reviewer_task");
+  });
+
+  it("uma vez concluído o QA, congela o parecer reaproveitando exatamente as entregas/análises do QA e o parecer dele — sem chamar o modelo", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc, calls } = service([], { s: store, localRepos: [repo.dir] });
+    const r = body<{ run: RunDetail; created: boolean }>(await svc.prepareReviewer(reviewerReq(plan, "t6")));
+    expect(r.created).toBe(true);
+    expect(r.run.status).toBe("awaiting_approval");
+    const snap = r.run.snapshot as ReviewerSnapshot;
+    expect(snap.qa.taskId).toBe("t5");
+    expect(snap.qa.result.criteria).toMatchObject([{ criterion: "Botão azul", verdict: "approved" }]);
+    expect(snap.deliverables.map(d => d.taskId)).toContain("t3");
+    expect(snap.analyses.map(a => a.taskId).sort()).toEqual(["t1", "t2"]);
+    expect(snap.tools.every(t => !t.allowed)).toBe(true); // Reviewer: no live tools at all
+    await svc.idle();
+    expect(calls).toHaveLength(0); // preparing never calls the model
+  });
+});
+
+describe("Revisor: aprovação, execução real (simulada) e veredito final coerente com o QA", () => {
+  it("execução completa: veredito aprovado quando o QA aprovou tudo, concluded, uma única chamada", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc, calls } = service([reply(reviewerResultRaw())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+    const done = (await store.detail(run.id))!;
+    expect(done.status).toBe("concluded");
+    expect(done.reviewer?.verdict).toBe("aprovado");
+  });
+
+  it("reprova a resposta do modelo quando o veredito diz aprovado mas o parecer do QA tem critério reprovado", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store, { criteria: [{ criterion: "Botão azul", verdict: "rejected", rejected: { steps: "Abri a tela", expected: "Azul", observed: "Vermelho", impact: "Critério não atendido" } }], recommendation: "blocked" });
+    const badVerdict = reviewerResultRaw({ verdict: "aprovado" });
+    const { svc, calls } = service([reply(badVerdict), reply(badVerdict)], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(2); // one correction attempt, per the standard policy
+    expect((await store.get(run.id))!.status).toBe("failed");
+  });
+
+  it("aceita reprovado quando o parecer do QA tem um critério reprovado", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store, { criteria: [{ criterion: "Botão azul", verdict: "rejected", rejected: { steps: "Abri a tela", expected: "Azul", observed: "Vermelho", impact: "Critério não atendido" } }], recommendation: "blocked" });
+    const { svc, calls } = service([reply(reviewerResultRaw({ verdict: "reprovado", facts: [{ statement: "O QA reprovou o critério de cor.", evidence: "Observado vermelho, esperado azul." }] }))], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+    expect((await store.get(run.id))!.status).toBe("concluded");
+    expect((await store.get(run.id))!.reviewer?.verdict).toBe("reprovado");
+  });
+
+  it("clique repetido na confirmação enfileira uma única vez; cancelamento antes da confirmação não chama o modelo", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc: sPending } = service([], { s: store, localRepos: [repo.dir] });
+    const runPending = body<{ run: RunDetail }>(await sPending.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    const discarded = await sPending.cancel(runPending.id);
+    expect(body<{ canceled: boolean }>(discarded).canceled).toBe(true);
+    await sPending.idle();
+
+    const { svc, calls } = service([reply(reviewerResultRaw())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    const [a, b] = await Promise.all([svc.approve(run.id, { snapshotHash: run.snapshotHash }), svc.approve(run.id, { snapshotHash: run.snapshotHash })]);
+    expect([a, b].filter(r => body<{ approved: boolean }>(r).approved)).toHaveLength(1);
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("persistência: o parecer final reabre do banco exatamente como gravado (kind reviewer_task)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc } = service([reply(reviewerResultRaw())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    const detail = (await store.detail(run.id))!;
+    expect(detail.kind).toBe("reviewer_task");
+    expect(detail.reviewer?.outcome).toBe("done");
+    expect(detail.qa).toBeNull();
+    expect(detail.developer).toBeNull();
+    expect((await store.get(run.id))!.reviewer?.verdict).toBe("aprovado");
+  });
+});

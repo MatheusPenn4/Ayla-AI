@@ -2,7 +2,7 @@
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
 import { randomUUID } from "node:crypto";
-import type { DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
+import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -79,10 +79,26 @@ const SCHEMA = [
     created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS task_completions_by_task ON task_completions (parent_run_id, task_id, created_at)`,
+  // API-key connections the user configured (Configurações → Conexões de IA). The key itself is stored
+  // encrypted (secret_json = a SecretBox, see lib/executor/secret-store.ts) with a machine key kept only in
+  // .dev.vars; no HTTP response ever returns secret_json, only the masked fields.
+  `CREATE TABLE IF NOT EXISTS api_connections (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    label TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT '',
+    last4 TEXT NOT NULL,
+    secret_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'unchecked',
+    message TEXT,
+    checked_at TEXT,
+    created_at TEXT NOT NULL
+  )`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence. */
-export const SCHEMA_VERSION = 5;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off. */
+export const SCHEMA_VERSION = 6;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
@@ -96,8 +112,8 @@ const ADDED_COLUMNS: [string, string][] = [
 const INDEXES = [
   // At most one active Director plan per demand (no duplicate runs on double click / refresh).
   `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_plan ON director_runs (demand_id) WHERE kind = 'director_plan' AND status IN ('queued', 'planning')`,
-  // At most one pending/active hand-off per task of a plan, whether to the Architect, the Developer or QA.
-  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind IN ('architect_task', 'developer_task', 'qa_task') AND status IN ('awaiting_approval', 'queued', 'planning')`,
+  // At most one pending/active hand-off per task of a plan, whether to the Architect, the Developer, QA or the Reviewer.
+  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind IN ('architect_task', 'developer_task', 'qa_task', 'reviewer_task') AND status IN ('awaiting_approval', 'queued', 'planning')`,
   `CREATE INDEX IF NOT EXISTS runs_by_parent ON director_runs (parent_run_id, task_id, created_at)`,
 ];
 
@@ -108,7 +124,7 @@ const parse = <T>(v: unknown): T | null => (typeof v === "string" && v ? (JSON.p
 const nowIso = () => new Date().toISOString();
 
 function toRecord(r: Row): RunRecord {
-  const kind = ((r.kind === "architect_task" || r.kind === "developer_task" || r.kind === "qa_task") ? r.kind : "director_plan") as RunRecord["kind"];
+  const kind = ((r.kind === "architect_task" || r.kind === "developer_task" || r.kind === "qa_task" || r.kind === "reviewer_task") ? r.kind : "director_plan") as RunRecord["kind"];
   return {
     id: String(r.id), kind, demandId: String(r.demand_id), agentId: String(r.agent_id), status: r.status as RunStatus,
     parentRunId: (r.parent_run_id as string) ?? null, taskId: (r.task_id as string) ?? null,
@@ -121,10 +137,19 @@ function toRecord(r: Row): RunRecord {
     analysis: kind === "architect_task" ? parse<RunRecord["analysis"]>(r.result_json) : null,
     developer: kind === "developer_task" ? parse<RunRecord["developer"]>(r.result_json) : null,
     qa: kind === "qa_task" ? parse<RunRecord["qa"]>(r.result_json) : null,
+    reviewer: kind === "reviewer_task" ? parse<RunRecord["reviewer"]>(r.result_json) : null,
     rejectedDiff: kind === "developer_task" ? parse<DeveloperDiff>(r.rejected_diff_json) : null,
     localResolution: parse<LocalResolution>(r.local_resolution_json),
     error: parse<RunError>(r.error_json),
     previousRunId: (r.previous_run_id as string) ?? null,
+  };
+}
+
+function toApiConnectionRecord(r: Row): ApiConnectionRecord {
+  return {
+    id: String(r.id), provider: r.provider as ApiProvider, label: String(r.label), model: String(r.model ?? ""), effort: String(r.effort ?? ""),
+    last4: String(r.last4), state: r.state as ApiConnectionState, message: (r.message as string) ?? null,
+    checkedAt: (r.checked_at as string) ?? null, createdAt: String(r.created_at),
   };
 }
 
@@ -183,7 +208,7 @@ export class RunStore {
     const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`);
     if (!tables.some(t => t.name === "director_runs")) return false;
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
-    return ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || !tables.some(t => t.name === "task_completions");
+    return ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || !tables.some(t => t.name === "task_completions") || !tables.some(t => t.name === "api_connections");
   }
 
   /** Consistent copy of the whole database (SQLite VACUUM INTO). */
@@ -215,7 +240,7 @@ export class RunStore {
     const kind = input.kind ?? "director_plan";
     const byKey = await this.db.all(`SELECT * FROM director_runs WHERE idempotency_key = ?`, [input.idempotencyKey]);
     if (byKey[0]) return { run: toRecord(byKey[0]), created: false };
-    const openRun = () => (kind === "architect_task" || kind === "developer_task" || kind === "qa_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
+    const openRun = () => (kind === "architect_task" || kind === "developer_task" || kind === "qa_task" || kind === "reviewer_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
     const active = await openRun();
     if (active) return { run: active, created: false };
     const t = nowIso();
@@ -239,7 +264,9 @@ export class RunStore {
         ? "Encaminhamento preparado para o Desenvolvedor. Nenhuma cópia de trabalho foi criada e nada será executado antes da sua confirmação."
         : kind === "qa_task"
           ? "Encaminhamento preparado para o QA. Nada será executado antes da sua confirmação."
-          : "Execução criada e colocada na fila do executor local.");
+          : kind === "reviewer_task"
+            ? "Encaminhamento preparado para o Revisor. Nada será executado antes da sua confirmação."
+            : "Execução criada e colocada na fila do executor local.");
     return { run: (await this.get(input.id))!, created: true };
   }
 
@@ -261,7 +288,7 @@ export class RunStore {
 
   /** The user's confirmation: awaiting_approval → queued, atomically (a repeated click changes nothing). */
   async approve(id: string) {
-    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind IN ('architect_task', 'developer_task', 'qa_task') AND status = 'awaiting_approval'`, [nowIso(), id]);
+    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind IN ('architect_task', 'developer_task', 'qa_task', 'reviewer_task') AND status = 'awaiting_approval'`, [nowIso(), id]);
     return changes === 1;
   }
 
@@ -441,5 +468,49 @@ export class RunStore {
     await this.ensureSchema();
     const rows = await this.db.all<{ n: number }>(`SELECT COUNT(*) AS n FROM director_runs WHERE status IN ('queued', 'planning')`);
     return Number(rows[0]?.n ?? 0);
+  }
+
+  // ---- API-key connections -------------------------------------------------
+  // The key itself (secretJson, an encrypted SecretBox — see lib/executor/secret-store.ts) is never returned
+  // by listApiConnections/getApiConnectionRecord; only getApiConnectionSecret exposes it, for the adapter's
+  // own use at call time.
+
+  async createApiConnection(input: { id: string; provider: ApiProvider; label: string; model: string; effort: string; last4: string; secretJson: string }): Promise<ApiConnectionRecord> {
+    await this.ensureSchema();
+    await this.db.run(
+      `INSERT INTO api_connections (id, provider, label, model, effort, last4, secret_json, state, message, checked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'unchecked', NULL, NULL, ?)`,
+      [input.id, input.provider, input.label, input.model, input.effort, input.last4, input.secretJson, nowIso()],
+    );
+    return (await this.getApiConnectionRecord(input.id))!;
+  }
+
+  async listApiConnections(): Promise<ApiConnectionRecord[]> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT id, provider, label, model, effort, last4, state, message, checked_at, created_at FROM api_connections ORDER BY created_at`);
+    return rows.map(toApiConnectionRecord);
+  }
+
+  async getApiConnectionRecord(id: string): Promise<ApiConnectionRecord | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT id, provider, label, model, effort, last4, state, message, checked_at, created_at FROM api_connections WHERE id = ?`, [id]);
+    return rows[0] ? toApiConnectionRecord(rows[0]) : null;
+  }
+
+  /** Only for the adapter's own use at call time: the record plus its encrypted secret box (still serialized text). */
+  async getApiConnectionSecret(id: string): Promise<{ record: ApiConnectionRecord; secretJson: string } | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM api_connections WHERE id = ?`, [id]);
+    return rows[0] ? { record: toApiConnectionRecord(rows[0]), secretJson: String(rows[0].secret_json) } : null;
+  }
+
+  async setApiConnectionCheck(id: string, state: ApiConnectionState, message: string | null): Promise<void> {
+    await this.ensureSchema();
+    await this.db.run(`UPDATE api_connections SET state = ?, message = ?, checked_at = ? WHERE id = ?`, [state, message, nowIso(), id]);
+  }
+
+  async deleteApiConnection(id: string): Promise<boolean> {
+    await this.ensureSchema();
+    const { changes } = await this.db.run(`DELETE FROM api_connections WHERE id = ?`, [id]);
+    return changes > 0;
   }
 }

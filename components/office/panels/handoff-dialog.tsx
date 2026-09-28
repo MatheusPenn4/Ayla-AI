@@ -5,7 +5,7 @@ import { AlertTriangle, CheckCircle2, FileText, Loader2, RefreshCw, ShieldCheck,
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { useRuns } from "@/hooks/use-runs";
 import { toTeamInput } from "@/lib/engine/client";
-import { CONNECTION_STATE_LABEL, connectionLabel } from "@/lib/engine/connections";
+import { CONNECTION_STATE_LABEL, connectionLabel, connectionStatusFor, readOnlyInfoFor } from "@/lib/engine/connections";
 import type { ArchitectSnapshot, ConsultedFile, RunDetail } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
 import { RevisionInfo, useRunDetail } from "./run-dialog";
@@ -73,7 +73,7 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
   if (!run) return <div className="run-loading">{error ?? <><Loader2 size={16} className="spin" /> Carregando o envio preparado…</>}</div>;
   const snap = run.snapshot as ArchitectSnapshot;
   const ctx = run.context;
-  const conn = runs.status?.connections[run.connection];
+  const conn = connectionStatusFor(run.connection, runs.status);
   const executorUp = !!runs.status?.executionEnabled;
   const current = agents.find(a => a.id === snap.agent.id);
   const cur = current ? toTeamInput(current, agents) : null;
@@ -181,7 +181,7 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
             {!executorUp && <p className="conn-msg">{runs.status?.disabledReason ?? runs.statusError ?? "Executor local indisponível."}</p>}
             {conn && <p className="conn-msg">{conn.message}</p>}
             {conn && conn.state !== "connected" && !!conn.steps.length && <ol className="conn-steps">{conn.steps.map((s, i) => <li key={i}>{s}</li>)}</ol>}
-            {runs.status?.readOnly[run.connection] && <small>Somente leitura garantido por: {runs.status.readOnly[run.connection]!.how}</small>}
+            {readOnlyInfoFor(run.connection, runs.status) && <small>Somente leitura garantido por: {readOnlyInfoFor(run.connection, runs.status)!.how}</small>}
           </div>
         </section>
 

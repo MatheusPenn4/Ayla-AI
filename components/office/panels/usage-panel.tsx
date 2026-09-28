@@ -1,10 +1,10 @@
 "use client";
 
 import { promptComposition } from "@/lib/engine/composition";
-import { reportedTotal, type CallUsage, type ConnectionId, type RunBudget } from "@/lib/engine/types";
+import { connectionLabel } from "@/lib/engine/connections";
+import { reportedTotal, type AgentConnectionRef, type CallUsage, type RunBudget } from "@/lib/engine/types";
 
 const fmt = (n: number | null | undefined) => (n == null ? "indisponível" : n.toLocaleString("pt-BR"));
-const CLIENT: Record<ConnectionId, string> = { claude_code: "Claude Code", codex: "Codex CLI" };
 
 /**
  * Only figures the client reported; a category it did not report shows
@@ -12,7 +12,7 @@ const CLIENT: Record<ConnectionId, string> = { claude_code: "Claude Code", codex
  * characters and is never turned into tokens per section.
  */
 export function UsagePanel({ budget, connection, agentLabel, prompt, schemaChars = 0 }: {
-  budget: RunBudget; connection: ConnectionId; agentLabel: string;
+  budget: RunBudget; connection: AgentConnectionRef; agentLabel: string;
   prompt?: { system: string; user: string } | null; schemaChars?: number;
 }) {
   const b = budget;
@@ -21,7 +21,7 @@ export function UsagePanel({ budget, connection, agentLabel, prompt, schemaChars
     return vals.length ? vals.reduce((x, y) => x + y, 0) : null;
   };
   const input = sum(c => c.inputTokens), cacheR = sum(c => c.cacheReadTokens), cacheW = sum(c => c.cacheWriteTokens), output = sum(c => c.outputTokens), reasoning = sum(c => c.reasoningTokens);
-  const sources = [...new Set(b.calls.map(c => c.source ?? `${CLIENT[connection]} · registro anterior à identificação da fonte (valores como gravados na época)`))];
+  const sources = [...new Set(b.calls.map(c => c.source ?? `${connectionLabel(connection)} · registro anterior à identificação da fonte (valores como gravados na época)`))];
   const comp = promptComposition(prompt ?? null, schemaChars);
   const perRequest = b.calls.flatMap(c => (c.apiCalls ?? []).map((x, i) => ({ call: c.label, i: i + 1, ...x })));
   return (

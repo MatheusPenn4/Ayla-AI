@@ -55,7 +55,8 @@ export class AgentError extends Error {
 }
 
 export interface AgentAdapter {
-  readonly id: ConnectionId;
+  /** "api" identifies an API-key adapter (see adapters/api.ts) — not one of the official CLI clients. */
+  readonly id: ConnectionId | "api";
   call(c: AgentCall): Promise<AgentReply>;
 }
 

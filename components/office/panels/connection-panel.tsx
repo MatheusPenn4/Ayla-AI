@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { AlertTriangle, CheckCircle2, Loader2, PlugZap, RefreshCw } from "lucide-react";
-import { CONNECTION_OPTIONS, CONNECTION_STATE_LABEL, DISCONNECTED_BEHAVIOUR, connectionFromLegacyProvider, type SheetConnection } from "@/lib/engine/connections";
+import { AlertTriangle, CheckCircle2, Loader2, PlugZap, RefreshCw, Settings2 } from "lucide-react";
+import { CONNECTION_OPTIONS, CONNECTION_STATE_LABEL, DISCONNECTED_BEHAVIOUR, apiConnectionIdOf, apiConnectionRef, connectionFromLegacyProvider, connectionStatusFor, isApiConnectionRef, type SheetConnection } from "@/lib/engine/connections";
 import type { ConnectionId, ConnectionStatus, EngineStatus } from "@/lib/engine/types";
 import { Field } from "./field";
 
@@ -11,6 +11,7 @@ export type EngineControls = {
   statusError: string | null;
   verify: () => Promise<void>;
   probe: (id: ConnectionId) => Promise<{ ok: boolean; message: string }>;
+  verifyApiConnection: (id: string) => Promise<{ ok: boolean; message: string }>;
 };
 
 const STATE_CLASS: Record<ConnectionStatus["state"], string> = {
@@ -39,24 +40,39 @@ export function ConnectionPanel({ connection, modelName, effort, legacyProvider,
 }) {
   const [busy, setBusy] = useState<"" | "verify" | "probe">("");
   const [probeMsg, setProbeMsg] = useState<{ ok: boolean; message: string } | null>(null);
-  const status = connection !== "none" ? engine?.status?.connections[connection] : undefined;
+  const isApi = isApiConnectionRef(connection);
+  const status = connectionStatusFor(connection, engine?.status);
   const executorDown = !!engine && !!engine.status && !engine.status.executor.reachable;
-  const models = status?.models ?? [];
+  const apiConnections = engine?.status?.apiConnections ?? [];
+  const models = !isApi ? (status?.models ?? []) : [];
   const selectedModel = models.find(m => m.value === modelName);
-  const efforts = connection === "codex" ? (selectedModel?.efforts ?? []) : (status?.efforts ?? []);
+  const efforts = !isApi ? (connection === "codex" ? (selectedModel?.efforts ?? []) : (status?.efforts ?? [])) : [];
   const legacyUnmapped = legacyProvider && legacyProvider !== "A definir" && connectionFromLegacyProvider(legacyProvider) === "none";
 
   const verify = async () => { if (!engine) return; setBusy("verify"); setProbeMsg(null); try { await engine.verify(); } finally { setBusy(""); } };
-  const probe = async () => { if (!engine || connection === "none") return; setBusy("probe"); try { setProbeMsg(await engine.probe(connection)); } finally { setBusy(""); } };
+  const probe = async () => {
+    if (!engine || connection === "none") return;
+    setBusy("probe");
+    try { setProbeMsg(isApiConnectionRef(connection) ? await engine.verifyApiConnection(apiConnectionIdOf(connection)) : await engine.probe(connection)); }
+    finally { setBusy(""); }
+  };
 
   return (
     <div className="conn-panel">
-      <Field label="Conexão de execução" hint="Cliente oficial instalado e autenticado neste computador. O Setor IA não guarda senha, cookie nem token das suas contas.">
+      <Field label="Conexão de execução" hint="Cliente oficial instalado e autenticado neste computador, ou uma conexão de API configurada em Configurações → Conexões de IA. O Setor IA não guarda senha, cookie nem token das suas contas.">
         <select value={connection} onChange={e => { onChange({ connection: e.target.value as SheetConnection, modelName: "", effort: "" }); setProbeMsg(null); }}>
           {CONNECTION_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          {apiConnections.length > 0 && (
+            <optgroup label="Conexões de API configuradas">
+              {apiConnections.map(a => <option key={a.id} value={apiConnectionRef(a.id)}>{a.provider === "anthropic" ? "Anthropic" : "OpenAI"} · {a.label} (API, cobrança separada)</option>)}
+            </optgroup>
+          )}
         </select>
       </Field>
       {legacyUnmapped && <p className="form-note">Provedor planejado em uma versão anterior da ficha: <b>{legacyProvider}</b> (mantido, mas sem cliente oficial suportado).</p>}
+      {isApi && !apiConnections.some(a => apiConnectionRef(a.id) === connection) && (
+        <p className="form-note bad">Esta conexão de API foi removida em Configurações → Conexões de IA. Escolha outra conexão.</p>
+      )}
 
       {connection !== "none" && (
         <div className={`conn-card ${status ? STATE_CLASS[status.state] : "unknown"}`}>
@@ -67,9 +83,9 @@ export function ConnectionPanel({ connection, modelName, effort, legacyProvider,
             {status?.version && <span className="muted">{status.version}</span>}
             {status?.account && <span className="muted">· {status.account}</span>}
             <span className="grow" />
-            <button type="button" className="btn-ghost" onClick={verify} disabled={!engine || !!busy}>{busy === "verify" ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>
-            {status && (status.state === "connected" || status.state === "expired") && (
-              <button type="button" className="btn-ghost" onClick={probe} disabled={!!busy} title="Faz uma chamada real mínima pelo cliente oficial (usa um pouco da assinatura).">{busy === "probe" ? <Loader2 size={13} className="spin" /> : <PlugZap size={13} />} Testar sessão</button>
+            {!isApi && <button type="button" className="btn-ghost" onClick={verify} disabled={!engine || !!busy}>{busy === "verify" ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>}
+            {((!isApi && status && (status.state === "connected" || status.state === "expired")) || isApi) && (
+              <button type="button" className="btn-ghost" onClick={probe} disabled={!!busy} title={isApi ? "Faz uma chamada real mínima pela API (usa um pouco do uso pago dessa chave)." : "Faz uma chamada real mínima pelo cliente oficial (usa um pouco da assinatura)."}>{busy === "probe" ? <Loader2 size={13} className="spin" /> : <PlugZap size={13} />} Testar sessão</button>
             )}
           </div>
           {executorDown && <p className="conn-msg">{engine?.status?.executor.message}</p>}
@@ -77,11 +93,13 @@ export function ConnectionPanel({ connection, modelName, effort, legacyProvider,
           {status && <p className="conn-msg">{status.message}</p>}
           {status && <ConnectionSteps status={status} />}
           {probeMsg && <p className={`conn-msg ${probeMsg.ok ? "ok" : "bad"}`}>{probeMsg.message}</p>}
-          <small>O login é feito por você, no terminal, pelo próprio cliente oficial; o Setor IA apenas verifica o estado com os comandos de status do cliente.</small>
+          {isApi
+            ? <small>Chave cadastrada em Configurações → Conexões de IA, guardada criptografada no executor local; nunca aparece de novo em texto puro.</small>
+            : <small>O login é feito por você, no terminal, pelo próprio cliente oficial; o Setor IA apenas verifica o estado com os comandos de status do cliente.</small>}
         </div>
       )}
 
-      {connection !== "none" && (
+      {connection !== "none" && !isApi && (
         <div className="form-row">
           <Field label="Modelo" hint={status?.modelsSource ?? "Sem lista de modelos do cliente: será usado o modelo padrão do cliente."}>
             <select value={modelName} onChange={e => onChange({ modelName: e.target.value, effort: "" })}>
@@ -100,6 +118,17 @@ export function ConnectionPanel({ connection, modelName, effort, legacyProvider,
             </Field>
           )}
         </div>
+      )}
+
+      {connection !== "none" && isApi && (
+        <div className="form-row">
+          <Field label="Modelo" hint="Nome exato do modelo aceito pela API (ex.: claude-sonnet-5, gpt-5). Em branco = um padrão seguro do Setor IA para este provedor.">
+            <input value={modelName} placeholder="padrão do Setor IA" onChange={e => onChange({ modelName: e.target.value })} />
+          </Field>
+        </div>
+      )}
+      {connection !== "none" && isApi && (
+        <p className="form-note"><Settings2 size={13} aria-hidden /> Conexões de API não têm ferramenta de arquivo nesta versão (uma única chamada, sem terminal nem tools): só podem ser usadas por colaboradores só de leitura/texto — nunca pelo Desenvolvedor.</p>
       )}
 
       <p className="form-note">

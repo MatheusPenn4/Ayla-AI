@@ -18,6 +18,7 @@ export async function GET(request: Request) {
     disabledReason: !gate.ok ? gate.reason : ok ? null : exErr,
     store: fromExecutor?.store ?? { ok: false, kind: "none", path: null, message: exErr },
     connections: fromExecutor?.connections ?? {},
+    apiConnections: fromExecutor?.apiConnections ?? [],
     github: fromExecutor?.github ?? { mode: "public-only", tokenConfigured: false },
     limits: fromExecutor?.limits ?? { maxRunsPerHour: 0, maxConcurrentRuns: 0, callTimeoutMs: 0 },
     executableAgents: fromExecutor?.executableAgents ?? ["director"],
