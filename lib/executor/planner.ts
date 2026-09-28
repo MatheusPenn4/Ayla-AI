@@ -9,16 +9,19 @@
 //   that text), so nothing is read again here.
 // Nothing is simulated: when the client is not usable the run fails with the
 // reason and the recovery steps. No collaborator triggers another one.
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { ANALYSIS_JSON_SCHEMA, partialTexts, validateAnalysis } from "@/lib/engine/analysis-schema";
+import { DEVELOPER_JSON_SCHEMA, validateDeveloperResult } from "@/lib/engine/developer-schema";
 import { PLAN_JSON_SCHEMA, validatePlan } from "@/lib/engine/plan-schema";
 import { buildSystemPrompt, buildUserMessage } from "@/lib/engine/prompt";
-import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DirectorSnapshot, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
+import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionStatus, type DeveloperDiff, type DeveloperSnapshot, type DirectorSnapshot, type EditScopeEntry, type RunBudget, type RunDetail, type RunError, type RunRecord, type RunStatus, type SourceContext } from "@/lib/engine/types";
 import { LOGIN_STEPS } from "./clients";
 import { AgentError, type AgentAdapter, type AgentErrorCode, type AgentProgress } from "./adapters/types";
 import { GithubError, readGithubContext, shrinkGithubText } from "./github";
+import { listLocalRepos, type GitDeps } from "./local-git";
 import type { RunStore } from "./store";
+import { destroyWorktree, diffWorktree, materializeCommit } from "./worktree";
 
 export type PlannerDeps = {
   store: RunStore;
@@ -29,6 +32,8 @@ export type PlannerDeps = {
   limits: { callTimeoutMs: number; leaseMs: number };
   /** Used by the Director only (the Architect's sources were read when the hand-off was prepared). */
   github: { fetch?: typeof fetch; token?: string; apiBase?: string; rawBase?: string; permitted: boolean };
+  /** Local Git clones authorized for reading — the Developer materializes its isolated copy from here. */
+  local?: { dirs: string[]; git: GitDeps };
   /** Parent folder for per-call empty working directories. */
   workRoot: string;
   signal?: AbortSignal;
@@ -98,14 +103,19 @@ function keywords(...texts: string[]) {
   return [...new Set(texts.join(" ").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9_-]+/))];
 }
 
-type Prepared = { system: string; user: string; context: SourceContext; readPaths: string[]; answered?: string[]; partial?: Record<string, string> };
+type Prepared = {
+  system: string; user: string; context: SourceContext | null; readPaths: string[]; answered?: string[]; partial?: Record<string, string>;
+  /** Developer only: where the isolated working copy lives, how to diff it, and what it may touch. */
+  runId?: string; workDir?: string; hooksDir?: string; gitDeps?: GitDeps; editScope?: EditScopeEntry[]; baseCommit?: string;
+};
 type Outcome = { status: RunStatus; result: object; message: string };
+type ValidateResult = { ok: true; outcome: Outcome } | { ok: false; errors: string[] };
 type Spec = {
   who: string;
   schema: Record<string, unknown>;
   prepare: (run: RunRecord, budget: RunBudget) => Promise<Prepared>;
-  validate: (output: unknown, p: Prepared, budget: RunBudget) => { ok: true; outcome: Outcome } | { ok: false; errors: string[] };
-  /** Director: the call is refused when even the text sent exceeds the sheet budget. Architect: the user saw the alert and approved. */
+  validate: (output: unknown, p: Prepared, budget: RunBudget) => ValidateResult | Promise<ValidateResult>;
+  /** Director: the call is refused when even the text sent exceeds the sheet budget. Architect/Developer: the user saw the alert and approved. */
   blockOverBudget: boolean;
 };
 
@@ -160,7 +170,7 @@ function directorSpec(deps: PlannerDeps, snap: DirectorSnapshot): Spec {
       const v = validatePlan(output, allowed);
       if (!v.ok) return v;
       const status = v.plan.outcome === "needs_clarification" ? "awaiting_clarification" : "plan_ready";
-      return { ok: true, outcome: { status, result: { ...v.plan, limitations: directorLimitations(p.context, budget) }, message: status === "plan_ready" ? `Plano pronto: ${v.plan.tasks.length} tarefa(s) proposta(s).` : `O Diretor precisa de esclarecimento: ${v.plan.questions.length} pergunta(s).` } };
+      return { ok: true, outcome: { status, result: { ...v.plan, limitations: directorLimitations(p.context!, budget) }, message: status === "plan_ready" ? `Plano pronto: ${v.plan.tasks.length} tarefa(s) proposta(s).` : `O Diretor precisa de esclarecimento: ${v.plan.questions.length} pergunta(s).` } };
     },
   };
 }
@@ -182,7 +192,56 @@ function architectSpec(deps: PlannerDeps): Spec {
       const v = validateAnalysis(output, p.readPaths, p.answered ?? [], p.partial ?? {});
       if (!v.ok) return v;
       const status = v.analysis.outcome === "needs_clarification" ? "awaiting_clarification" : "analysis_ready";
-      return { ok: true, outcome: { status, result: { ...v.analysis, limitations: architectLimitations(p.context, budget) }, message: status === "analysis_ready" ? "Análise técnica concluída e registrada." : `O Arquiteto precisa de esclarecimento: ${v.analysis.questions.length} pergunta(s).` } };
+      return { ok: true, outcome: { status, result: { ...v.analysis, limitations: architectLimitations(p.context!, budget) }, message: status === "analysis_ready" ? "Análise técnica concluída e registrada." : `O Arquiteto precisa de esclarecimento: ${v.analysis.questions.length} pergunta(s).` } };
+    },
+  };
+}
+
+function developerLimitations(diff: DeveloperDiff, budget: RunBudget) {
+  const out = [
+    "Nenhum comando foi executado nesta execução: sem ferramenta de terminal nesta versão, tipos, lint, testes e build continuam sem verificação real.",
+    "Nada foi aplicado ao projeto original, commitado, publicado ou enviado ao QA: o resultado existiu só na cópia isolada (já removida) e fica registrado aqui (diff e relatório).",
+  ];
+  if (diff.diffTruncated) out.push(`O diff mostrado foi cortado por tamanho; o diff real pode ser maior que o texto exibido.`);
+  return [...out, ...usageNotes(budget)];
+}
+
+function developerSpec(deps: PlannerDeps): Spec {
+  return {
+    who: "Desenvolvedor",
+    schema: DEVELOPER_JSON_SCHEMA as unknown as Record<string, unknown>,
+    blockOverBudget: false,
+    async prepare(run) {
+      const detail = (await deps.store.detail(run.id))!;
+      if (!detail.prompt) fail({ code: "handoff_incomplete", message: "O encaminhamento não tem a entrada congelada na aprovação. Prepare o envio novamente.", retryable: false, recovery: ["Abra a tarefa e clique em “Enviar ao Desenvolvedor” de novo."] });
+      const snap = detail.snapshot as DeveloperSnapshot;
+      if (!deps.local?.dirs.length) fail({ code: "local_not_authorized", message: "Nenhuma cópia local autorizada está configurada (AYLA_LOCAL_REPOS); o Desenvolvedor não tem de onde montar a cópia isolada.", retryable: false, recovery: ["Configure AYLA_LOCAL_REPOS e prepare o envio novamente."] });
+      const repos = await listLocalRepos(deps.local!.dirs, deps.local!.git);
+      const repo = repos.find(r => r.owner.toLowerCase() === snap.base.owner.toLowerCase() && r.repo.toLowerCase() === snap.base.repo.toLowerCase() && r.dirName === snap.base.dirName);
+      if (!repo) fail({ code: "local_not_authorized", message: "A cópia local autorizada usada no preparo deste envio não está mais disponível.", retryable: false, recovery: ["Prepare o envio novamente."] });
+      const workDir = path.join(deps.workRoot, run.id);
+      await deps.store.event(run.id, "worktree", `Preparando a cópia de trabalho isolada do commit ${snap.base.commit.slice(0, 12)} (git archive, sem node_modules, sem histórico do projeto real)…`);
+      let m;
+      try { m = await materializeCommit({ sourceDir: repo!.dir, commit: snap.base.commit, workDir }, deps.local!.git); }
+      catch (err) { if (err instanceof GithubError) fail({ code: err.code, message: err.message, retryable: false }); throw err; }
+      await deps.store.event(run.id, "worktree_ready", `Cópia isolada pronta: ${m.fileCount} arquivo(s). O modelo só enxerga esta pasta.`);
+      return {
+        system: detail.prompt!.system, user: detail.prompt!.user, context: null, readPaths: [],
+        runId: run.id, workDir: m.workDir, hooksDir: m.hooksDir, gitDeps: deps.local!.git, editScope: snap.editScope, baseCommit: snap.base.commit,
+      };
+    },
+    async validate(output, p, budget) {
+      const d = await diffWorktree({ workDir: p.workDir!, hooksDir: p.hooksDir! }, p.gitDeps!);
+      const editable = new Set((p.editScope ?? []).filter(e => e.action !== "consultar").map(e => e.path));
+      const touched = [...new Set(d.files.map(f => f.path))];
+      const outOfScope = touched.filter(t => !editable.has(t));
+      const files = d.files.map(f => ({ ...f, inScope: !outOfScope.includes(f.path) }));
+      await deps.store.event(p.runId!, "diff", `Diff real da cópia isolada: ${files.length} arquivo(s) tocado(s) (${files.filter(f => f.status === "added").length} criado(s), ${files.filter(f => f.status === "modified").length} alterado(s), ${files.filter(f => f.status === "deleted").length} removido(s))${outOfScope.length ? `; FORA DO ESCOPO APROVADO: ${outOfScope.join(", ")}` : "; todos dentro do escopo aprovado"}.`, { files, diffTruncated: d.diffTruncated });
+      const v = validateDeveloperResult(output, touched, outOfScope);
+      if (!v.ok) return v;
+      const diff: DeveloperDiff = { baseCommit: p.baseCommit!, files, diffText: d.diffText, diffTruncated: d.diffTruncated, outOfScope };
+      const status = v.result.outcome === "needs_clarification" ? "awaiting_clarification" : "implementation_ready";
+      return { ok: true, outcome: { status, result: { ...v.result, diff, limitations: developerLimitations(diff, budget) }, message: status === "implementation_ready" ? `Implementação pronta na cópia isolada: ${files.length} arquivo(s) tocado(s). Nada foi aplicado ao projeto original.` : `O Desenvolvedor precisa de esclarecimento: ${v.result.questions.length} pergunta(s).` } };
     },
   };
 }
@@ -193,7 +252,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
   if (!(await store.claim(runId, deps.limits.leaseMs))) return;
   const run = (await store.get(runId))!;
   const snap = (await store.snapshot(runId)) as RunDetail["snapshot"];
-  const spec = run.kind === "architect_task" ? architectSpec(deps) : directorSpec(deps, snap as DirectorSnapshot);
+  const spec = run.kind === "architect_task" ? architectSpec(deps) : run.kind === "developer_task" ? developerSpec(deps) : directorSpec(deps, snap as DirectorSnapshot);
   await store.event(runId, "started", run.kind === "architect_task" ? "O executor local iniciou a análise do Arquiteto." : "O executor local iniciou o planejamento.");
   const budget: RunBudget = { ...run.budget, calls: [], reportedTotalTokens: null, exceeded: false };
   const record = (u: CallUsage | null) => {
@@ -239,7 +298,9 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
           if (p.kind === "model_output") lastOutputEvent = Date.now();
           void store.event(runId, `client_${p.kind}`, p.message, p.data);
         };
-        reply = await adapter.call({ label: attempt === 1 ? (run.kind === "architect_task" ? "análise" : "planejamento") : "correção", system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, onProgress });
+        const label = attempt === 1 ? (run.kind === "architect_task" ? "análise" : run.kind === "developer_task" ? "implementação" : "planejamento") : "correção";
+        const mode = run.kind === "developer_task" ? "developer_write" : "read_only";
+        reply = await adapter.call({ label, system: prepared.system, user: prompt, schema: spec.schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, onProgress, mode });
       } catch (err) {
         if (err instanceof AgentError) {
           record((err as AgentError & { usage?: CallUsage | null }).usage ?? null);
@@ -255,7 +316,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
       const total = reply.usage ? reportedTotal(reply.usage) : null;
       await store.event(runId, "reply", total !== null ? `Resposta recebida. Uso informado pelo cliente: ${total} tokens${reply.usage?.model ? ` (${reply.usage.model})` : ""}.` : "Resposta recebida. O cliente não informou o uso de tokens.");
 
-      const v = reply.output === null || typeof reply.output !== "object" ? { ok: false as const, errors: ["A resposta não é um JSON válido."] } : spec.validate(reply.output, prepared, budget);
+      const v = reply.output === null || typeof reply.output !== "object" ? { ok: false as const, errors: ["A resposta não é um JSON válido."] } : await spec.validate(reply.output, prepared, budget);
       if (v.ok) {
         const current = await store.get(runId);
         if (current?.status === "canceled") return;
@@ -281,6 +342,6 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
     await store.event(runId, "failed", e.message, e.detail ? { detail: e.detail } : undefined);
   } finally {
     clearInterval(lease);
-    try { rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    destroyWorktree(workDir);
   }
 }

@@ -90,7 +90,7 @@ function EngineBanner({ runs, director, onOpenDirector }: { runs: RunsApi; direc
       <div className="engine-head">
         <span className={`led ${blocking ? "amber" : "green"}`} />
         <b>Motor do Diretor · fase 1</b>
-        <span className="muted">somente planejamento · especialistas ainda não executam · GitHub: só repositórios públicos, leitura limitada</span>
+        <span className="muted">Diretor planeja · Arquiteto analisa (só leitura) e Desenvolvedor implementa (cópia isolada), só com sua revisão e confirmação · GitHub: só repositórios públicos, leitura limitada</span>
         <button className="btn-ghost" disabled={runs.checking} onClick={() => { void runs.verify(); void runs.refresh(); }}>{runs.checking ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>
         <button className="btn-ghost" onClick={onOpenDirector}>Ficha do Diretor</button>
       </div>

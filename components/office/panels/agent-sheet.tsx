@@ -210,7 +210,7 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
             </div>
             <ConnectionPanel
               connection={draft.connection} modelName={draft.modelName} effort={draft.effort} legacyProvider={String(draft.model)}
-              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id) ? "starts" : (engine?.status?.handoffTargets ?? ["architect"]).includes(draft.id) ? "handoff" : "none"}
+              executable={(engine?.status?.executableAgents ?? ["director"]).includes(draft.id) ? "starts" : (engine?.status?.handoffTargets ?? ["architect"]).includes(draft.id) ? "handoff" : draft.id === "developer" ? "handoff_write" : "none"}
               engine={engine}
               onChange={part => update(part)}
             />
@@ -253,15 +253,22 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
           </Tabs.Content>
 
           <Tabs.Content value="tools" className="tab-pane">
-            <div className="notice">Permissões <b>planejadas</b> para as próximas etapas. Nesta fase só uma tem efeito real: <b>GitHub</b> na ficha do Diretor autoriza a leitura limitada de repositórios <b>públicos</b> durante o planejamento. Nas execuções, as ferramentas dos clientes oficiais (terminal, edição, navegador, busca) ficam sempre desligadas.</div>
+            <div className="notice">Permissões <b>planejadas</b> para as próximas etapas; a maioria ainda não tem efeito real. As exceções reais de hoje: <b>GitHub</b> na ficha do Diretor (leitura limitada de repositórios públicos durante o planejamento); <b>Ler arquivos</b> na ficha do Arquiteto (leitura só do texto que o executor envia, sem ferramentas); <b>Editar arquivos</b> na ficha do Desenvolvedor com conexão Claude — assinatura (escrita restrita a uma cópia isolada do commit aprovado, nunca no seu projeto). Terminal e navegador continuam sempre desligados nesta versão, para todos.</div>
             <div className="tool-list">
-              {TOOL_INFO.map(t => (
-                <label className="tool-row" key={t.key}>
-                  <span><b>{t.label}</b><small>{t.description}</small></span>
-                  <em className="tool-state">{draft.tools[t.key] ? "planejada" : "não planejada"} · {t.key === "github" && draft.id === "director" ? "aplicada ao planejamento (só leitura pública)" : "não conectada"}</em>
-                  <Switch checked={draft.tools[t.key]} onCheckedChange={v => update({ tools: { ...draft.tools, [t.key]: v } })} aria-label={`Planejar permissão: ${t.label}`} />
-                </label>
-              ))}
+              {TOOL_INFO.map(t => {
+                const real =
+                  t.key === "github" && draft.id === "director" ? "aplicada ao planejamento (só leitura pública)"
+                  : t.key === "read" && draft.id === "architect" ? "aplicada ao envio ao Arquiteto (só leitura, sem ferramentas de rede)"
+                  : (t.key === "read" || t.key === "edit") && draft.id === "developer" && draft.connection === "claude_code" ? "aplicada ao envio ao Desenvolvedor (cópia isolada do commit aprovado; nunca no seu projeto)"
+                  : "sem efeito nesta versão";
+                return (
+                  <label className="tool-row" key={t.key}>
+                    <span><b>{t.label}</b><small>{t.description}</small></span>
+                    <em className="tool-state">{draft.tools[t.key] ? "planejada" : "não planejada"} · {real}</em>
+                    <Switch checked={draft.tools[t.key]} onCheckedChange={v => update({ tools: { ...draft.tools, [t.key]: v } })} aria-label={`Planejar permissão: ${t.label}`} />
+                  </label>
+                );
+              })}
             </div>
             <div className="field">
               <span>Orçamento de tokens por execução (limite do Setor IA)</span>

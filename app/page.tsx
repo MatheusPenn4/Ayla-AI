@@ -9,6 +9,7 @@ import { AgentSheet } from "@/components/office/panels/agent-sheet";
 import { DemandDialog } from "@/components/office/panels/demand-dialog";
 import { HireDialog } from "@/components/office/panels/hire-dialog";
 import { CharacterCard, Roster } from "@/components/office/panels/roster";
+import { DeveloperHandoffDialog } from "@/components/office/panels/developer-handoff-dialog";
 import { HandoffDialog } from "@/components/office/panels/handoff-dialog";
 import { RunDialog } from "@/components/office/panels/run-dialog";
 import { DemandQueue, TeamScreen } from "@/components/office/panels/screens";
@@ -47,8 +48,9 @@ export default function Home() {
   const { agents, demands } = office;
   const runs = useRuns(demands, office.hydrated);
   const [runId, setRunId] = useState<string | null>(null);
-  // Prepared hand-off being reviewed (status awaiting_approval).
+  // Prepared hand-off being reviewed (status awaiting_approval): Architect or Developer, kept apart.
   const [handoffId, setHandoffId] = useState<string | null>(null);
+  const [devHandoffId, setDevHandoffId] = useState<string | null>(null);
   const vw = useViewport();
   const [screen, setScreen] = useState<Screen>("office");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -89,10 +91,21 @@ export default function Home() {
     if (r.ok) toast.success("Planejamento enviado ao executor local.", { action: { label: "Ver", onClick: () => setRunId(r.run.id) } });
     else toast.error(r.error);
   };
-  const openReview = (id: string) => { setRunId(null); setHandoffId(id); };
+  // Which review dialog to open depends on the run's kind (Architect vs. Developer).
+  const openReview = (id: string) => {
+    setRunId(null);
+    const kind = runs.runs.find(r => r.id === id)?.kind;
+    if (kind === "developer_task") setDevHandoffId(id); else setHandoffId(id);
+  };
   const handoff = async (planRunId: string, taskId: string, followUp?: HandoffFollowUp) => {
     const r = await runs.prepareHandoff(planRunId, taskId, agents, followUp);
-    if (r.ok) openReview(r.run.id);
+    // Known kind at this call site: set it directly (runs.runs may not have re-rendered with the new row yet).
+    if (r.ok) { setRunId(null); setHandoffId(r.run.id); }
+    else toast.error(r.error, { duration: 9000 });
+  };
+  const handoffDeveloper = async (planRunId: string, taskId: string) => {
+    const r = await runs.prepareDeveloperHandoff(planRunId, taskId, agents);
+    if (r.ok) { setRunId(null); setDevHandoffId(r.run.id); }
     else toast.error(r.error, { duration: 9000 });
   };
   const replan = async (run: RunDetail, answers?: { question: string; answer: string }[]) => {
@@ -285,11 +298,17 @@ export default function Home() {
         runId={runId} agents={agents} runs={runs} onClose={() => setRunId(null)} onOpenRun={setRunId}
         onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)}
         onHandoff={(planRunId, taskId, followUp) => void handoff(planRunId, taskId, followUp)} onReview={openReview}
+        onHandoffDeveloper={(planRunId, taskId) => void handoffDeveloper(planRunId, taskId)}
+        onReviewDeveloper={id => { setRunId(null); setDevHandoffId(id); }}
         onAnswerArchitect={(run, followUp) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { ...followUp, previousRunId: run.id }); }}
       />
       <HandoffDialog
         runId={handoffId} agents={agents} runs={runs} onClose={() => setHandoffId(null)}
         onApproved={id => { setHandoffId(null); setRunId(id); toast.success("Envio confirmado. O Arquiteto entrou na fila do executor local."); }}
+      />
+      <DeveloperHandoffDialog
+        runId={devHandoffId} agents={agents} runs={runs} onClose={() => setDevHandoffId(null)}
+        onApproved={id => { setDevHandoffId(null); setRunId(id); toast.success("Envio confirmado. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora."); }}
       />
       <Toaster position="top-center" offset={78} theme="dark" toastOptions={{ className: "game-toast" }} />
     </div>

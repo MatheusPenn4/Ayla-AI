@@ -14,10 +14,16 @@ export type AgentCall = {
   effort: string;
   timeoutMs: number;
   signal?: AbortSignal;
-  /** Empty working directory owned by this call (no project files). */
+  /** Working directory owned by this call: empty for "read_only", the Developer's isolated copy for "developer_write". */
   workDir: string;
   /** Progress reported by the client while it runs (streaming clients only). */
   onProgress?: (p: AgentProgress) => void;
+  /**
+   * Capability profile enforced by client flags (never by the prompt alone).
+   * "read_only" (default): no tools at all — the Architect's profile.
+   * "developer_write": Read/Edit/Write/Glob/Grep confined to workDir, no Bash/PowerShell/network/MCP/hooks.
+   */
+  mode?: "read_only" | "developer_write";
 };
 
 export type AgentProgress = { kind: "started" | "api_retry" | "model_output" | "turn" | "client_error"; message: string; data?: unknown };

@@ -82,6 +82,9 @@ export const engineApi = {
   sourceOptions: (planRunId: string, taskId: string) => call<SourceOptions>(`/api/handoffs/source-options?plan=${planRunId}&task=${encodeURIComponent(taskId)}`),
   /** Preview of a future Developer hand-off (a view: no run, no model call, no write access). */
   developerPreview: (planRunId: string, taskId: string) => call<{ preview: DeveloperPreview }>(`/api/developer-preview?plan=${planRunId}&task=${encodeURIComponent(taskId)}`),
-  /** Hand-off step 2: the user's confirmation of exactly that content. */
+  /** Developer hand-off step 1: freezes the review. No working copy is built and no model is called here. */
+  prepareDeveloperHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; source?: { commit: string }; revisionReason?: string }) =>
+    call<{ run: RunDetail; created: boolean }>("/api/developer-handoffs", { method: "POST", body: JSON.stringify(req) }),
+  /** Hand-off step 2: the user's confirmation of exactly that content (Architect or Developer). */
   approve: (id: string, snapshotHash: string) => call<{ run: RunRecord; approved: boolean }>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify({ snapshotHash }) }),
 };

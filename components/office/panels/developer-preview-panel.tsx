@@ -1,18 +1,28 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Download, Loader2, Lock, X } from "lucide-react";
+import { Download, Loader2, Lock, Send, X } from "lucide-react";
+import type { useRuns } from "@/hooks/use-runs";
 import { EngineApiError, engineApi } from "@/lib/engine/client";
 import { developerPreviewMarkdown, type DeveloperPreview } from "@/lib/engine/developer-preview";
+import type { Agent } from "@/lib/office/types";
 import { TaskStateBadge } from "./run-dialog";
 
+type RunsApi = ReturnType<typeof useRuns>;
+
 /**
- * Preview of a FUTURE hand-off to the Developer. A view of the executor's records only:
- * it creates no run, calls no model and grants no write access.
+ * Preview of a FUTURE hand-off to the Developer, plus (when eligible) the real "Enviar ao Desenvolvedor"
+ * button. Building the preview itself is a view of the executor's records only: it creates no run, calls
+ * no model and grants no write access. Preparing the actual hand-off freezes a review for your
+ * confirmation — it does not build a working copy or call a model either (see docs/executor-local.md).
  */
-export function DeveloperPreviewPanel({ planRunId, taskId, onOpenRun, onClose }: { planRunId: string; taskId: string; onOpenRun: (id: string) => void; onClose: () => void }) {
+export function DeveloperPreviewPanel({ planRunId, taskId, agents, runs, onOpenRun, onReview, onClose }: {
+  planRunId: string; taskId: string; agents: Agent[]; runs: RunsApi; onOpenRun: (id: string) => void; onReview: (handoffRunId: string) => void; onClose: () => void;
+}) {
   const [p, setP] = useState<DeveloperPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const sending = runs.pending.has(`${planRunId}:${taskId}`);
   useEffect(() => {
     let live = true;
     engineApi.developerPreview(planRunId, taskId)
@@ -31,6 +41,12 @@ export function DeveloperPreviewPanel({ planRunId, taskId, onOpenRun, onClose }:
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const send = async () => {
+    setSendError(null);
+    const r = await runs.prepareDeveloperHandoff(planRunId, taskId, agents);
+    if (r.ok) onReview(r.run.id); else setSendError(r.error);
+  };
+
   if (error) return <div className="dev-preview"><p className="form-error">{error}</p><button className="btn-ghost small" onClick={onClose}>Fechar</button></div>;
   if (!p) return <div className="dev-preview"><Loader2 size={14} className="spin" /> Montando a prévia a partir dos registros (nada é executado)…</div>;
   return (
@@ -38,6 +54,15 @@ export function DeveloperPreviewPanel({ planRunId, taskId, onOpenRun, onClose }:
       <div className="send-head"><b>Prévia do envio ao Desenvolvedor · {p.task.id}</b><button className="icon-btn" onClick={onClose} aria-label="Fechar prévia"><X size={14} /></button></div>
       <div className="notice lock"><Lock size={14} /><div>{p.notice.map((n, i) => <p key={i}>{n}</p>)}</div></div>
       <p><b>Apta para revisão:</b> {p.eligible ? "sim — todas as dependências têm análise concluída do Arquiteto." : `não — ${p.blockers.join("; ")}.`}</p>
+      {p.eligible && (
+        <div className="task-actions">
+          <button className="btn-primary small" disabled={sending || !runs.status?.executionEnabled} onClick={() => void send()}>
+            {sending ? <><Loader2 size={13} className="spin" /> Preparando…</> : <><Send size={13} /> Enviar ao Desenvolvedor</>}
+          </button>
+          <span className="run-hint">Só congela a revisão; a cópia de trabalho é montada apenas se você confirmar.</span>
+        </div>
+      )}
+      {sendError && <p className="form-error" role="alert">{sendError}</p>}
 
       <section className="run-sec"><h4>Tarefas relevantes (estado real no executor)</h4>
         <table className="ctx-table"><thead><tr><th>Tarefa</th><th>Responsável</th><th>Relação</th><th>Estado</th></tr></thead>
@@ -73,7 +98,7 @@ export function DeveloperPreviewPanel({ planRunId, taskId, onOpenRun, onClose }:
         <small>Fora do escopo desta tarefa:</small><ul>{p.outOfScope.map((o, i) => <li key={i}>{o}</li>)}</ul>
       </section>
 
-      <section className="run-sec limits"><h4>O que uma futura execução do Desenvolvedor exigiria (não implementado)</h4><ul>{p.future.map((f, i) => <li key={i}>{f}</li>)}</ul></section>
+      <section className="run-sec limits"><h4>O que já está implementado e o que ainda falta</h4><ul>{p.future.map((f, i) => <li key={i}>{f}</li>)}</ul></section>
       <div className="task-actions"><button className="btn-secondary small" onClick={download}><Download size={13} /> Baixar prévia (.md)</button><span className="run-hint">Cópia desta visualização, gerada dos mesmos dados.</span></div>
     </div>
   );

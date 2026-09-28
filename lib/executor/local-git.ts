@@ -94,6 +94,21 @@ export async function compareLocalCommits(
   };
 }
 
+/** Bare file listing of a commit (paths, sizes, blob ids), no content — for review screens and scope checks. */
+export async function listTreeEntries(dir: string, commit: string, deps: GitDeps): Promise<TreeEntry[]> {
+  if (!/^[0-9a-f]{40}$/.test(commit)) throw new GithubError("invalid_repo", "Commit local inválido (use o hash completo de 40 caracteres).");
+  const g = resolveGit(deps);
+  if (!g) throw new GithubError("github_unavailable", "Git não encontrado neste computador.");
+  const tree = await git(deps, g, dir, ["ls-tree", "-r", "-l", "--full-tree", commit], 8_000_000);
+  if (tree.code !== 0) throw new GithubError("github_unavailable", "Não foi possível listar os arquivos do commit local.");
+  const entries: TreeEntry[] = [];
+  for (const line of tree.stdout.split(/\r?\n/)) {
+    const m = /^\d+ (blob|tree|commit) ([0-9a-f]{40})\s+(-|\d+)\t(.+)$/.exec(line);
+    if (m) entries.push({ path: m[4], type: m[1], size: m[3] === "-" ? 0 : Number(m[3]), blob: m[2] });
+  }
+  return entries;
+}
+
 /** Reads a commit of an authorized clone with the same selection and limits as the GitHub reader. */
 export async function readLocalGitContext(
   opts: {

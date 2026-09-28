@@ -24,22 +24,42 @@ const MODEL_RE = /^[A-Za-z0-9._\-[\]]{1,80}$/;
 const EFFORT_RE = /^[a-z]{2,12}$/;
 
 export function claudeArgs(c: AgentCall, systemFile: string): string[] {
-  const args = [
+  const shared = [
     // stream-json + verbose: one JSON event per line while it runs (progress, API retries, per-message usage);
     // the last line is the same "result" object the json format prints.
     "-p", "--output-format", "stream-json", "--verbose",
     "--json-schema", JSON.stringify(c.schema),
     "--system-prompt-file", systemFile,
-    "--tools", "",
     "--strict-mcp-config",
     "--setting-sources", "",
-    "--safe-mode",
     "--disable-slash-commands",
     "--no-session-persistence",
-    // Second layer: even if a tool appeared, anything that would need permission is denied.
-    "--permission-mode", "dontAsk",
-    "--disallowedTools", "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch,WebSearch",
   ];
+  const args = c.mode === "developer_write"
+    ? [
+        ...shared,
+        // Real, client-enforced confinement (verified against `claude --help`, not assumed): --restricted removes
+        // Bash/PowerShell/REPL/other code-running tools and WebFetch unless --tools names them, confines the file
+        // tools (Read/Edit/Write/Glob/Grep) to the working directory (no --add-dir is passed), ignores user/project/
+        // local settings (so no hooks or CLAUDE.md auto-injection reach this run), and refuses bypassPermissions —
+        // settings/git/tool-configuration writes need a person or handler, which headless mode has none of, so they
+        // are denied automatically. --disallowedTools is a second, explicit layer on top of --restricted.
+        "--restricted",
+        "--allowedTools", "Read", "Edit", "Write", "Glob", "Grep",
+        "--disallowedTools", "Bash", "PowerShell", "NotebookEdit", "WebFetch", "WebSearch", "Task",
+        "--permission-mode", "acceptEdits",
+        "--permission-prompts", "none",
+        // Extra layer on top of --restricted: no CLAUDE.md/skills/plugins/hooks/MCP/custom commands.
+        "--safe-mode",
+      ]
+    : [
+        ...shared,
+        "--tools", "",
+        "--safe-mode",
+        // Second layer: even if a tool appeared, anything that would need permission is denied.
+        "--permission-mode", "dontAsk",
+        "--disallowedTools", "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch,WebSearch",
+      ];
   if (c.model) { if (!MODEL_RE.test(c.model)) throw new AgentError("model_unavailable", "Nome de modelo inválido na ficha.", false); args.push("--model", c.model); }
   if (c.effort) { if (!EFFORT_RE.test(c.effort)) throw new AgentError("client_error", "Nível de esforço inválido na ficha.", false); args.push("--effort", c.effort); }
   return args;

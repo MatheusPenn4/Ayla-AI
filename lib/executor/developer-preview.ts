@@ -139,10 +139,12 @@ export async function developerPreview(q: { directorRunId: string; taskId: strin
       "Publicar, fazer push, abrir pull request ou deploy.",
     ],
     future: [
-      "Revisão e aprovação explícitas suas, como no envio ao Arquiteto, com o commit de base escolhido por você.",
-      "Cópia de trabalho isolada no commit de base, em pasta temporária do executor, sem credencial de push; a sua pasta não é alterada.",
-      "Permissão de escrita restrita a essa cópia e a um conjunto fechado de comandos de verificação, com limite de tempo e de saída.",
-      "Resultado entregue como diff e saída real dos comandos, para o QA; nada é mesclado ou publicado sem outra aprovação sua.",
+      "Implementado: revisão e aprovação explícitas, como no envio ao Arquiteto, com o commit de base escolhido por você — use “Preparar envio ao Desenvolvedor” quando a tarefa estiver apta.",
+      "Implementado: cópia de trabalho isolada no commit de base (git archive), montada só após sua confirmação, sem credencial de push; sua pasta não é alterada.",
+      "Implementado: permissão de escrita restrita a essa cópia e aos caminhos aprovados (Claude Code em --restricted), com limite de tempo e uma tentativa de correção.",
+      "Implementado: resultado entregue como diff real da cópia (calculado pelo executor, não só relatado pelo modelo) e lista de arquivos tocados.",
+      "Ainda não implementado: comandos de verificação (tipos, lint, testes, build) — sem ferramenta de terminal nesta versão, por falta de um isolamento de rede comprovado e por a cópia não ter node_modules.",
+      "Ainda não implementado: envio ao QA e aplicação ao projeto original; isso depende de uma aprovação separada sua, numa etapa futura.",
     ],
   };
 }

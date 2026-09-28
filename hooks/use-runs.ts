@@ -71,12 +71,13 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     prevActive.current = anyActive;
   }, [anyActive, refreshStatus]);
 
-  // Director plans of a demand (the queue card) and hand-offs of a plan's tasks are kept apart.
-  const latestFor = useCallback((demandId: string) => runs.find(r => r.demandId === demandId && r.kind !== "architect_task") ?? null, [runs]);
-  const historyFor = useCallback((demandId: string) => runs.filter(r => r.demandId === demandId && r.kind !== "architect_task"), [runs]);
-  /** Hand-offs of one task of a plan, newest first. */
-  const taskRunsFor = useCallback((planRunId: string, taskId: string) => runs.filter(r => r.kind === "architect_task" && r.parentRunId === planRunId && r.taskId === taskId), [runs]);
-  const handoffsOf = useCallback((planRunId: string) => runs.filter(r => r.kind === "architect_task" && r.parentRunId === planRunId), [runs]);
+  const isHandoff = (r: RunRecord) => r.kind === "architect_task" || r.kind === "developer_task";
+  // Director plans of a demand (the queue card) and hand-offs of a plan's tasks (Architect or Developer) are kept apart.
+  const latestFor = useCallback((demandId: string) => runs.find(r => r.demandId === demandId && !isHandoff(r)) ?? null, [runs]);
+  const historyFor = useCallback((demandId: string) => runs.filter(r => r.demandId === demandId && !isHandoff(r)), [runs]);
+  /** Hand-offs of one task of a plan, newest first (Architect or Developer — a task has exactly one assignee). */
+  const taskRunsFor = useCallback((planRunId: string, taskId: string) => runs.filter(r => isHandoff(r) && r.parentRunId === planRunId && r.taskId === taskId), [runs]);
+  const handoffsOf = useCallback((planRunId: string) => runs.filter(r => isHandoff(r) && r.parentRunId === planRunId), [runs]);
 
   const start = useCallback(async (demand: Demand, agents: Agent[], followUp?: { previousRunId: string; answers: { question: string; answer: string }[] }) => {
     if (keys.current.has(demand.id)) return { ok: false as const, error: "Já existe um pedido em andamento para esta demanda." };
@@ -122,6 +123,30 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     }
   }, []);
 
+  /**
+   * “Enviar ao Desenvolvedor”: asks the executor to prepare (validate + freeze) the hand-off.
+   * Builds no working copy and calls no model — that only happens after approve().
+   */
+  const preparingDev = useRef(new Set<string>());
+  const prepareDeveloperHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], opts?: { source?: { commit: string }; revisionReason?: string }) => {
+    const key = `${planRunId}:${taskId}`;
+    if (preparingDev.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
+    const developer = agents.find(a => a.id === "developer");
+    if (!developer) return { ok: false as const, error: "O Desenvolvedor não está na equipe." };
+    preparingDev.current.add(key);
+    setPending(s => new Set(s).add(key));
+    try {
+      const { run } = await engineApi.prepareDeveloperHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(developer, agents), ...(opts ?? {}) });
+      setRuns(list => [run, ...list.filter(r => r.id !== run.id)]);
+      return { ok: true as const, run };
+    } catch (e) {
+      return { ok: false as const, error: message(e, "Falha ao preparar o envio ao Desenvolvedor.") };
+    } finally {
+      preparingDev.current.delete(key);
+      setPending(s => { const n = new Set(s); n.delete(key); return n; });
+    }
+  }, []);
+
   const approving = useRef(new Set<string>());
   const approve = useCallback(async (runId: string, snapshotHash: string) => {
     if (approving.current.has(runId)) return { ok: false as const, error: "Confirmação já enviada." };
@@ -141,5 +166,5 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     try { const { run } = await engineApi.cancel(runId); setRuns(list => list.map(r => (r.id === run.id ? run : r))); } catch { /* shown on next refresh */ }
   }, []);
 
-  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, approve, cancel, refresh, refreshStatus, verify, probe };
+  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, approve, cancel, refresh, refreshStatus, verify, probe };
 }

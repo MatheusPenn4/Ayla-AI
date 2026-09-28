@@ -72,8 +72,8 @@ const ADDED_COLUMNS: [string, string][] = [
 const INDEXES = [
   // At most one active Director plan per demand (no duplicate runs on double click / refresh).
   `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_plan ON director_runs (demand_id) WHERE kind = 'director_plan' AND status IN ('queued', 'planning')`,
-  // At most one pending/active hand-off per task of a plan.
-  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind = 'architect_task' AND status IN ('awaiting_approval', 'queued', 'planning')`,
+  // At most one pending/active hand-off per task of a plan, whether to the Architect or the Developer.
+  `CREATE UNIQUE INDEX IF NOT EXISTS runs_one_active_task ON director_runs (parent_run_id, task_id) WHERE kind IN ('architect_task', 'developer_task') AND status IN ('awaiting_approval', 'queued', 'planning')`,
   `CREATE INDEX IF NOT EXISTS runs_by_parent ON director_runs (parent_run_id, task_id, created_at)`,
 ];
 
@@ -84,7 +84,7 @@ const parse = <T>(v: unknown): T | null => (typeof v === "string" && v ? (JSON.p
 const nowIso = () => new Date().toISOString();
 
 function toRecord(r: Row): RunRecord {
-  const kind = (r.kind === "architect_task" ? "architect_task" : "director_plan") as RunRecord["kind"];
+  const kind = ((r.kind === "architect_task" || r.kind === "developer_task") ? r.kind : "director_plan") as RunRecord["kind"];
   return {
     id: String(r.id), kind, demandId: String(r.demand_id), agentId: String(r.agent_id), status: r.status as RunStatus,
     parentRunId: (r.parent_run_id as string) ?? null, taskId: (r.task_id as string) ?? null,
@@ -95,6 +95,7 @@ function toRecord(r: Row): RunRecord {
     budget: parse<RunBudget>(r.budget_json)!, context: parse<SourceContext>(r.context_json),
     result: kind === "director_plan" ? parse<RunRecord["result"]>(r.result_json) : null,
     analysis: kind === "architect_task" ? parse<RunRecord["analysis"]>(r.result_json) : null,
+    developer: kind === "developer_task" ? parse<RunRecord["developer"]>(r.result_json) : null,
     error: parse<RunError>(r.error_json),
     previousRunId: (r.previous_run_id as string) ?? null,
   };
@@ -114,7 +115,7 @@ export type NewRun = {
 
 export type RunPatch = Partial<{
   status: RunStatus; startedAt: string | null; finishedAt: string | null; leaseUntil: string | null; attempt: number;
-  prompt: RunDetail["prompt"]; context: SourceContext | null; result: RunRecord["result"] | RunRecord["analysis"]; error: RunError | null; budget: RunBudget; rawOutput: string | null;
+  prompt: RunDetail["prompt"]; context: SourceContext | null; result: RunRecord["result"] | RunRecord["analysis"] | RunRecord["developer"]; error: RunError | null; budget: RunBudget; rawOutput: string | null;
 }>;
 
 const COLUMN: Record<keyof RunPatch, [string, (v: unknown) => unknown]> = {
@@ -160,6 +161,8 @@ export class RunStore {
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
     for (const [c, def] of ADDED_COLUMNS) if (!cols.some(x => x.name === c)) await this.db.exec(`ALTER TABLE director_runs ADD COLUMN ${c} ${def}`);
     await this.db.exec(`DROP INDEX IF EXISTS director_runs_one_active`);
+    // Recreated every boot: an existing database may still have the pre-Developer definition (architect_task only).
+    await this.db.exec(`DROP INDEX IF EXISTS runs_one_active_task`);
     for (const s of INDEXES) await this.db.exec(s);
     await this.db.run(`INSERT INTO ayla_meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [String(SCHEMA_VERSION)]);
   }
@@ -173,7 +176,7 @@ export class RunStore {
     const kind = input.kind ?? "director_plan";
     const byKey = await this.db.all(`SELECT * FROM director_runs WHERE idempotency_key = ?`, [input.idempotencyKey]);
     if (byKey[0]) return { run: toRecord(byKey[0]), created: false };
-    const openRun = () => (kind === "architect_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
+    const openRun = () => (kind === "architect_task" || kind === "developer_task" ? this.openForTask(input.parentRunId ?? "", input.taskId ?? "") : this.activeForDemand(input.demandId));
     const active = await openRun();
     if (active) return { run: active, created: false };
     const t = nowIso();
@@ -193,26 +196,31 @@ export class RunStore {
     }
     await this.event(input.id, "created", kind === "architect_task"
       ? "Encaminhamento preparado para o Arquiteto. Nada será executado antes da sua confirmação."
-      : "Execução criada e colocada na fila do executor local.");
+      : kind === "developer_task"
+        ? "Encaminhamento preparado para o Desenvolvedor. Nenhuma cópia de trabalho foi criada e nada será executado antes da sua confirmação."
+        : "Execução criada e colocada na fila do executor local.");
     return { run: (await this.get(input.id))!, created: true };
   }
 
-  /** Hand-off of a task that is waiting for approval, queued or running. */
+  /**
+   * Hand-off of a task that is waiting for approval, queued or running (Architect or Developer — a task
+   * has exactly one assignee, so parent_run_id + task_id alone identify its hand-offs without a kind filter).
+   */
   async openForTask(parentRunId: string, taskId: string) {
     await this.ensureSchema();
-    const rows = await this.db.all(`SELECT * FROM director_runs WHERE kind = 'architect_task' AND parent_run_id = ? AND task_id = ? AND status IN ${TASK_OPEN} LIMIT 1`, [parentRunId, taskId]);
+    const rows = await this.db.all(`SELECT * FROM director_runs WHERE parent_run_id = ? AND task_id = ? AND status IN ${TASK_OPEN} LIMIT 1`, [parentRunId, taskId]);
     return rows[0] ? toRecord(rows[0]) : null;
   }
 
-  /** Every hand-off of a task, newest first. */
+  /** Every hand-off of a task, newest first (Architect or Developer). */
   async runsForTask(parentRunId: string, taskId: string) {
     await this.ensureSchema();
-    return (await this.db.all(`SELECT * FROM director_runs WHERE kind = 'architect_task' AND parent_run_id = ? AND task_id = ? ORDER BY created_at DESC`, [parentRunId, taskId])).map(toRecord);
+    return (await this.db.all(`SELECT * FROM director_runs WHERE parent_run_id = ? AND task_id = ? ORDER BY created_at DESC`, [parentRunId, taskId])).map(toRecord);
   }
 
   /** The user's confirmation: awaiting_approval → queued, atomically (a repeated click changes nothing). */
   async approve(id: string) {
-    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind = 'architect_task' AND status = 'awaiting_approval'`, [nowIso(), id]);
+    const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind IN ('architect_task', 'developer_task') AND status = 'awaiting_approval'`, [nowIso(), id]);
     return changes === 1;
   }
 

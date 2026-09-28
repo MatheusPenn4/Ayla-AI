@@ -9,6 +9,7 @@ import { claudeAdapter } from "./adapters/claude";
 import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
 import { detect, LOGIN_STEPS, resolveClient, type ClientDeps } from "./clients";
+import { DeveloperHandoffZ, prepareDeveloperHandoff } from "./developer";
 import { developerPreview } from "./developer-preview";
 import { HandoffRefused, HandoffZ, prepareHandoff, sourceOptions } from "./handoff";
 import { listLocalRepos } from "./local-git";
@@ -51,6 +52,18 @@ export type Reply = { status: number; body: unknown };
 export const READ_ONLY: Record<ConnectionId, { safe: boolean; how: string }> = {
   claude_code: { safe: true, how: "Claude Code sem nenhuma ferramenta (--tools \"\"), permissões negadas (--permission-mode dontAsk, --disallowedTools), sem MCP, sem personalizações e em pasta vazia." },
   codex: { safe: true, how: "Codex CLI em sandbox somente leitura (--sandbox read-only, approval_policy never), shell e ferramentas extras desligadas, sem busca na web e em pasta vazia." },
+};
+
+/**
+ * Write confinement required before the Developer may use a connection. Unlike READ_ONLY, granting real
+ * Edit/Write; must be backed by a client mechanism this Setor IA has actually read the documentation of
+ * and can name here (see adapters/claude.ts, mode "developer_write"). Codex is left unverified in this
+ * version: its workspace-write sandbox's network policy has not been confirmed on this system, so it is
+ * blocked for the Developer rather than assumed safe.
+ */
+export const WRITE_RESTRICTED: Record<ConnectionId, { safe: boolean; how: string }> = {
+  claude_code: { safe: true, how: "Claude Code em --restricted: remove Bash/PowerShell/REPL e WebFetch (não nomeados em --allowedTools), confina Read/Edit/Write/Glob/Grep à cópia de trabalho isolada (sem --add-dir), ignora configurações de usuário/projeto/local (sem hooks nem CLAUDE.md automático) e recusa bypassPermissions; --disallowedTools nega Bash/PowerShell/NotebookEdit/WebFetch/WebSearch/Task como segunda camada." },
+  codex: { safe: false, how: "Bloqueado nesta versão: a política de rede do sandbox workspace-write do Codex CLI não foi verificada neste ambiente. Use Claude Code na ficha do Desenvolvedor." },
 };
 const err = (status: number, code: string, message: string, details?: string[]): Reply => ({ status, body: { error: { code, message, ...(details ? { details } : {}) } } });
 
@@ -232,18 +245,43 @@ export class ExecutorService {
     catch (e) { if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details); throw e; }
   }
 
-  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). */
+  // ---- hand-off to the Developer ------------------------------------------
+
+  /**
+   * Step 1: validate against the executor's own records and freeze what will be sent. Nothing is built or
+   * called — the isolated working copy is only materialized inside execute(), and only after approval.
+   */
+  async prepareDeveloper(body: unknown): Promise<Reply> {
+    const parsed = DeveloperHandoffZ.safeParse(body);
+    if (!parsed.success) return err(400, "invalid_request", "Dados do encaminhamento inválidos.", parsed.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`));
+    const req = parsed.data;
+    if (req.agent.connection !== "none" && !WRITE_RESTRICTED[req.agent.connection].safe) {
+      return err(409, "adapter_not_write_restricted", "Esta conexão não tem isolamento de escrita comprovado e está bloqueada para o Desenvolvedor. Escolha Claude Code na ficha dele.");
+    }
+    if ((await this.store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
+      return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
+    }
+    try {
+      const { run, created } = await prepareDeveloperHandoff(req, this.handoffDeps(), { callTimeoutMs: this.cfg.limits.callTimeoutMs });
+      return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
+    } catch (e) {
+      if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
+      throw e;
+    }
+  }
+
+  /** Step 2: the user's confirmation of the exact prepared content (identified by its hash). Architect or Developer. */
   async approve(id: string, body: unknown): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
     const hash = (body as { snapshotHash?: unknown } | null)?.snapshotHash;
     const run = await this.store.get(id);
-    if (!run || run.kind !== "architect_task") return err(404, "not_found", "Encaminhamento não encontrado.");
+    if (!run || (run.kind !== "architect_task" && run.kind !== "developer_task")) return err(404, "not_found", "Encaminhamento não encontrado.");
     if (run.status !== "awaiting_approval") return { status: 200, body: { run, approved: false } };
     if (typeof hash !== "string" || hash !== run.snapshotHash) return err(409, "content_changed", "O conteúdo confirmado não corresponde ao encaminhamento preparado. Abra a revisão de novo.");
     const parent = run.parentRunId ? await this.store.get(run.parentRunId) : null;
     if (!parent || parent.status !== "plan_ready") return err(409, "plan_not_ready", "O plano do Diretor desta tarefa não está mais disponível.");
     if (!(await this.store.approve(id))) return { status: 200, body: { run: await this.store.get(id), approved: false } };
-    await this.store.event(id, "approved", "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
+    await this.store.event(id, "approved", run.kind === "developer_task" ? "Envio confirmado por você. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora." : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
     this.enqueue(id);
     return { status: 202, body: { run: await this.store.get(id), approved: true } };
   }
@@ -274,6 +312,7 @@ export class ExecutorService {
       adapter: this.adapterFor(conn),
       limits: { callTimeoutMs: this.cfg.limits.callTimeoutMs, leaseMs: this.cfg.limits.leaseMs },
       github: { ...this.cfg.github, permitted: (snap as DirectorSnapshot).director?.tools.github !== false },
+      local: this.cfg.localRepos?.length ? { dirs: this.cfg.localRepos, git: this.gitDeps() } : undefined,
       workRoot: this.cfg.workRoot,
       signal: ac.signal,
     });

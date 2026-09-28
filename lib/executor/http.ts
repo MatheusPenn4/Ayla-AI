@@ -82,6 +82,7 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "POST" && p === "/v1/handoffs") return await service.prepare(await readJson(req));
     if (m === "GET" && p === "/v1/handoffs/source-options") return await service.sourceOptions(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");
     if (m === "GET" && p === "/v1/developer-preview") return await service.developerPreview(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");
+    if (m === "POST" && p === "/v1/developer-handoffs") return await service.prepareDeveloper(await readJson(req));
     return { status: 404, body: { error: { code: "not_found", message: "Rota inexistente." } } };
   } catch (e) {
     const status = (e as { status?: number }).status ?? 500;

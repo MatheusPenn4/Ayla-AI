@@ -12,10 +12,11 @@ import { ComparisonTable, SendForm } from "./send-form";
 import { UsagePanel } from "./usage-panel";
 import { engineApi, type HandoffFollowUp } from "@/lib/engine/client";
 import { ANALYSIS_JSON_SCHEMA } from "@/lib/engine/analysis-schema";
+import { DEVELOPER_JSON_SCHEMA } from "@/lib/engine/developer-schema";
 import { PLAN_JSON_SCHEMA } from "@/lib/engine/plan-schema";
 import { connectionLabel } from "@/lib/engine/connections";
-import { TASK_STATE_LABEL, developerBlocker, handoffBlocker, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
-import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DirectorSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
+import { TASK_STATE_LABEL, developerBlocker, handoffBlocker, isExecutableAssignee, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
+import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
 
 type RunsApi = ReturnType<typeof useRuns>;
@@ -45,7 +46,11 @@ type DialogProps = {
   onCancel: (runId: string) => void;
   /** “Enviar ao Arquiteto” on a task of a Director plan (prepares the hand-off and opens the review). */
   onHandoff: (planRunId: string, taskId: string, followUp?: HandoffFollowUp) => void;
-  /** Reopens the review of a prepared hand-off. */
+  /** “Enviar ao Desenvolvedor” on a task of a Director plan (prepares the hand-off and opens the review). */
+  onHandoffDeveloper: (planRunId: string, taskId: string) => void;
+  /** Opens the review of a just-prepared Developer hand-off (kind known at the call site, unlike onReview). */
+  onReviewDeveloper: (handoffRunId: string) => void;
+  /** Reopens the review of a prepared hand-off (Architect or Developer — resolved by the run's kind). */
   onReview: (handoffRunId: string) => void;
   /** Resolution of the Architect's questions (prepares a new hand-off for review). */
   onAnswerArchitect: (run: RunDetail, followUp: HandoffFollowUp) => void;
@@ -85,7 +90,9 @@ export function useRunDetail(runId: string | null) {
 function RunBody(props: DialogProps & { runId: string }) {
   const { run, error, active } = useRunDetail(props.runId);
   if (!run) return <div className="run-loading">{error ?? <><Loader2 size={16} className="spin" /> Carregando execução…</>}</div>;
-  return run.kind === "architect_task" ? <ArchitectBody {...props} run={run} active={active} /> : <DirectorBody {...props} run={run} active={active} />;
+  if (run.kind === "architect_task") return <ArchitectBody {...props} run={run} active={active} />;
+  if (run.kind === "developer_task") return <DeveloperBody {...props} run={run} active={active} />;
+  return <DirectorBody {...props} run={run} active={active} />;
 }
 
 function ErrorBox({ run }: { run: RunDetail }) {
@@ -153,7 +160,7 @@ function Meta({ run }: { run: RunDetail }) {
 
 // ---- Director plan ---------------------------------------------------------
 
-function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff, onReview, onOpenRun }: BodyProps) {
+function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff, onHandoffDeveloper, onReview, onReviewDeveloper, onOpenRun }: BodyProps) {
   const [tab, setTab] = useState("plan");
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const res = run.result;
@@ -213,7 +220,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
           </Tabs.Content>
 
           <Tabs.Content value="tasks" className="run-pane">
-            <p className="pane-intro">Propostas de delegação do Diretor. Nesta fase, somente tarefas do <b>Arquiteto</b> podem ser enviadas, uma de cada vez e só depois que você revisar e confirmar. Desenvolvedor, QA e Revisor não executam.</p>
+            <p className="pane-intro">Propostas de delegação do Diretor. Nesta fase, tarefas do <b>Arquiteto</b> (só leitura) e do <b>Desenvolvedor</b> (escrita numa cópia isolada) podem ser enviadas, uma de cada vez e só depois que você revisar e confirmar. QA e Revisor ainda não executam.</p>
             {res && run.status === "plan_ready" && !architectTasks.length && (
               <div className="notice">Nenhuma tarefa deste plano foi atribuída ao Arquiteto: não há encaminhamento arquitetural neste plano.</div>
             )}
@@ -252,17 +259,26 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                   {canSend && sendFor === t.id && run.status === "plan_ready" && (
                     <SendForm planRunId={run.id} taskId={t.id} sending={sending} disabled={!runs.status?.executionEnabled} onClose={() => setSendFor(null)} onSubmit={f => { setSendFor(null); onHandoff(run.id, t.id, f); }} />
                   )}
-                  {!isHandoffTarget(t.assignee) && <small className="muted">Proposta registrada. {name(t.assignee)} ainda não executa nesta fase; nada foi delegado.</small>}
+                  {!isExecutableAssignee(t.assignee) && <small className="muted">Proposta registrada. {name(t.assignee)} ainda não executa nesta fase; nada foi delegado.</small>}
                   {t.assignee === "developer" && run.status === "plan_ready" && (() => {
                     const devBlocker = developerBlocker(t, res.tasks, runsOf);
                     return (
                       <div className="task-actions">
-                        <button className="btn-secondary small" disabled={!!devBlocker || previewFor === t.id} title={devBlocker ?? undefined} onClick={() => setPreviewFor(t.id)}><FileText size={13} /> Ver prévia do envio ao Desenvolvedor</button>
-                        <span className="run-hint">{devBlocker ?? "Só visualização: não cria execução nem concede escrita."}</span>
+                        {canSend && (
+                          <button className="btn-primary small" disabled={!!devBlocker || sending || !runs.status?.executionEnabled} title={devBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffDeveloper(run.id, t.id)}>
+                            {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><Send size={13} /> {st.key === "proposed" ? "Enviar ao Desenvolvedor" : "Enviar ao Desenvolvedor novamente"}</>}
+                          </button>
+                        )}
+                        {st.key === "awaiting_approval" && st.run && <button className="btn-primary small" onClick={() => onReview(st.run!.id)}><ShieldCheck size={13} /> Revisar e confirmar envio</button>}
+                        {st.run && st.key !== "awaiting_approval" && <button className="btn-secondary small" onClick={() => onOpenRun(st.run!.id)}>{st.key === "implementation_ready" ? "Ver implementação" : st.key === "awaiting_clarification" ? "Ver dúvidas do Desenvolvedor" : "Ver execução do Desenvolvedor"}</button>}
+                        {(st.key === "queued" || st.key === "working") && st.run && <button className="btn-ghost small" onClick={() => onCancel(st.run!.id)}>Cancelar</button>}
+                        <button className="btn-secondary small" disabled={previewFor === t.id} onClick={() => setPreviewFor(t.id)}><FileText size={13} /> Ver prévia</button>
+                        {devBlocker && <span className="run-hint">{devBlocker}</span>}
+                        {tr.length > 1 && <span className="run-history">Histórico: {tr.map(r => <button key={r.id} className="chip" onClick={() => (r.status === "awaiting_approval" ? onReview(r.id) : onOpenRun(r.id))} title={time(r.createdAt)}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>}
                       </div>
                     );
                   })()}
-                  {previewFor === t.id && <DeveloperPreviewPanel planRunId={run.id} taskId={t.id} onOpenRun={onOpenRun} onClose={() => setPreviewFor(null)} />}
+                  {previewFor === t.id && <DeveloperPreviewPanel planRunId={run.id} taskId={t.id} agents={agents} runs={runs} onOpenRun={onOpenRun} onReview={id => { setPreviewFor(null); onReviewDeveloper(id); }} onClose={() => setPreviewFor(null)} />}
                 </article>
               );
             }) ?? <p className="muted">Sem tarefas.</p>}
@@ -433,6 +449,135 @@ function Coverage({ run }: { run: RunDetail }) {
         <li><b>Não examinado</b>: os outros {notExamined} arquivo(s) de texto do repositório foram enviados só pelo nome{ctx.skipped.length ? `; pedidos e não lidos: ${ctx.skipped.map(x => `${x.path} (${x.reason})`).join(", ")}` : ""}.</li>
       </ul>
     </section>
+  );
+}
+
+// ---- Developer implementation ----------------------------------------------
+
+function DiffTable({ files }: { files: { path: string; status: "added" | "modified" | "deleted"; additions: number | null; deletions: number | null; inScope: boolean }[] }) {
+  if (!files.length) return <p className="muted">Nenhum arquivo tocado.</p>;
+  return (
+    <table className="ctx-table"><thead><tr><th>Arquivo</th><th>Status</th><th>+/-</th><th>Escopo</th></tr></thead>
+      <tbody>{files.map((f, i) => (
+        <tr key={i} className={f.inScope ? "" : "cmp-row-new"}>
+          <td><FileText size={12} /> {f.path}</td>
+          <td>{f.status === "added" ? "criado" : f.status === "deleted" ? "removido" : "alterado"}</td>
+          <td>{f.additions ?? "—"}/{f.deletions ?? "—"}</td>
+          <td>{f.inScope ? "dentro do aprovado" : <b>FORA DO APROVADO</b>}</td>
+        </tr>
+      ))}</tbody>
+    </table>
+  );
+}
+
+function DeveloperBody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProps) {
+  const [tab, setTab] = useState("implementation");
+  const snap = run.snapshot as DeveloperSnapshot;
+  const d = run.developer;
+  const developer = agents.find(x => x.id === run.agentId);
+  const name = (id: string) => agents.find(x => x.id === id)?.name ?? snap.team.find(t => t.id === id)?.name ?? id;
+  const editable = snap.editScope.filter(e => e.action !== "consultar");
+  const consult = snap.editScope.filter(e => e.action === "consultar");
+
+  return (
+    <>
+      <DialogHeader>
+        <span className="eyebrow">DESENVOLVEDOR · TAREFA {snap.task.id} · EXECUÇÃO {run.id.slice(0, 8).toUpperCase()}</span>
+        <DialogTitle className="run-title">{snap.task.title}</DialogTitle>
+        <DialogDescription asChild>
+          <div>
+            <Meta run={run} />
+            <div className="run-origin">
+              {developer && <Avatar look={developer.look} color={developer.color} size={22} />}
+              <span>Demanda “{snap.demand.title}” · tarefa {snap.task.id}</span>
+              {run.parentRunId && <button className="btn-ghost small" onClick={() => onOpenRun(run.parentRunId!)}><ArrowLeft size={13} /> Ver plano do Diretor</button>}
+            </div>
+          </div>
+        </DialogDescription>
+      </DialogHeader>
+      {run.status === "awaiting_approval" && (
+        <div className="run-live">Envio preparado e aguardando sua aprovação. Nenhuma cópia de trabalho existe ainda.<button className="btn-primary small" onClick={() => onReview(run.id)}><ShieldCheck size={13} /> Revisar e confirmar</button></div>
+      )}
+      {active && (
+        <div className="run-live"><Loader2 size={15} className="spin" /> {run.status === "queued" ? "Na fila do executor local." : `Desenvolvedor trabalhando via ${connectionLabel(run.connection)} numa cópia isolada.`} Esta janela atualiza sozinha.
+          <button className="btn-ghost" onClick={() => onCancel(run.id)}>Cancelar</button>
+        </div>
+      )}
+      <ErrorBox run={run} />
+
+      <Tabs.Root value={tab} onValueChange={setTab} className="run-tabs">
+        <Tabs.List className="tab-list" aria-label="Detalhes da implementação">
+          <Tabs.Trigger value="implementation">Implementação</Tabs.Trigger>
+          <Tabs.Trigger value="diff">Diff {d?.diff?.files.length ? `(${d.diff.files.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="questions">Dúvidas {d?.questions.length ? `(${d.questions.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="task">Tarefa</Tabs.Trigger>
+          <Tabs.Trigger value="events">Eventos</Tabs.Trigger>
+          <Tabs.Trigger value="tokens">Tokens</Tabs.Trigger>
+          <Tabs.Trigger value="input">Entrada</Tabs.Trigger>
+        </Tabs.List>
+        <div className="dialog-scroll run-scroll">
+          <Tabs.Content value="implementation" className="run-pane">
+            {!d && <p className="pane-intro">{active ? "O relatório aparecerá aqui quando o Desenvolvedor terminar." : run.status === "awaiting_approval" ? "O Desenvolvedor ainda não foi acionado." : "Esta execução não produziu um relatório."}</p>}
+            {d && (
+              <>
+                {d.outcome === "needs_clarification" && <div className="notice">O Desenvolvedor não concluiu: ele precisa de respostas (aba Dúvidas).</div>}
+                {d.diff?.outOfScope.length ? <div className="run-error" role="alert"><AlertTriangle size={16} /><div><b>O diff real tocou arquivo(s) fora do escopo aprovado.</b><small>{d.diff.outOfScope.join(", ")}</small></div></div> : null}
+                <section className="run-sec"><h4>Resumo</h4><p>{d.summary || "—"}</p></section>
+                <section className="run-sec"><h4>Critérios de aceite</h4>
+                  {d.acceptance.length ? <table className="ctx-table"><thead><tr><th>Critério</th><th>Estado</th><th>Nota</th></tr></thead><tbody>{d.acceptance.map((c, i) => <tr key={i}><td>{c.criterion}</td><td><span className={`basis b-${c.status === "met" ? "read" : "inferred"}`}>{c.status === "met" ? "atendido" : c.status === "not_met" ? "não atendido" : "não verificado"}</span></td><td>{c.note}</td></tr>)}</tbody></table> : <p className="muted">—</p>}
+                </section>
+                <section className="run-sec"><h4>Arquivos relatados pelo Desenvolvedor</h4>{d.changes.length ? <ul>{d.changes.map((c, i) => <li key={i}><code>{c.path}</code> — {c.action === "created" ? "criado" : c.action === "deleted" ? "removido" : "alterado"}: {c.reason}</li>)}</ul> : <p className="muted">Nenhum.</p>}
+                  <small>Conferido pelo executor contra o diff real da cópia isolada (aba Diff), não aceito só porque o modelo relatou.</small>
+                </section>
+                <div className="run-cols">
+                  <section className="run-sec"><h4>Suposições</h4>{d.assumptions.length ? <ul>{d.assumptions.map((x, i) => <li key={i}>{x}</li>)}</ul> : <p className="muted">Nenhuma.</p>}</section>
+                  <section className="run-sec"><h4>Não verificado</h4>{d.not_verified.length ? <ul>{d.not_verified.map((x, i) => <li key={i}>{x}</li>)}</ul> : <p className="muted">—</p>}</section>
+                </div>
+                <section className="run-sec limits"><h4>Limitações desta execução</h4><ul>{d.limitations.map((r, i) => <li key={i}>{r}</li>)}</ul></section>
+                {run.status === "implementation_ready" && <p className="form-note">Implementação pronta na cópia isolada (já removida). Nada foi aplicado ao projeto original, commitado, publicado ou enviado ao QA a partir daqui.</p>}
+              </>
+            )}
+          </Tabs.Content>
+
+          <Tabs.Content value="diff" className="run-pane">
+            {!d?.diff && <p className="muted">Nenhum diff calculado ainda.</p>}
+            {d?.diff && (
+              <>
+                <p className="pane-intro">Calculado pelo executor (git diff dentro da cópia isolada), independente do que o modelo relatou. Commit de base: <code>{d.diff.baseCommit.slice(0, 12)}</code>.</p>
+                <DiffTable files={d.diff.files} />
+                <details className="raw"><summary>Ver o diff completo{d.diff.diffTruncated ? " (cortado por tamanho)" : ""}</summary><pre className="brief">{d.diff.diffText || "(vazio)"}</pre></details>
+              </>
+            )}
+          </Tabs.Content>
+
+          <Tabs.Content value="questions" className="run-pane">
+            {!d?.questions.length && <p className="muted">Nenhuma pergunta.</p>}
+            {!!d?.questions.length && (
+              <>
+                <p className="pane-intro">Perguntas registradas nesta execução. Responder a elas ainda não tem formulário dedicado nesta versão; prepare um novo envio manualmente se precisar prosseguir.</p>
+                {d.questions.map((q, i) => <div key={i} className="question"><b>{i + 1}. {q.question}</b><small>Por que bloqueia: {q.why_it_blocks || "—"}</small></div>)}
+              </>
+            )}
+          </Tabs.Content>
+
+          <Tabs.Content value="task" className="run-pane">
+            <section className="run-sec"><h4>Tarefa {snap.task.id}</h4>
+              <dl className="kv"><dt>Escopo</dt><dd>{snap.task.scope}</dd><dt>Insumos</dt><dd>{snap.task.inputs || "—"}</dd><dt>Entregável</dt><dd>{snap.task.deliverable}</dd><dt>Critérios</dt><dd><ul>{snap.task.acceptance_criteria.map((c, i) => <li key={i}>{c}</li>)}</ul></dd></dl>
+            </section>
+            <section className="run-sec"><h4>Commit de base</h4><p><code>{snap.base.commit}</code> · cópia local “{snap.base.dirName}” ({snap.base.owner}/{snap.base.repo}) · revisão {snap.revision.number}{snap.revision.changedCommit ? ` · motivo: ${snap.revision.reason}` : ""}</p></section>
+            <section className="run-sec"><h4>Escopo de edição aprovado</h4>
+              <ul>{editable.map(e => <li key={e.path}><code>{e.path}</code> — {e.action}</li>)}</ul>
+              {!!consult.length && <><small>Somente leitura:</small><ul className="ctx-skip">{consult.map(e => <li key={e.path}>{e.path}</li>)}</ul></>}
+            </section>
+            <section className="run-sec"><h4>Ferramentas nesta execução</h4><ul className="tool-grants">{snap.tools.map(t => <li key={t.label} className={t.allowed ? "ok" : "no"}><b>{t.label}: {t.allowed ? "permitida" : "bloqueada"}</b><small>{t.how}</small></li>)}</ul></section>
+            {!!snap.plan.dependents.length && <section className="run-sec"><h4>Quem usa este resultado</h4><ul>{snap.plan.dependents.map(dd => <li key={dd.id}>{dd.id} · {dd.title} → {name(dd.assignee)} (não acionado automaticamente)</li>)}</ul></section>}
+          </Tabs.Content>
+          <Tabs.Content value="events" className="run-pane"><Events run={run} /></Tabs.Content>
+          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="Desenvolvedor" prompt={run.prompt} schemaChars={JSON.stringify(DEVELOPER_JSON_SCHEMA).length} /></Tabs.Content>
+          <Tabs.Content value="input" className="run-pane"><Input run={run} systemTitle="Instruções (protocolo do Desenvolvedor + ficha do Desenvolvedor)" /></Tabs.Content>
+        </div>
+      </Tabs.Root>
+    </>
   );
 }
 

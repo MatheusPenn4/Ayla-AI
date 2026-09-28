@@ -174,7 +174,8 @@ describe("preparar o envio ao Arquiteto (nada executa)", () => {
 
   it("o estado das tarefas na interface segue os registros do executor", () => {
     const plan = archPlan();
-    expect(taskState(plan.tasks[2], []).key).toBe("not_executable");
+    // t3 is a Developer task: it now has its own hand-off flow, so it is "proposed" (executable), not "not_executable".
+    expect(taskState(plan.tasks[2], []).key).toBe("proposed");
     expect(taskState(plan.tasks[0], []).key).toBe("proposed");
     expect(handoffBlocker(plan.tasks[1], plan.tasks, () => [])).toContain("t1");
     expect(handoffBlocker(plan.tasks[3], plan.tasks, () => [])).toContain("ainda não executa");
@@ -760,7 +761,8 @@ describe("tarefa dependente e prévia do Desenvolvedor", () => {
     expect(p.analyses.map(a => a.taskId)).toEqual(["t2", "t1"]);
     expect(p.analyses[1].decisions).toEqual([DECISION]);
     expect(p.base.proposed).toMatchObject({ commit: COMMIT });
-    expect(p.tasks.find(t => t.id === "t3")).toMatchObject({ relation: "esta tarefa", state: "not_executable" });
+    // t3 (Developer) now has its own hand-off flow: "proposed" (executable), not "not_executable".
+    expect(p.tasks.find(t => t.id === "t3")).toMatchObject({ relation: "esta tarefa", state: "proposed" });
     expect(p.tasks.find(t => t.id === "t2")).toMatchObject({ relation: "dependência direta", state: "analysis_ready", runId: t2.id });
     expect(p.tasks.find(t => t.id === "t1")).toMatchObject({ relation: "dependência indireta", state: "analysis_ready" });
     expect(p.tasks.find(t => t.id === "t4")).toMatchObject({ relation: "depende desta" });
@@ -845,5 +847,251 @@ describe("primeiro envio numa cópia local, comparado com o commit do Diretor (G
     expect(run.prompt!.user).toContain("Primeiro envio desta tarefa, em um commit diferente do que o Diretor leu");
     expect(run.prompt!.user).toContain("não existiam lá: src/botao.tsx");
     expect(g("status", "--porcelain")).toBe(statusBefore);
+  });
+});
+
+// ---- Developer: prepare/approve, real isolated copy (Git + tar), real diff, scope enforcement ----
+import { existsSync } from "node:fs";
+import type { DeveloperResult } from "@/lib/engine/types";
+
+const developerSheet = (over = {}) => member("developer", { connection: "claude_code", tools: { read: true, edit: true, terminal: false }, brief: "# Desenvolvedor\nFicha salva do Desenvolvedor.", budget: 48000, ...over });
+const devReq = (planId: string, taskId = "t3", over = {}) => ({ idempotencyKey: `h:${Math.random().toString(36).slice(2, 12)}`, directorRunId: planId, taskId, agent: developerSheet(), ...over });
+
+const devResult = (over: Partial<DeveloperResult> = {}): DeveloperResult => ({
+  outcome: "done", summary: "Criado o serializador e ajustado o botão.",
+  changes: [{ path: "src/serializador.ts", action: "created", reason: "Novo módulo puro pedido pela tarefa." }, { path: "src/botao.tsx", action: "modified", reason: "Usa o novo serializador." }],
+  acceptance: [{ criterion: "Azul", status: "met", note: "Classe aplicada." }],
+  questions: [], not_verified: [], assumptions: [], ...over,
+});
+
+/** A real, local repo with the files chainPlan's Architect guidance cites (src/estilo.css, src/botao.tsx). */
+function makeDevRepo(root: string) {
+  const dir = path.join(root, "devclone");
+  mkdirSync(dir);
+  const g = (...a: string[]) => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
+  g("init", "-q", "-b", "main");
+  g("remote", "add", "origin", "https://github.com/o/r.git");
+  writeFileSync(path.join(dir, "package.json"), '{"name":"x"}');
+  mkdirSync(path.join(dir, "src"));
+  writeFileSync(path.join(dir, "src", "estilo.css"), ".a{}");
+  writeFileSync(path.join(dir, "src", "botao.tsx"), "export const Botao = () => null\n");
+  g("add", "."); g("commit", "-q", "-m", "base");
+  const base = g("rev-parse", "HEAD");
+  return { dir, base, status: () => g("status", "--porcelain") };
+}
+
+/**
+ * chainPlan (t3 developer ← t2 architect ← t1 architect), both Architect analyses done for REAL against
+ * `repo.base`, using their own scripted service (kept apart from whatever service the caller tests the
+ * Developer hand-off with). Shares `s` so the resulting rows are visible to the caller's own service.
+ */
+async function localChainWithAnalyses(repo: { dir: string; base: string }, s: RunStore) {
+  const { svc } = service(
+    [reply(analysis()), reply(analysis({ recommendation: { summary: "Serializador puro, sem alterar tipos.", rationale: "Menor risco, mais fácil de testar." }, developer_guidance: ["Criar src/serializador.ts", "Alterar src/botao.tsx"] }))],
+    { s, localRepos: [repo.dir] },
+  );
+  const plan = await directorPlan(chainPlan(), s, "plan_ready");
+  const detail = (await s.detail(plan))!;
+  await s.update(plan, { context: { ...(detail.context as Extract<RunDetail["context"], { kind: "github" }>)!, commit: repo.base } });
+  const local = { via: "local_git" as const, commit: repo.base };
+  const t1 = body<{ run: RunDetail }>(await svc.prepare({ ...handoffReq(plan, "t1", { decisions: [DECISION] }), source: local, revisionReason: "Ler do commit local real (teste)." })).run;
+  await svc.approve(t1.id, { snapshotHash: t1.snapshotHash });
+  await svc.idle();
+  const t2 = body<{ run: RunDetail }>(await svc.prepare({ ...handoffReq(plan, "t2"), source: local, revisionReason: "Ler do commit local real (teste)." })).run;
+  await svc.approve(t2.id, { snapshotHash: t2.snapshotHash });
+  await svc.idle();
+  return { plan, t1: (await s.detail(t1.id))!, t2: (await s.detail(t2.id))! };
+}
+
+describe("Desenvolvedor: comandos e caminhos permitidos (verificação real dos argumentos do cliente, sem chamada)", () => {
+  it("modo developer_write concede só Read/Edit/Write/Glob/Grep, confina ao --restricted e nega Bash/PowerShell/rede/subagente", () => {
+    const args = claudeArgs({ mode: "developer_write", schema: {}, label: "x", system: "s", user: "u", model: "", effort: "", timeoutMs: 1, workDir: "w" }, "sys.txt");
+    expect(args).toContain("--restricted");
+    expect(args.join(" ")).toContain("--allowedTools Read Edit Write Glob Grep");
+    const disallowed = args.slice(args.indexOf("--disallowedTools") + 1, args.indexOf("--permission-mode"));
+    for (const tool of ["Bash", "PowerShell", "NotebookEdit", "WebFetch", "WebSearch", "Task"]) expect(disallowed).toContain(tool);
+    expect(disallowed).not.toContain("Edit");
+    expect(args).not.toContain("--tools"); // "--tools \"\"" (no tools at all) is the READ-ONLY (Architect) flag, not used here
+    expect(args).toContain("--safe-mode");
+    expect(args).toContain("acceptEdits");
+  });
+  it("modo padrão (Arquiteto) continua sem nenhuma ferramenta, inalterado", () => {
+    const args = claudeArgs({ schema: {}, label: "x", system: "s", user: "u", model: "", effort: "", timeoutMs: 1, workDir: "w" }, "sys.txt");
+    expect(args).toContain("--tools");
+    expect(args[args.indexOf("--tools") + 1]).toBe("");
+    expect(args).not.toContain("--restricted");
+  });
+});
+
+describe("Desenvolvedor: preparar o envio (nada é construído ou chamado)", () => {
+  it("recusa quando as dependências (Arquiteto) não estão concluídas", async () => {
+    const { svc } = service([reply(analysis())]);
+    const { plan } = await chainWithT1(svc); // only t1 done; t2 still pending
+    const r = await svc.prepareDeveloper(devReq(plan, "t3"));
+    expect(body<{ error: { code: string; details?: string[] } }>(r).error).toMatchObject({ code: "dependency_pending" });
+  });
+  it("recusa conexão diferente de Claude Code e ficha sem permissão de editar", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    // Blocked earlier, at the service's connection gate (WRITE_RESTRICTED), before prepareDeveloperHandoff's own redundant check ever runs.
+    expect(body<{ error: { code: string } }>(await svc.prepareDeveloper(devReq(plan, "t3", { agent: developerSheet({ connection: "codex" }) }))).error.code).toBe("adapter_not_write_restricted");
+    expect(body<{ error: { code: string } }>(await svc.prepareDeveloper(devReq(plan, "t3", { agent: developerSheet({ tools: { read: true, edit: false } }) }))).error.code).toBe("no_write_permission");
+  });
+  it("congela a revisão sem criar cópia de trabalho nem chamar o cliente; recusa sem cópia local autorizada", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const unauthorized = service([], { s: store, localRepos: [] });
+    expect(body<{ error: { code: string } }>(await unauthorized.svc.prepareDeveloper(devReq(plan, "t3"))).error.code).toBe("local_not_authorized");
+    const { svc, calls } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareDeveloper(devReq(plan, "t3"));
+    expect(r.status).toBe(201);
+    const run = body<{ run: RunDetail }>(r).run;
+    expect(run.status).toBe("awaiting_approval");
+    const snap = run.snapshot as { base: { commit: string; owner: string; repo: string; dirName: string }; editScope: { path: string; action: string }[]; tools: { label: string; allowed: boolean }[] };
+    expect(snap.base).toMatchObject({ commit: repo.base, owner: "o", repo: "r", dirName: "devclone" });
+    expect(snap.editScope.filter(e => e.action !== "consultar").map(e => e.path).sort()).toEqual(["src/botao.tsx", "src/serializador.ts"]);
+    const tool = (label: string) => snap.tools.find(t => t.label === label)!;
+    expect(tool("Criar, editar e remover arquivos").allowed).toBe(true);
+    expect(tool("Terminal / comandos").allowed).toBe(false);
+    expect(run.prompt!.user).toContain("<escopo_de_edicao>");
+    expect(run.prompt!.user).not.toContain("<dados_da_fonte>"); // no file content is pasted — the Developer reads the copy itself
+    expect(JSON.stringify(run)).not.toContain(repo.dir.replace(/\\/g, "\\\\")); // no full local path leaked
+    // Nothing built, nothing called yet.
+    expect(existsSync(path.join(work, run.id))).toBe(false);
+    await svc.idle();
+    expect(calls).toHaveLength(0);
+    expect(repo.status()).toBe(""); // the source repo's working tree is untouched
+  });
+  it("cliques repetidos preparando o mesmo envio: um único registro", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const [a, b, c] = await Promise.all([svc.prepareDeveloper(devReq(plan, "t3")), svc.prepareDeveloper(devReq(plan, "t3")), svc.prepareDeveloper(devReq(plan, "t3"))]);
+    const ids = new Set([a, b, c].map(r => body<{ run: RunDetail }>(r).run.id));
+    expect(ids.size).toBe(1);
+  });
+});
+
+describe("Desenvolvedor: aprovação, execução real (materializada) e diff", () => {
+  it("divergência no momento da confirmação: hash diferente é recusado; aprovação dupla enfileira uma única vez", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    // No real edits reported: matches the (also empty) real diff, so this validates cleanly on the first attempt —
+    // the point of this test is approval de-dup, not the outcome.
+    const { svc, calls } = service([reply(devResult({ changes: [] }), usage())], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    expect((await svc.approve(run.id, { snapshotHash: "outro" })).status).toBe(409);
+    const [x, y] = await Promise.all([svc.approve(run.id, { snapshotHash: run.snapshotHash }), svc.approve(run.id, { snapshotHash: run.snapshotHash })]);
+    expect([x, y].filter(r => body<{ approved: boolean }>(r).approved)).toHaveLength(1);
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+    expect((await store.get(run.id))!.status).toBe("implementation_ready");
+  });
+
+  it("execução real (Claude Code simulado, escrita de verdade na cópia isolada): materializa, valida e calcula o diff — nada toca o repositório de origem", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    let seenWorkDir = "";
+    const { svc, calls } = service(
+      [async (c: AgentCall) => {
+        seenWorkDir = c.workDir;
+        expect(c.mode).toBe("developer_write");
+        // Simulates the model's Edit/Write tool: real writes, confined by the real client's own flags (not by this test).
+        expect(existsSync(path.join(c.workDir, "src", "botao.tsx"))).toBe(true);
+        expect(existsSync(path.join(c.workDir, ".git"))).toBe(true); // the throwaway diff-base repo, not the real project's
+        expect(existsSync(path.join(c.workDir, "node_modules"))).toBe(false);
+        writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const toMarkdown = () => \"\";\n");
+        writeFileSync(path.join(c.workDir, "src", "botao.tsx"), "export const Botao = () => null // usa o serializador\n");
+        return reply(devResult());
+      }],
+      { s: store, localRepos: [repo.dir] },
+    );
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(1);
+    const done = (await store.detail(run.id))!;
+    expect(done.status).toBe("implementation_ready");
+    const dev = done.developer!;
+    expect(dev.diff!.outOfScope).toEqual([]);
+    const byPath = Object.fromEntries(dev.diff!.files.map(f => [f.path, f]));
+    expect(byPath["src/serializador.ts"]).toMatchObject({ status: "added", inScope: true });
+    expect(byPath["src/botao.tsx"]).toMatchObject({ status: "modified", inScope: true });
+    expect(dev.changes.map(c => c.path).sort()).toEqual(["src/botao.tsx", "src/serializador.ts"]);
+    expect(dev.limitations.join(" ")).toContain("Nenhum comando foi executado");
+    // Isolation, proven for real: the isolated copy is gone, and the SOURCE repo was never touched.
+    expect(existsSync(seenWorkDir)).toBe(false);
+    expect(repo.status()).toBe("");
+    expect(existsSync(path.join(repo.dir, "src", "serializador.ts"))).toBe(false);
+  });
+
+  it("pedido adversarial: escreve fora do escopo aprovado dentro da própria cópia — reprovado pelo diff real, não pelo que o modelo relata", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc, calls } = service(
+      [
+        async (c: AgentCall) => {
+          writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const x = 1;\n");
+          // Out of scope: package.json is not in editScope for this task at all.
+          writeFileSync(path.join(c.workDir, "package.json"), '{"name":"x","tampered":true}');
+          return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "ok" }] }));
+        },
+        async (c: AgentCall) => {
+          // Second attempt (correction): still out of scope — must fail for good, not be silently accepted.
+          writeFileSync(path.join(c.workDir, "package.json"), '{"name":"x","tampered":"again"}');
+          return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "ok" }] }));
+        },
+      ],
+      { s: store, localRepos: [repo.dir] },
+    );
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect(calls).toHaveLength(2); // one retry, per the standard correction policy
+    const done = (await store.get(run.id))!;
+    expect(done.status).toBe("failed"); // never "implementation_ready" for an out-of-scope diff
+    const events = (await store.detail(run.id))!.events;
+    expect(events.some(e => e.kind === "diff" && e.message.includes("FORA DO ESCOPO") && e.message.includes("package.json"))).toBe(true);
+    expect(repo.status()).toBe("");
+  });
+
+  it("cancelamento antes da aprovação não cria cópia nem chama o cliente; cancelamento em execução aborta o processo", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc, calls } = service([async () => { await new Promise(r => setTimeout(r, 500)); return reply(devResult()); }], { s: store, localRepos: [repo.dir] });
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    const discarded = await svc.cancel(run.id);
+    expect(body<{ canceled: boolean }>(discarded).canceled).toBe(true);
+    expect((await store.get(run.id))!.status).toBe("canceled");
+    await svc.idle();
+    expect(calls).toHaveLength(0);
+
+    const run2 = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(run2.id, { snapshotHash: run2.snapshotHash });
+    await new Promise(r => setTimeout(r, 50));
+    await svc.cancel(run2.id);
+    await svc.idle();
+    expect((await store.get(run2.id))!.status).toBe("canceled");
+  });
+
+  it("persistência: o relatório e o diff reabrem do banco exatamente como gravados (kind developer_task)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service(
+      [async (c: AgentCall) => { writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export {};\n"); return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "ok" }] })); }],
+      { s: store, localRepos: [repo.dir] },
+    );
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    const detail = (await store.detail(run.id))!;
+    expect(detail.kind).toBe("developer_task");
+    expect(detail.developer?.outcome).toBe("done");
+    expect(detail.developer?.diff?.baseCommit).toBe(repo.base);
+    expect(detail.result).toBeNull();
+    expect(detail.analysis).toBeNull();
+    // Same record via the plain (non-detail) accessor, confirming the store's generic kind branch (store.ts#toRecord).
+    expect((await store.get(run.id))!.developer?.outcome).toBe("done");
   });
 });

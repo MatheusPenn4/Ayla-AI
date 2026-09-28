@@ -8,6 +8,7 @@ export type RunStatus =
   | "queued" | "planning" | "awaiting_clarification"
   | "plan_ready" // Director: plan done
   | "analysis_ready" // Architect: analysis done
+  | "implementation_ready" // Developer: edits done, diff computed and in scope
   | "failed" | "canceled";
 export const ACTIVE_STATUSES: RunStatus[] = ["queued", "planning"];
 export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
@@ -17,15 +18,18 @@ export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   awaiting_clarification: "Aguardando esclarecimento",
   plan_ready: "Plano pronto",
   analysis_ready: "Análise concluída",
+  implementation_ready: "Implementação pronta (não aplicada)",
   failed: "Falha",
   canceled: "Cancelada",
 };
 
-/** Director planning, or one Director task handed off (with approval) to the Architect. */
-export type RunKind = "director_plan" | "architect_task";
+/** Director planning, one Director task handed off (with approval) to the Architect, or to the Developer. */
+export type RunKind = "director_plan" | "architect_task" | "developer_task";
 
-/** Collaborators that can receive a hand-off in this phase. */
+/** Collaborators that can receive a read-only hand-off in this phase (see HandoffTargets for the Architect flow). */
 export const HANDOFF_TARGETS = ["architect"] as const;
+/** The Developer's hand-off is a separate, write-capable flow (see lib/executor/developer.ts); not merged into HANDOFF_TARGETS. */
+export const DEVELOPER_ASSIGNEE = "developer";
 
 /**
  * How a collaborator reaches a model: through an official client installed and
@@ -290,6 +294,64 @@ export type ContextRevision = {
   comparisons?: SourceComparison[];
 };
 
+/** Where a file of the task stands: create it, change it, or only read it for context (never a grant by itself). */
+export type EditScopeEntry = { path: string; action: "criar" | "alterar" | "consultar"; from: string[] };
+
+/** What the executor lets this Developer run do (enforced by client flags and the isolated copy, not by the prompt). */
+export type DeveloperTool = { label: string; allowed: boolean; how: string };
+
+/**
+ * Frozen at "Enviar ao Desenvolvedor" (prepare). No file is materialized yet: the isolated working copy is
+ * built only when the run is approved (see lib/executor/worktree.ts). Nothing here is sent to the model as
+ * pasted file content — the Developer reads the working copy itself, through its own confined tools.
+ */
+export type DeveloperSnapshot = {
+  kind: "developer_task";
+  agent: TeamMemberInput;
+  team: Pick<TeamMemberInput, "id" | "name" | "role" | "specialty" | "connection">[];
+  demand: StartRunRequest["demand"];
+  task: HandoffTask;
+  plan: { objective_summary: string; step: PlanStep | null; dependents: { id: string; title: string; assignee: string }[] };
+  dependencies: (DependencyAnalysis & { taskId: string; title: string })[];
+  base: {
+    owner: string; repo: string; commit: string; dirName: string;
+    treeEntries: number;
+    /** Up to 60 paths, for reference only (the working copy has the whole tree). */
+    sampleFiles: string[];
+  };
+  editScope: EditScopeEntry[];
+  outOfScope: string[];
+  tools: DeveloperTool[];
+  revision: ContextRevision;
+  limits: { timeoutMs: number; maxDiffChars: number };
+};
+
+export type DeveloperChange = { path: string; action: "created" | "modified" | "deleted"; reason: string };
+export type DeveloperAcceptance = { criterion: string; status: "met" | "not_met" | "not_verified"; note: string };
+
+/** The Developer's own structured report (self-reported; cross-checked against the independently computed diff). */
+export type DeveloperResult = {
+  outcome: "done" | "needs_clarification";
+  summary: string;
+  changes: DeveloperChange[];
+  acceptance: DeveloperAcceptance[];
+  questions: PlanQuestion[];
+  not_verified: string[];
+  assumptions: string[];
+};
+
+export type DeveloperDiffFile = { path: string; status: "added" | "modified" | "deleted"; additions: number | null; deletions: number | null; inScope: boolean };
+
+/** Computed by the executor from the isolated copy (git diff), independent of what the model reports. */
+export type DeveloperDiff = {
+  baseCommit: string;
+  files: DeveloperDiffFile[];
+  diffText: string;
+  diffTruncated: boolean;
+  /** Files touched outside the approved edit scope (a non-empty list fails validation). */
+  outOfScope: string[];
+};
+
 export type DirectorSnapshot = {
   kind?: "director_plan";
   director: TeamMemberInput;
@@ -361,6 +423,8 @@ export type RunRecord = {
   result: (DirectorPlan & { limitations: string[] }) | null;
   /** Architect analysis (kind architect_task). */
   analysis: (ArchitectAnalysis & { limitations: string[] }) | null;
+  /** Developer implementation (kind developer_task): its own report plus the diff the executor computed. */
+  developer: (DeveloperResult & { limitations: string[]; diff: DeveloperDiff | null }) | null;
   error: RunError | null;
   previousRunId: string | null;
 };
@@ -368,7 +432,7 @@ export type RunRecord = {
 export type RunDetail = RunRecord & {
   events: RunEvent[];
   /** Exactly what the collaborator received (frozen at run creation). */
-  snapshot: DirectorSnapshot | ArchitectSnapshot;
+  snapshot: DirectorSnapshot | ArchitectSnapshot | DeveloperSnapshot;
   prompt: { system: string; user: string } | null;
   rawOutput: string | null;
 };
