@@ -1,7 +1,7 @@
 // Durable run storage behind a tiny SQL driver interface.
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
-import type { DeveloperDiff, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext } from "@/lib/engine/types";
+import type { DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -32,6 +32,7 @@ const SCHEMA = [
     context_json TEXT,
     result_json TEXT,
     rejected_diff_json TEXT,
+    local_resolution_json TEXT,
     error_json TEXT,
     budget_json TEXT NOT NULL,
     raw_output TEXT,
@@ -60,8 +61,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS ayla_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection. */
-export const SCHEMA_VERSION = 3;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection. */
+export const SCHEMA_VERSION = 4;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
@@ -69,6 +70,7 @@ const ADDED_COLUMNS: [string, string][] = [
   ["parent_run_id", "TEXT"],
   ["task_id", "TEXT"],
   ["rejected_diff_json", "TEXT"],
+  ["local_resolution_json", "TEXT"],
 ];
 
 const INDEXES = [
@@ -99,6 +101,7 @@ function toRecord(r: Row): RunRecord {
     analysis: kind === "architect_task" ? parse<RunRecord["analysis"]>(r.result_json) : null,
     developer: kind === "developer_task" ? parse<RunRecord["developer"]>(r.result_json) : null,
     rejectedDiff: kind === "developer_task" ? parse<DeveloperDiff>(r.rejected_diff_json) : null,
+    localResolution: parse<LocalResolution>(r.local_resolution_json),
     error: parse<RunError>(r.error_json),
     previousRunId: (r.previous_run_id as string) ?? null,
   };
@@ -227,6 +230,23 @@ export class RunStore {
   /** The user's confirmation: awaiting_approval → queued, atomically (a repeated click changes nothing). */
   async approve(id: string) {
     const { changes } = await this.db.run(`UPDATE director_runs SET status = 'queued', updated_at = ? WHERE id = ? AND kind IN ('architect_task', 'developer_task') AND status = 'awaiting_approval'`, [nowIso(), id]);
+    return changes === 1;
+  }
+
+  /**
+   * Records that a Developer clarification was resolved OUTSIDE the model (orchestrator/human decision),
+   * never changing `status` (the model's own outcome stays exactly as returned) and never touching
+   * `result_json`. Only applies to a developer_task run still in "awaiting_clarification"; a run that moved
+   * on (a fresh attempt was sent, or it was superseded) refuses, since the note would no longer be about the
+   * task's current run. Idempotent columns, but each call still appends its own event (an audit trail, not a toggle).
+   */
+  async resolveClarificationLocally(id: string, resolution: LocalResolution) {
+    await this.ensureSchema();
+    const { changes } = await this.db.run(
+      `UPDATE director_runs SET local_resolution_json = ?, updated_at = ? WHERE id = ? AND kind = 'developer_task' AND status = 'awaiting_clarification'`,
+      [JSON.stringify(resolution), nowIso(), id],
+    );
+    if (changes === 1) await this.event(id, "clarification_resolved_locally", `Esclarecimento resolvido fora do modelo: ${resolution.note}`, resolution);
     return changes === 1;
   }
 

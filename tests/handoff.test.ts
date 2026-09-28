@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { refPath, validateAnalysis } from "@/lib/engine/analysis-schema";
 import { handoffBlocker, taskState } from "@/lib/engine/handoff-state";
-import { reportedTotal, type ArchitectAnalysis, type ArchitectSnapshot, type DirectorPlan, type RunDetail } from "@/lib/engine/types";
+import { reportedTotal, type ArchitectAnalysis, type ArchitectSnapshot, type DirectorPlan, type PlanTask, type RunDetail } from "@/lib/engine/types";
 import { claudeArgs, claudeUsage, claudeAdapter } from "@/lib/executor/adapters/claude";
 import { codexArgs, parseCodexEvents, codexAdapter } from "@/lib/executor/adapters/codex";
 import { AgentError, type AgentCall } from "@/lib/executor/adapters/types";
@@ -1161,5 +1161,63 @@ describe("Desenvolvedor: aprovação, execução real (materializada) e diff", (
     expect(detail.analysis).toBeNull();
     // Same record via the plain (non-detail) accessor, confirming the store's generic kind branch (store.ts#toRecord).
     expect((await store.get(run.id))!.developer?.outcome).toBe("done");
+  });
+});
+
+describe("Desenvolvedor: esclarecimento resolvido fora do modelo (nunca reescreve o status nem o resultado)", () => {
+  async function awaitingClarificationRun() {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service(
+      [reply(devResult({ outcome: "needs_clarification", changes: [], questions: [{ question: "Onde colocar o teste?", why_it_blocks: "Nenhum caminho de teste está no escopo aprovado." }] }))],
+      { s: store, localRepos: [repo.dir] },
+    );
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    return { svc, runId: run.id };
+  }
+  const RESOLUTION = { note: "Testes escritos localmente, fora do escopo aprovado da execução isolada.", commit: "6".repeat(40), testFile: "tests/plan-markdown.test.ts", testCount: 13 };
+
+  it("registra a resolução sem tocar em status/result; fica visível no registro e num evento", async () => {
+    const { svc, runId } = await awaitingClarificationRun();
+    expect((await store.get(runId))!.status).toBe("awaiting_clarification");
+    const r = await svc.resolveClarificationLocally(runId, RESOLUTION);
+    expect(r.status).toBe(200);
+    const after = await store.get(runId);
+    expect(after!.status).toBe("awaiting_clarification"); // never rewritten as if the model had finished
+    expect(after!.developer?.outcome).toBe("needs_clarification"); // the model's own answer, untouched
+    expect(after!.localResolution).toMatchObject(RESOLUTION);
+    expect(after!.localResolution!.by).toBe("orchestrator");
+    const detail = (await store.detail(runId))!;
+    expect(detail.events.some(e => e.kind === "clarification_resolved_locally" && e.message.includes(RESOLUTION.note))).toBe(true);
+  });
+
+  it("recusa corpo inválido (commit não é hash de 40, note vazia)", async () => {
+    const { svc, runId } = await awaitingClarificationRun();
+    expect(body<{ error: { code: string } }>(await svc.resolveClarificationLocally(runId, { ...RESOLUTION, commit: "abc" })).error.code).toBe("invalid_body");
+    expect(body<{ error: { code: string } }>(await svc.resolveClarificationLocally(runId, { ...RESOLUTION, note: "  " })).error.code).toBe("invalid_body");
+    expect((await store.get(runId))!.localResolution).toBeNull();
+  });
+
+  it("recusa quando a execução não está aguardando esclarecimento (já foi para outra tentativa)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([reply(devResult({ changes: [] }), usage())], { s: store, localRepos: [repo.dir] }); // outcome "done" this time, real diff empty and matching
+    const run = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(run.id, { snapshotHash: run.snapshotHash });
+    await svc.idle();
+    expect((await store.get(run.id))!.status).toBe("implementation_ready");
+    expect(body<{ error: { code: string } }>(await svc.resolveClarificationLocally(run.id, RESOLUTION)).error.code).toBe("not_awaiting_clarification");
+  });
+
+  it("não libera nenhuma regra de dependência: uma tarefa dependente do Desenvolvedor continua bloqueada categoricamente (HANDOFF_TARGETS só inclui o Arquiteto)", async () => {
+    // developerBlocker only ever treats an Architect dependency as satisfiable; a Developer-assigned
+    // dependency is refused regardless of status — resolving a clarification locally does not, and must
+    // not, change that categorical rule (localResolution is never consulted by it, on purpose).
+    const t3: PlanTask = { id: "t3", step_id: "s1", assignee: "developer", title: "t3", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: [] };
+    const t4: PlanTask = { id: "t4", step_id: "s2", assignee: "developer", title: "t4", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: ["t3"] };
+    const blocker = developerBlocker(t4, [t3, t4], () => []);
+    expect(blocker).toBe("Depende de t3 (developer), que ainda não executa nesta fase.");
   });
 });

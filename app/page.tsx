@@ -20,6 +20,7 @@ import { ZONE_LABEL } from "@/lib/office/defaults";
 import { presetUpdate } from "@/lib/office/profile";
 import { CAPACITY, STATION_BY_ID, ZONES } from "@/lib/office/layout";
 import { loadPrefs, savePrefs, serializeOffice, type QualityPref } from "@/lib/office/storage";
+import { downloadTextFile } from "@/lib/utils";
 import type { HandoffFollowUp } from "@/lib/engine/client";
 import type { RunDetail } from "@/lib/engine/types";
 import type { Agent, Demand, WorkZoneId, ZoneId } from "@/lib/office/types";
@@ -143,10 +144,7 @@ export default function Home() {
   const setQualityPref = (q: QualityPref) => { setQuality(q); savePrefs({ quality: q }); };
 
   const exportData = () => {
-    const blob = new Blob([JSON.stringify({ ...serializeOffice({ agents, demands }), exportedAt: new Date().toISOString() }, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob), a = document.createElement("a");
-    a.href = url; a.download = "setor-ia-configuracoes.json"; a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
+    downloadTextFile("setor-ia-configuracoes.json", JSON.stringify({ ...serializeOffice({ agents, demands }), exportedAt: new Date().toISOString() }, null, 2), "application/json");
   };
 
   const title = screen === "office" ? "Escritório" : screen === "team" ? "Funcionários" : "Fila de demandas";

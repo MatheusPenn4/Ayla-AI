@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Tabs } from "radix-ui";
-import { AlertTriangle, ArrowLeft, CheckCircle2, CircleDashed, Clock, FileText, HelpCircle, Loader2, RefreshCw, Send, ShieldCheck, XCircle } from "lucide-react";
+import { AlertTriangle, ArrowLeft, CheckCircle2, CircleDashed, Clock, Download, FileText, HelpCircle, Loader2, RefreshCw, Send, ShieldCheck, XCircle } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { useRuns } from "@/hooks/use-runs";
 import { Avatar } from "../avatar";
@@ -17,6 +17,8 @@ import { PLAN_JSON_SCHEMA } from "@/lib/engine/plan-schema";
 import { connectionLabel } from "@/lib/engine/connections";
 import { TASK_STATE_LABEL, developerBlocker, handoffBlocker, isExecutableAssignee, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
+import { directorPlanToMarkdown, planMarkdownFilename, type PlanMarkdownStep, type PlanMarkdownTask } from "@/lib/engine/plan-markdown";
+import { downloadTextFile } from "@/lib/utils";
 import type { Agent } from "@/lib/office/types";
 
 type RunsApi = ReturnType<typeof useRuns>;
@@ -172,6 +174,25 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   const [sendFor, setSendFor] = useState<string | null>(null);
   const [previewFor, setPreviewFor] = useState<string | null>(null);
 
+  // Every field here comes from data already loaded for this dialog (run.result, taskState/runsOf) — no extra
+  // fetch per task. stateLabel/architectSummary reflect the REAL state the UI already shows elsewhere (same
+  // TASK_STATE_LABEL, same run.analysis already present on the plain RunRecord); a clarification resolved
+  // outside the model (run.localResolution) is named as such, never folded into "implementation done".
+  const downloadPlanMarkdown = () => {
+    if (!res) return;
+    const steps: PlanMarkdownStep[] = res.steps.map(s => ({ step: s, ownerName: name(s.owner) }));
+    const tasks: PlanMarkdownTask[] = res.tasks.map(t => {
+      const st = taskState(t, runsOf(t.id));
+      const base = TASK_STATE_LABEL[st.key];
+      const lr = st.run?.localResolution;
+      const stateLabel = lr ? `${base} — esclarecimento resolvido fora do modelo (commit ${lr.commit.slice(0, 8)}${lr.testCount != null ? `, ${lr.testCount} teste(s)` : ""}): ${lr.note}` : base;
+      const architectSummary = isHandoffTarget(t.assignee) && st.run?.analysis ? st.run.analysis.recommendation.summary : null;
+      return { task: t, assigneeName: name(t.assignee), stateLabel, architectSummary, architectSummaryNote: null };
+    });
+    const md = directorPlanToMarkdown({ demandTitle: snap.demand.title, runId: run.id, generatedAt: new Date().toLocaleString("pt-BR"), plan: res, steps, tasks });
+    downloadTextFile(planMarkdownFilename(snap.demand.title, run.id), md, "text/markdown;charset=utf-8");
+  };
+
   return (
     <>
       <DialogHeader>
@@ -314,6 +335,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
       </Tabs.Root>
 
       <div className="dialog-actions">
+        {res && <button className="btn-secondary" onClick={downloadPlanMarkdown}><Download size={14} /> Baixar plano em Markdown</button>}
         {!active && <button className="btn-secondary" onClick={() => onReplan(run)}><RefreshCw size={14} /> Planejar novamente</button>}
       </div>
     </>

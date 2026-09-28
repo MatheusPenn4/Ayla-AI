@@ -4,7 +4,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { CONNECTION_IDS } from "@/lib/engine/connections";
-import { HANDOFF_TARGETS, type ConnectionId, type ConnectionStatus, type DirectorSnapshot, type EngineStatus, type RunRecord } from "@/lib/engine/types";
+import { HANDOFF_TARGETS, type ConnectionId, type ConnectionStatus, type DirectorSnapshot, type EngineStatus, type LocalResolution, type RunRecord } from "@/lib/engine/types";
 import { claudeAdapter } from "./adapters/claude";
 import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
@@ -284,6 +284,28 @@ export class ExecutorService {
     await this.store.event(id, "approved", run.kind === "developer_task" ? "Envio confirmado por você. O Desenvolvedor entrou na fila do executor local; a cópia de trabalho isolada será montada agora." : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.");
     this.enqueue(id);
     return { status: 202, body: { run: await this.store.get(id), approved: true } };
+  }
+
+  /**
+   * Records that a Developer clarification was resolved outside the model — an orchestrator/human decision
+   * (e.g. a scope question about where a test file belongs), never a claim that the model itself finished
+   * the call. Never touches `status` or `result`: those stay exactly what the model returned. Not a general
+   * user-facing action — there is no UI button for it; it exists so this kind of resolution is durable and
+   * auditable (a real field plus an event) instead of only asserted in a chat transcript.
+   */
+  async resolveClarificationLocally(id: string, body: unknown): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
+    const b = body as { note?: unknown; commit?: unknown; testFile?: unknown; testCount?: unknown } | null;
+    if (typeof b?.note !== "string" || !b.note.trim()) return err(400, "invalid_body", "Informe o que foi resolvido (note).");
+    if (typeof b?.commit !== "string" || !/^[0-9a-f]{40}$/.test(b.commit)) return err(400, "invalid_body", "Informe o commit (hash de 40 caracteres) que resolveu isto.");
+    if (b.testFile !== undefined && b.testFile !== null && typeof b.testFile !== "string") return err(400, "invalid_body", "testFile deve ser texto ou nulo.");
+    if (b.testCount !== undefined && b.testCount !== null && (typeof b.testCount !== "number" || !Number.isInteger(b.testCount) || b.testCount < 0)) return err(400, "invalid_body", "testCount deve ser um número inteiro não negativo ou nulo.");
+    const run = await this.store.get(id);
+    if (!run || run.kind !== "developer_task") return err(404, "not_found", "Execução do Desenvolvedor não encontrada.");
+    if (run.status !== "awaiting_clarification") return err(409, "not_awaiting_clarification", "Esta execução não está aguardando esclarecimento (pode já ter uma tentativa mais recente).");
+    const resolution: LocalResolution = { at: new Date().toISOString(), by: "orchestrator", note: b.note.trim(), commit: b.commit, testFile: (b.testFile as string | undefined) ?? null, testCount: (b.testCount as number | undefined) ?? null };
+    if (!(await this.store.resolveClarificationLocally(id, resolution))) return err(409, "conflict", "Não foi possível registrar: a execução mudou de estado.");
+    return { status: 200, body: { run: await this.store.get(id) } };
   }
 
   private enqueue(id: string) {

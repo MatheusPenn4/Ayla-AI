@@ -352,6 +352,24 @@ export type DeveloperDiff = {
   outOfScope: string[];
 };
 
+/**
+ * A run's clarification question resolved OUTSIDE the model (e.g. the model asked a scope question the
+ * user/orchestrator decided directly, such as "where should the test file go"). Never implies the model
+ * itself finished the call: `RunRecord.status` stays whatever the model actually returned (e.g.
+ * "awaiting_clarification"); this only records, verifiably, that a human/orchestrator resolved it and how.
+ */
+export type LocalResolution = {
+  at: string;
+  by: "orchestrator";
+  /** What was resolved, in the resolver's own words. */
+  note: string;
+  /** Commit that carries the resolution (e.g. the one that added the missing test file). */
+  commit: string;
+  /** Test file that demonstrates the resolution, when applicable. */
+  testFile: string | null;
+  testCount: number | null;
+};
+
 export type DirectorSnapshot = {
   kind?: "director_plan";
   director: TeamMemberInput;
@@ -427,6 +445,8 @@ export type RunRecord = {
   developer: (DeveloperResult & { limitations: string[]; diff: DeveloperDiff | null }) | null;
   /** Developer only: the real diff computed even when it was rejected (out-of-scope edit, invalid response). Kept for inspection; never applied to the project. Null on success (the diff then lives in `developer.diff`) or when the run never reached a computed diff. */
   rejectedDiff: DeveloperDiff | null;
+  /** Set only when a clarification question was resolved outside the model (see LocalResolution). Null otherwise. */
+  localResolution: LocalResolution | null;
   error: RunError | null;
   previousRunId: string | null;
 };
