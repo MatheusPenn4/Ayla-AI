@@ -124,6 +124,7 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
   const [filter, setFilter] = useState<string>("all");
   const [payloadFor, setPayloadFor] = useState<Demand | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
+  const [planConfirm, setPlanConfirm] = useState<string | null>(null);
   const list = useMemo(() => (filter === "all" ? demands : demands.filter(d => d.recipient === filter)), [demands, filter]);
   const recipients = [...new Set(demands.map(d => d.recipient))];
   const director = agents.find(a => a.id === "director");
@@ -173,7 +174,7 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
                 <button className="btn-ghost danger" onClick={() => setConfirm(d.id)} aria-label={`Remover ${d.title}`}><Trash2 size={14} /></button>
               </div>
               <div className="run-row">
-                <button className="btn-primary small" disabled={active || sending || !runs.status?.executionEnabled} onClick={() => onPlan(d)} title={!runs.status?.executionEnabled ? runs.status?.disabledReason ?? "Executor local indisponível" : undefined}>
+                <button className="btn-primary small" disabled={active || sending || !runs.status?.executionEnabled} onClick={() => setPlanConfirm(d.id)} title={!runs.status?.executionEnabled ? runs.status?.disabledReason ?? "Executor local indisponível" : undefined}>
                   {sending ? <><Loader2 size={14} className="spin" /> Enviando…</> : active ? <><Loader2 size={14} className="spin" /> {latest?.status === "queued" ? "Na fila do executor…" : "Diretor planejando…"}</> : <><Sparkles size={14} /> {latest ? "Planejar novamente" : "Planejar com o Diretor"}</>}
                 </button>
                 {latest && <button className="btn-secondary small" onClick={() => onOpenRun(latest.id)}>Ver execução</button>}
@@ -209,6 +210,15 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
                   Remover esta demanda da fila local? O registro das execuções continua no executor local.
                   <button className="btn-secondary" onClick={() => setConfirm(null)}>Manter</button>
                   <button className="btn-danger" onClick={() => { onRemove(d.id); setConfirm(null); }}>Remover</button>
+                </div>
+              )}
+              {planConfirm === d.id && (
+                <div className="inline-confirm" role="alert">
+                  {latest
+                    ? <>Replanejar “{d.title}”? Isso chama de verdade o {connectionLabel(director?.connection ?? "none")} do Diretor e consome uso real da sua assinatura; o plano atual fica no histórico.</>
+                    : <>Iniciar o planejamento de “{d.title}” com o Diretor? Isso chama de verdade o {connectionLabel(director?.connection ?? "none")} e consome uso real da sua assinatura.</>}
+                  <button className="btn-secondary" onClick={() => setPlanConfirm(null)}>Cancelar</button>
+                  <button className="btn-primary" disabled={sending} onClick={() => { setPlanConfirm(null); onPlan(d); }}>{latest ? "Replanejar" : "Planejar"}</button>
                 </div>
               )}
             </article>
