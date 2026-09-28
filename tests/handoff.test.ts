@@ -740,7 +740,7 @@ describe("tarefa dependente e prévia do Desenvolvedor", () => {
   });
 
   it("prévia do Desenvolvedor: bloqueada até todas as dependências (inclusive indiretas); depois, só visualização com estados reais", async () => {
-    const { svc, calls } = service([reply(analysis()), reply(analysis({ recommendation: { summary: "Criar src/serializador.ts puro.", rationale: "Testável." }, developer_guidance: ["Criar src/serializador.ts", "Alterar src/botao.tsx", "Antes de implementar, ler src/estilo.css"] }))]);
+    const { svc, calls } = service([reply(analysis()), reply(analysis({ recommendation: { summary: "Criar src/serializador.ts puro, sem alterar src/tipos.ts.", rationale: "Especificar (sem implementar) o uso dos campos já validados (src/contrato.ts, confirmados)." }, developer_guidance: ["Criar src/serializador.ts", "Alterar src/botao.tsx", "Antes de implementar, ler src/estilo.css"] }))]);
     const { plan } = await chainWithT1(svc);
     const tasks = chainPlan().tasks;
     const runsOf = (id: string) => (id === "t1" ? [{ status: "analysis_ready" }] : []) as never;
@@ -767,6 +767,9 @@ describe("tarefa dependente e prévia do Desenvolvedor", () => {
     expect(p.editScope.map(e => e.path)).toEqual(expect.arrayContaining(["src/serializador.ts", "src/botao.tsx"]));
     expect(p.editScope.find(e => e.path === "src/estilo.css")?.action).toBe("consultar"); // "ler" before the path: read, not edit
     expect(p.editScope.find(e => e.path === "src/serializador.ts")?.action).toBe("a confirmar");
+    // Cited without an edit verb right before it, or after "sem": only consulted.
+    expect(p.editScope.find(e => e.path === "src/tipos.ts")?.action).toBe("consultar");
+    expect(p.editScope.find(e => e.path === "src/contrato.ts")?.action).toBe("consultar");
     expect(p.unverified.some(x => x.source.startsWith("inferido") && x.text.includes("src/tema.ts"))).toBe(true);
     // Same states in the Markdown copy as on screen (both come from taskState of the executor's records).
     const md = developerPreviewMarkdown(p);

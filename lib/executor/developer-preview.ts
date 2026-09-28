@@ -102,10 +102,11 @@ export async function developerPreview(q: { directorRunId: string; taskId: strin
   const cite = (text: string, from: string) => {
     for (const r of extractFileRefs(text)) {
       const p = r.split("#")[0];
-      const before = text.slice(0, Math.max(0, text.indexOf(p))).toLowerCase();
+      // Only a verb right before the path counts ("Criar lib/x.ts", "Adicionar em lib/y.ts"); a path merely cited nearby is only consulted.
+      const before = text.slice(Math.max(0, text.indexOf(p) - 40), Math.max(0, text.indexOf(p))).toLowerCase();
       const verbs = [...before.matchAll(/\b(ler|leia|consultar|confirmar|verificar|conferir|criar|adicionar|alterar|editar|extrair|mover|implementar|incluir|reaproveitar|generalizar|inserir|modificar|atualizar)\b/g)];
       const last = verbs[verbs.length - 1]?.[1];
-      const edit = !last || !["ler", "leia", "consultar", "confirmar", "verificar", "conferir"].includes(last);
+      const edit = !!last && !["ler", "leia", "consultar", "confirmar", "verificar", "conferir"].includes(last) && !/\bsem\s+\S*$/.test(before.slice(0, before.lastIndexOf(last)));
       const cur = scope.get(p) ?? { from: new Set<string>(), edit: false };
       cur.from.add(from); cur.edit ||= edit;
       scope.set(p, cur);
