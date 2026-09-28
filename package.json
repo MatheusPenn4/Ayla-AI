@@ -16,6 +16,7 @@
     "executor": "tsx executor/main.ts",
     "check:clients": "tsx scripts/check-clients.ts",
     "check:readonly": "tsx scripts/check-readonly.ts",
+    "check:developer-write": "tsx scripts/check-developer-write.ts",
     "diagnose:run": "tsx scripts/diagnose-run.ts"
   },
   "dependencies": {
