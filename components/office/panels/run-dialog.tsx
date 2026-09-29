@@ -51,9 +51,7 @@ type DialogProps = {
   onCancel: (runId: string) => void;
   /** “Enviar ao Arquiteto” on a task of a Director plan (prepares the hand-off and opens the review). */
   onHandoff: (planRunId: string, taskId: string, followUp?: HandoffFollowUp) => void;
-  /** “Enviar ao Desenvolvedor” on a task of a Director plan (prepares the hand-off and opens the review). */
-  onHandoffDeveloper: (planRunId: string, taskId: string) => void;
-  /** Opens the review of a just-prepared Developer hand-off (kind known at the call site, unlike onReview). */
+  /** Opens the review of a just-prepared Developer hand-off (kind known at the call site, unlike onReview). Preparing itself only happens through DeveloperPreviewPanel, where the user picks the real edit scope. */
   onReviewDeveloper: (handoffRunId: string) => void;
   /** “Enviar ao QA” on a task of a Director plan (prepares the hand-off and opens the review). */
   onHandoffQA: (planRunId: string, taskId: string) => void;
@@ -173,7 +171,7 @@ function Meta({ run }: { run: RunDetail }) {
 
 const REVIEWER_VERDICT_LABEL: Record<string, string> = { aprovado: "aprovado", aprovado_com_ressalvas: "aprovado com ressalvas", reprovado: "reprovado" };
 
-function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff, onHandoffDeveloper, onReviewDeveloper, onHandoffQA, onHandoffReviewer, onReview, onOpenRun }: BodyProps) {
+function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff, onReviewDeveloper, onHandoffQA, onHandoffReviewer, onReview, onOpenRun }: BodyProps) {
   const [tab, setTab] = useState("plan");
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const res = run.result;
@@ -312,14 +310,14 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                     return (
                       <div className="task-actions">
                         {canSend && (
-                          <button className="btn-primary small" disabled={!!devBlocker || sending || !runs.status?.executionEnabled} title={devBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffDeveloper(run.id, t.id)}>
-                            {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><Send size={13} /> {st.key === "proposed" ? "Enviar ao Desenvolvedor" : "Enviar ao Desenvolvedor novamente"}</>}
+                          <button className={`btn-${previewFor === t.id ? "secondary" : "primary"} small`} disabled={!!devBlocker || sending || previewFor === t.id || !runs.status?.executionEnabled} title={devBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => setPreviewFor(t.id)}>
+                            {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><FileText size={13} /> {st.key === "proposed" ? "Selecionar arquivos e enviar ao Desenvolvedor" : "Selecionar arquivos e enviar novamente"}</>}
                           </button>
                         )}
                         {st.key === "awaiting_approval" && st.run && <button className="btn-primary small" onClick={() => onReview(st.run!.id)}><ShieldCheck size={13} /> Revisar e confirmar envio</button>}
                         {st.run && st.key !== "awaiting_approval" && <button className="btn-secondary small" onClick={() => onOpenRun(st.run!.id)}>{st.key === "implementation_ready" ? "Ver implementação" : st.key === "awaiting_clarification" ? "Ver dúvidas do Desenvolvedor" : "Ver execução do Desenvolvedor"}</button>}
                         {(st.key === "queued" || st.key === "working") && st.run && <button className="btn-ghost small" onClick={() => onCancel(st.run!.id)}>Cancelar</button>}
-                        <button className="btn-secondary small" disabled={previewFor === t.id} onClick={() => setPreviewFor(t.id)}><FileText size={13} /> Ver prévia</button>
+                        {!canSend && <button className="btn-secondary small" disabled={previewFor === t.id} onClick={() => setPreviewFor(t.id)}><FileText size={13} /> Ver prévia</button>}
                         {devBlocker && <span className="run-hint">{devBlocker}</span>}
                         {tr.length > 1 && <span className="run-history">Histórico: {tr.map(r => <button key={r.id} className="chip" onClick={() => (r.status === "awaiting_approval" ? onReview(r.id) : onOpenRun(r.id))} title={time(r.createdAt)}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>}
                       </div>

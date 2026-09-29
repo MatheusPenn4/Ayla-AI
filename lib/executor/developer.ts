@@ -24,6 +24,8 @@ import type { NewRun, RunStore } from "./store";
 const refuse = (status: number, code: string, message: string, details?: string[]): never => { throw new HandoffRefused(status, code, message, details); };
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
+const editPathZ = z.string().trim().min(1).max(240).regex(/^[A-Za-z0-9_.@[\]/-]+$/, "caminho inválido").refine(v => !v.includes(".."), "caminho inválido");
+
 export const DeveloperHandoffZ = z.object({
   idempotencyKey: z.string().regex(/^[A-Za-z0-9:_-]{8,120}$/),
   directorRunId: z.string().uuid(),
@@ -34,6 +36,13 @@ export const DeveloperHandoffZ = z.object({
   source: z.object({ commit: z.string().regex(/^[0-9a-f]{40}$/, "commit deve ter 40 caracteres hexadecimais") }).optional(),
   /** Required when the commit differs from the proposed base. */
   revisionReason: z.string().trim().max(500).optional(),
+  /**
+   * What the Developer may touch, chosen explicitly by the user preparing this hand-off — never inferred
+   * from the Architect's guidance text. Each path is checked against the real tree of the chosen commit
+   * (source.commit, or the proposed base) before the hand-off is frozen: "alterar"/"consultar" require the
+   * path to exist there; "criar" does not (see prepareDeveloperHandoff).
+   */
+  editScope: z.array(z.object({ path: editPathZ, action: z.enum(["alterar", "criar", "consultar"]) }).strict()).min(1).max(60),
 });
 export type DeveloperHandoffRequest = z.infer<typeof DeveloperHandoffZ>;
 
@@ -98,12 +107,17 @@ export async function prepareDeveloperHandoff(req: DeveloperHandoffRequest, deps
   catch (err) { if (err instanceof GithubError) refuse(502, err.code, err.message); throw err; }
   const known = new Set(entries.filter(e => e.type === "blob").map(e => e.path));
 
-  // The preview's scope is resolved against the actual chosen commit's tree (it may differ from the proposed one).
-  const editScope: EditScopeEntry[] = preview.editScope.map(e => ({
-    path: e.path, from: e.from,
-    action: e.action === "consultar" ? "consultar" : known.has(e.path) ? "alterar" : "criar",
-  }));
-  if (!editScope.some(e => e.action !== "consultar")) refuse(409, "no_edit_scope", "Nenhum caminho de edição foi identificado para esta tarefa a partir da tarefa do Diretor e das análises do Arquiteto. Ajuste a tarefa do Diretor antes de enviar ao Desenvolvedor.");
+  // Authorization is exactly what the user chose here, checked against the real tree of the chosen commit —
+  // never the Architect's/task's own text (that heuristic is still computed by developerPreview() and shown
+  // as suggestedEditScope below, purely for reference; it grants nothing).
+  const seenPaths = new Set<string>();
+  const dupes: string[] = [];
+  for (const e of req.editScope) { if (seenPaths.has(e.path)) dupes.push(e.path); seenPaths.add(e.path); }
+  if (dupes.length) refuse(400, "duplicate_path", "Cada caminho só pode aparecer uma vez no escopo de edição.", [...new Set(dupes)]);
+  const missing = req.editScope.filter(e => e.action !== "criar" && !known.has(e.path)).map(e => e.path);
+  if (missing.length) refuse(400, "path_not_found", `Caminho(s) marcados para alterar/consultar que não existem no commit ${wantCommit.slice(0, 12)}: ${missing.join(", ")}. Se o arquivo ainda não existe, marque-o como "criar".`, missing);
+  const editScope: EditScopeEntry[] = req.editScope.map(e => ({ path: e.path, action: e.action, from: ["Selecionado por você na revisão do envio."] }));
+  if (!editScope.some(e => e.action !== "consultar")) refuse(409, "no_edit_scope", "Nenhum caminho foi marcado para alterar ou criar — marque ao menos um antes de enviar. Apenas consultar não dá ao Desenvolvedor nada para produzir.");
 
   const pSnap = (await store.snapshot(parent!.id)) as DirectorSnapshot;
   const demand = pSnap.demand;
@@ -143,7 +157,7 @@ export async function prepareDeveloperHandoff(req: DeveloperHandoffRequest, deps
 
   const snapshot: DeveloperSnapshot = {
     kind: "developer_task", agent, team, demand, task: task!, plan: planExcerpt, dependencies: preview.analyses,
-    base, editScope, outOfScope, tools, revision, limits: { timeoutMs: limits.callTimeoutMs, maxDiffChars: 40_000 },
+    base, editScope, suggestedEditScope: preview.editScope, outOfScope, tools, revision, limits: { timeoutMs: limits.callTimeoutMs, maxDiffChars: 40_000 },
   };
   const prompt = { system, user };
   const budget: RunBudget = { sheetTokens: budgetTokens, estimatedInputTokens: estimate, calls: [], reportedTotalTokens: null, exceeded: false };

@@ -353,7 +353,19 @@ export type DeveloperSnapshot = {
     /** Up to 60 paths, for reference only (the working copy has the whole tree). */
     sampleFiles: string[];
   };
+  /**
+   * The real, authorized scope for this run — set explicitly by the user when preparing the hand-off
+   * (never inferred from the Architect's text). This, not suggestedEditScope, is what the client's tool
+   * confinement and the post-run diff validation actually enforce.
+   */
   editScope: EditScopeEntry[];
+  /**
+   * Non-binding forecast, mentioned in the task and the Architect's analyses (extractFileRefs + verb
+   * heuristic) — shown to the user as a starting point when they pick editScope, but never itself a grant.
+   * "a confirmar" = the heuristic found an edit verb but could not tell create from modify (no local repo
+   * access at preview time).
+   */
+  suggestedEditScope: { path: string; action: "alterar" | "criar" | "consultar" | "a confirmar"; from: string[] }[];
   outOfScope: string[];
   tools: DeveloperTool[];
   revision: ContextRevision;

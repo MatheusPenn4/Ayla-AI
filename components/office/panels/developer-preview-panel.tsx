@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Download, Loader2, Lock, Send, X } from "lucide-react";
+import { Download, Loader2, Lock, Plus, Send, Trash2, X } from "lucide-react";
 import type { useRuns } from "@/hooks/use-runs";
 import { EngineApiError, engineApi } from "@/lib/engine/client";
 import { developerPreviewMarkdown, type DeveloperPreview } from "@/lib/engine/developer-preview";
@@ -9,6 +9,13 @@ import type { Agent } from "@/lib/office/types";
 import { TaskStateBadge } from "./run-dialog";
 
 type RunsApi = ReturnType<typeof useRuns>;
+type EditAction = "alterar" | "criar" | "consultar";
+type EditRow = { path: string; action: EditAction };
+const ACTION_LABEL: Record<EditAction, string> = { alterar: "Alterar", criar: "Criar", consultar: "Consultar (só leitura)" };
+
+/** The suggestion ("a confirmar" included) mapped onto a starting choice the user must still confirm. */
+const rowsFromSuggestion = (editScope: DeveloperPreview["editScope"]): EditRow[] =>
+  editScope.map(e => ({ path: e.path, action: e.action === "a confirmar" ? "alterar" : e.action }));
 
 /**
  * Preview of a FUTURE hand-off to the Developer, plus (when eligible) the real "Enviar ao Desenvolvedor"
@@ -22,14 +29,28 @@ export function DeveloperPreviewPanel({ planRunId, taskId, agents, runs, onOpenR
   const [p, setP] = useState<DeveloperPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [rows, setRows] = useState<EditRow[] | null>(null);
+  const [newPath, setNewPath] = useState("");
+  const [newAction, setNewAction] = useState<EditAction>("alterar");
   const sending = runs.pending.has(`${planRunId}:${taskId}`);
   useEffect(() => {
     let live = true;
     engineApi.developerPreview(planRunId, taskId)
-      .then(r => live && setP(r.preview))
+      .then(r => { if (live) { setP(r.preview); setRows(rowsFromSuggestion(r.preview.editScope)); } })
       .catch(e => live && setError(e instanceof EngineApiError ? e.message : "Não foi possível montar a prévia."));
     return () => { live = false; };
   }, [planRunId, taskId]);
+
+  const addRow = () => {
+    const path = newPath.trim();
+    if (!path) return;
+    if (rows?.some(r => r.path === path)) { setSendError(`"${path}" já está na lista.`); return; }
+    setRows(rs => [...(rs ?? []), { path, action: newAction }]);
+    setNewPath("");
+    setSendError(null);
+  };
+  const removeRow = (path: string) => setRows(rs => (rs ?? []).filter(r => r.path !== path));
+  const setRowAction = (path: string, action: EditAction) => setRows(rs => (rs ?? []).map(r => (r.path === path ? { ...r, action } : r)));
 
   // Local copy of the preview; the generic download helper is left for the Developer's own task (task-4).
   const download = () => {
@@ -41,9 +62,13 @@ export function DeveloperPreviewPanel({ planRunId, taskId, agents, runs, onOpenR
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const editable = (rows ?? []).filter(r => r.action !== "consultar");
+  const canSend = p?.eligible && !!rows?.length && editable.length > 0;
   const send = async () => {
     setSendError(null);
-    const r = await runs.prepareDeveloperHandoff(planRunId, taskId, agents);
+    if (!rows?.length) { setSendError("Escolha ao menos um caminho antes de enviar."); return; }
+    if (!editable.length) { setSendError("Marque ao menos um caminho para alterar ou criar — só consultar não dá ao Desenvolvedor nada para produzir."); return; }
+    const r = await runs.prepareDeveloperHandoff(planRunId, taskId, agents, rows.map(row => ({ path: row.path, action: row.action })));
     if (r.ok) onReview(r.run.id); else setSendError(r.error);
   };
 
@@ -54,15 +79,6 @@ export function DeveloperPreviewPanel({ planRunId, taskId, agents, runs, onOpenR
       <div className="send-head"><b>Prévia do envio ao Desenvolvedor · {p.task.id}</b><button className="icon-btn" onClick={onClose} aria-label="Fechar prévia"><X size={14} /></button></div>
       <div className="notice lock"><Lock size={14} /><div>{p.notice.map((n, i) => <p key={i}>{n}</p>)}</div></div>
       <p><b>Apta para revisão:</b> {p.eligible ? "sim — todas as dependências têm análise concluída do Arquiteto." : `não — ${p.blockers.join("; ")}.`}</p>
-      {p.eligible && (
-        <div className="task-actions">
-          <button className="btn-primary small" disabled={sending || !runs.status?.executionEnabled} onClick={() => void send()}>
-            {sending ? <><Loader2 size={13} className="spin" /> Preparando…</> : <><Send size={13} /> Enviar ao Desenvolvedor</>}
-          </button>
-          <span className="run-hint">Só congela a revisão; a cópia de trabalho é montada apenas se você confirmar.</span>
-        </div>
-      )}
-      {sendError && <p className="form-error" role="alert">{sendError}</p>}
 
       <section className="run-sec"><h4>Tarefas relevantes (estado real no executor)</h4>
         <table className="ctx-table"><thead><tr><th>Tarefa</th><th>Responsável</th><th>Relação</th><th>Estado</th></tr></thead>
@@ -93,9 +109,48 @@ export function DeveloperPreviewPanel({ planRunId, taskId, agents, runs, onOpenR
         {p.unverified.length ? <ul>{p.unverified.map((u, i) => <li key={i}><span className="tag">{u.source}</span> {u.text}</li>)}</ul> : <p className="muted">Nenhum registrado.</p>}
       </section>
 
-      <section className="run-sec"><h4>Escopo de edição previsto (não é permissão)</h4>
+      <section className="run-sec"><h4>Escopo de edição previsto (sugestão do Arquiteto/tarefa — nunca é permissão)</h4>
         {p.editScope.length ? <table className="ctx-table"><thead><tr><th>Arquivo</th><th>Previsão</th><th>Citado em</th></tr></thead><tbody>{p.editScope.map(e => <tr key={e.path}><td>{e.path}</td><td>{e.action}</td><td>{e.from.join(", ")}</td></tr>)}</tbody></table> : <p className="muted">Nenhum arquivo citado.</p>}
         <small>Fora do escopo desta tarefa:</small><ul>{p.outOfScope.map((o, i) => <li key={i}>{o}</li>)}</ul>
+      </section>
+
+      <section className="run-sec"><h4>Sua escolha — isto é a permissão real do Desenvolvedor</h4>
+        <p className="pane-intro">Marque explicitamente o que o Desenvolvedor pode alterar, criar ou só consultar nesta cópia isolada. A sugestão acima só preenche o ponto de partida; nada aqui vem automaticamente dela. Ao confirmar, cada caminho é conferido contra o commit de base real{p.base.proposed ? <> (<code>{p.base.proposed.commit.slice(0, 12)}</code>{p.base.proposed.via === "local_git" ? ", cópia local" : ""})</> : ""} — &ldquo;alterar&rdquo;/&ldquo;consultar&rdquo; precisam existir lá; &ldquo;criar&rdquo; não precisa.</p>
+        {rows && (
+          <table className="ctx-table">
+            <thead><tr><th>Arquivo</th><th>Ação</th><th /></tr></thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.path}>
+                  <td><code>{r.path}</code></td>
+                  <td>
+                    <select value={r.action} onChange={e => setRowAction(r.path, e.target.value as EditAction)} aria-label={`Ação para ${r.path}`}>
+                      {(Object.keys(ACTION_LABEL) as EditAction[]).map(a => <option key={a} value={a}>{ACTION_LABEL[a]}</option>)}
+                    </select>
+                  </td>
+                  <td><button type="button" className="icon-btn danger" onClick={() => removeRow(r.path)} aria-label={`Remover ${r.path}`}><Trash2 size={13} /></button></td>
+                </tr>
+              ))}
+              {!rows.length && <tr><td colSpan={3} className="muted">Nenhum caminho selecionado.</td></tr>}
+            </tbody>
+          </table>
+        )}
+        <div className="form-row">
+          <input value={newPath} onChange={e => setNewPath(e.target.value)} onKeyDown={e => e.key === "Enter" && (e.preventDefault(), addRow())} placeholder="caminho/do/arquivo.ts" aria-label="Novo caminho" />
+          <select value={newAction} onChange={e => setNewAction(e.target.value as EditAction)} aria-label="Ação do novo caminho">
+            {(Object.keys(ACTION_LABEL) as EditAction[]).map(a => <option key={a} value={a}>{ACTION_LABEL[a]}</option>)}
+          </select>
+          <button type="button" className="btn-secondary small" onClick={addRow} disabled={!newPath.trim()}><Plus size={13} /> Adicionar caminho</button>
+        </div>
+        {p.eligible && (
+          <div className="task-actions">
+            <button className="btn-primary small" disabled={!canSend || sending || !runs.status?.executionEnabled} onClick={() => void send()}>
+              {sending ? <><Loader2 size={13} className="spin" /> Preparando…</> : <><Send size={13} /> Enviar ao Desenvolvedor</>}
+            </button>
+            <span className="run-hint">Só congela a revisão para você confirmar depois; a cópia de trabalho é montada apenas se você aprovar.</span>
+          </div>
+        )}
+        {sendError && <p className="form-error" role="alert">{sendError}</p>}
       </section>
 
       <section className="run-sec limits"><h4>O que já está implementado e o que ainda falta</h4><ul>{p.future.map((f, i) => <li key={i}>{f}</li>)}</ul></section>

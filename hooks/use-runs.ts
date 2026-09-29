@@ -126,10 +126,12 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
 
   /**
    * “Enviar ao Desenvolvedor”: asks the executor to prepare (validate + freeze) the hand-off.
-   * Builds no working copy and calls no model — that only happens after approve().
+   * Builds no working copy and calls no model — that only happens after approve(). editScope is the
+   * user's own explicit choice of what the Developer may touch (never inferred from the Architect's text);
+   * the executor still checks every path against the real tree of the chosen commit.
    */
   const preparingDev = useRef(new Set<string>());
-  const prepareDeveloperHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], opts?: { source?: { commit: string }; revisionReason?: string }) => {
+  const prepareDeveloperHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], editScope: { path: string; action: "alterar" | "criar" | "consultar" }[], opts?: { source?: { commit: string }; revisionReason?: string }) => {
     const key = `${planRunId}:${taskId}`;
     if (preparingDev.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
     const developer = agents.find(a => a.id === "developer");
@@ -137,7 +139,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     preparingDev.current.add(key);
     setPending(s => new Set(s).add(key));
     try {
-      const { run } = await engineApi.prepareDeveloperHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(developer, agents), ...(opts ?? {}) });
+      const { run } = await engineApi.prepareDeveloperHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(developer, agents), editScope, ...(opts ?? {}) });
       setRuns(list => [run, ...list.filter(r => r.id !== run.id)]);
       return { ok: true as const, run };
     } catch (e) {

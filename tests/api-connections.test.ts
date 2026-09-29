@@ -170,9 +170,10 @@ describe("ExecutorService: conexões de API (CRUD) — a chave nunca sai do exec
     const plan = await store.create(buildNewRun(parsed.value));
     await store.update(plan.run.id, { status: "plan_ready", result: { outcome: "plan_ready", objective_summary: "x", context_understanding: "x", flow: { type: "short", rationale: "x", skipped_roles: [] }, questions: [], steps: [], tasks: [{ id: "t1", step_id: "s1", assignee: "developer", title: "x", scope: "x", inputs: "x", deliverable: "x", acceptance_criteria: [], depends_on: [] }], risks: [], assumptions: [], not_verified: [], limitations: [] } });
     const devAgent = member("developer", { connection: apiRef as never });
-    const parsedDev = DeveloperHandoffZ.safeParse({ idempotencyKey: "h:teste-dev-api-conexao", directorRunId: plan.run.id, taskId: "t1", agent: devAgent });
+    const editScope = [{ path: "src/x.ts", action: "alterar" as const }];
+    const parsedDev = DeveloperHandoffZ.safeParse({ idempotencyKey: "h:teste-dev-api-conexao", directorRunId: plan.run.id, taskId: "t1", agent: devAgent, editScope });
     expect(parsedDev.success).toBe(true);
-    const r = await s.prepareDeveloper({ idempotencyKey: "h:teste-dev-api-conexao", directorRunId: plan.run.id, taskId: "t1", agent: devAgent });
+    const r = await s.prepareDeveloper({ idempotencyKey: "h:teste-dev-api-conexao", directorRunId: plan.run.id, taskId: "t1", agent: devAgent, editScope });
     expect(body<{ error: { code: string } }>(r).error.code).toBe("adapter_not_write_restricted");
   });
 });

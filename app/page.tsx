@@ -113,11 +113,6 @@ export default function Home() {
     if (r.ok) { setRunId(null); setHandoffId(r.run.id); }
     else toast.error(r.error, { duration: 9000 });
   };
-  const handoffDeveloper = async (planRunId: string, taskId: string) => {
-    const r = await runs.prepareDeveloperHandoff(planRunId, taskId, agents);
-    if (r.ok) { setRunId(null); setDevHandoffId(r.run.id); }
-    else toast.error(r.error, { duration: 9000 });
-  };
   const handoffQA = async (planRunId: string, taskId: string) => {
     const r = await runs.prepareQAHandoff(planRunId, taskId, agents);
     if (r.ok) { setRunId(null); setQAHandoffId(r.run.id); }
@@ -317,7 +312,6 @@ export default function Home() {
         runId={runId} agents={agents} runs={runs} onClose={() => setRunId(null)} onOpenRun={setRunId}
         onCancel={id => void runs.cancel(id)} onReplan={(run, answers) => void replan(run, answers)}
         onHandoff={(planRunId, taskId, followUp) => void handoff(planRunId, taskId, followUp)} onReview={openReview}
-        onHandoffDeveloper={(planRunId, taskId) => void handoffDeveloper(planRunId, taskId)}
         onReviewDeveloper={id => { setRunId(null); setDevHandoffId(id); }}
         onHandoffQA={(planRunId, taskId) => void handoffQA(planRunId, taskId)}
         onHandoffReviewer={(planRunId, taskId) => void handoffReviewer(planRunId, taskId)}

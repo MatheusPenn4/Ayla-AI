@@ -870,7 +870,12 @@ import { existsSync } from "node:fs";
 import type { DeveloperResult, QAResult, QASnapshot } from "@/lib/engine/types";
 
 const developerSheet = (over = {}) => member("developer", { connection: "claude_code", tools: { read: true, edit: true, terminal: false }, brief: "# Desenvolvedor\nFicha salva do Desenvolvedor.", budget: 48000, ...over });
-const devReq = (planId: string, taskId = "t3", over = {}) => ({ idempotencyKey: `h:${Math.random().toString(36).slice(2, 12)}`, directorRunId: planId, taskId, agent: developerSheet(), ...over });
+// Matches what chainPlan's t3 (and archPlan's t3, same repo fixture) really has in makeDevRepo(): src/botao.tsx
+// exists (alterar), src/serializador.ts does not yet (criar) — the same pair the old auto-inference used to
+// derive from the Architect's guidance text. Explicit now: the caller states it, prepareDeveloperHandoff no
+// longer infers it from that text (see "Desenvolvedor: escopo de edição escolhido explicitamente" below).
+const devEditScope = [{ path: "src/serializador.ts", action: "criar" as const }, { path: "src/botao.tsx", action: "alterar" as const }];
+const devReq = (planId: string, taskId = "t3", over = {}) => ({ idempotencyKey: `h:${Math.random().toString(36).slice(2, 12)}`, directorRunId: planId, taskId, agent: developerSheet(), editScope: devEditScope, ...over });
 
 const devResult = (over: Partial<DeveloperResult> = {}): DeveloperResult => ({
   outcome: "done", summary: "Criado o serializador e ajustado o botão.",
@@ -1033,6 +1038,80 @@ describe("Desenvolvedor: preparar o envio (nada é construído ou chamado)", () 
     const ids = new Set([a, b, c].map(r => body<{ run: RunDetail }>(r).run.id));
     expect(ids.size).toBe(1);
   });
+});
+
+describe("Desenvolvedor: escopo de edição escolhido explicitamente (nunca inferido da sugestão do Arquiteto)", () => {
+  it("recusa corpo sem editScope (campo agora obrigatório na validação de entrada)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const { editScope, ...noScope } = devReq(plan, "t3");
+    void editScope;
+    const r = await svc.prepareDeveloper(noScope);
+    expect(r.status).toBe(400);
+  });
+
+  it("recusa quando nenhum caminho é marcado para alterar/criar (só consultar não autoriza nada)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareDeveloper(devReq(plan, "t3", { editScope: [{ path: "src/botao.tsx", action: "consultar" }] }));
+    expect(body<{ error: { code: string } }>(r).error.code).toBe("no_edit_scope");
+  });
+
+  it("valida que um caminho marcado \"alterar\" ou \"consultar\" existe de verdade no commit escolhido — recusa se não existir", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareDeveloper(devReq(plan, "t3", { editScope: [{ path: "src/nao-existe.ts", action: "alterar" }] }));
+    const err = body<{ error: { code: string; details?: string[] } }>(r).error;
+    expect(err.code).toBe("path_not_found");
+    expect(err.details).toContain("src/nao-existe.ts");
+  });
+
+  it("um caminho marcado \"criar\" não precisa existir no commit — passa mesmo sem estar na árvore", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareDeveloper(devReq(plan, "t3", { editScope: [{ path: "src/novo-arquivo-que-nao-existe.ts", action: "criar" }] }));
+    expect(r.status).toBe(201);
+    const snap = body<{ run: RunDetail }>(r).run.snapshot as { editScope: { path: string; action: string }[] };
+    expect(snap.editScope).toEqual([{ path: "src/novo-arquivo-que-nao-existe.ts", action: "criar", from: ["Selecionado por você na revisão do envio."] }]);
+  });
+
+  it("recusa caminho repetido no escopo de edição", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const r = await svc.prepareDeveloper(devReq(plan, "t3", { editScope: [{ path: "src/botao.tsx", action: "alterar" }, { path: "src/botao.tsx", action: "consultar" }] }));
+    expect(body<{ error: { code: string } }>(r).error.code).toBe("duplicate_path");
+  });
+
+  it("a sugestão do Arquiteto/tarefa fica só como suggestedEditScope, informativa — um caminho que ela cita mas o usuário não escolheu NÃO fica autorizado", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store); // t2's guidance mentions src/serializador.ts and src/botao.tsx
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    // The user explicitly authorizes ONLY src/estilo.css (present in the repo, never mentioned by the Architect at all) to consult.
+    const r = await svc.prepareDeveloper(devReq(plan, "t3", { editScope: [{ path: "src/estilo.css", action: "consultar" }, { path: "src/serializador.ts", action: "criar" }] }));
+    expect(r.status).toBe(201);
+    const snap = body<{ run: RunDetail }>(r).run.snapshot as {
+      editScope: { path: string; action: string }[];
+      suggestedEditScope: { path: string; action: string }[];
+    };
+    // Real, enforced authorization: exactly what was chosen — src/botao.tsx is NOT there, even though the
+    // Architect's own guidance (reused by localChainWithAnalyses) recommends changing it.
+    expect(snap.editScope.map(e => e.path).sort()).toEqual(["src/estilo.css", "src/serializador.ts"]);
+    expect(snap.editScope.find(e => e.path === "src/botao.tsx")).toBeUndefined();
+    // The suggestion is still shown (transparency), but it is a different field, never merged into editScope.
+    expect(snap.suggestedEditScope.some(e => e.path === "src/botao.tsx")).toBe(true);
+  });
+
+  // The exact real-world scenario (plan d1618429, task T2, commit 5272e1f0e5a486f85d15340ec5675c6272f09933,
+  // editScope = run-dialog.tsx:alterar + plan-markdown.ts:consultar) was verified live against the real
+  // running executor and the real plan instead of a synthetic fixture here — see the session report: it
+  // reproduced the original "no_edit_scope" failure's exact cause (the old heuristic classified every cited
+  // path, including run-dialog.tsx, as "consultar") and confirmed the explicit editScope fixes it, without
+  // ever calling a model, then canceled that test hand-off so the user's own selection is what they confirm.
 });
 
 describe("Desenvolvedor: aprovação, execução real (materializada) e diff", () => {
