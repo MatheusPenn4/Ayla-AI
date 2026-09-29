@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { Tabs } from "radix-ui";
-import { AlertTriangle, ArrowLeft, CheckCircle2, CircleDashed, Clock, Download, FileText, HelpCircle, Loader2, RefreshCw, Send, ShieldCheck, XCircle } from "lucide-react";
+import { AlertTriangle, ArrowLeft, CheckCircle2, CircleDashed, Clock, Copy, Download, FileText, HelpCircle, Loader2, RefreshCw, Send, ShieldCheck, XCircle } from "lucide-react";
+import { toast } from "sonner";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import type { useRuns } from "@/hooks/use-runs";
 import { Avatar } from "../avatar";
@@ -192,8 +193,12 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   // — no extra fetch per task. stateLabel/architectSummary reflect the REAL state the UI already shows
   // elsewhere; a clarification asked isn't enough for "resolvido" here — only a VALIDATED TaskCompletion
   // (dependencyEvidence) is, so this never claims more than the dependency rule itself accepts.
-  const downloadPlanMarkdown = () => {
-    if (!res) return;
+  // Single source of the plan's Markdown text — both the download and the "Copiar Markdown" action
+  // call this and only this to build the string, so neither duplicates directorPlanToMarkdown's rules.
+  // generatedAt is stamped fresh on each call (download and copy may happen at different times), so the
+  // two outputs can legitimately differ only on that "gerado em" line.
+  const buildPlanMarkdown = () => {
+    if (!res) return null;
     const steps: PlanMarkdownStep[] = res.steps.map(s => ({ step: s, ownerName: name(s.owner) }));
     const tasks: PlanMarkdownTask[] = res.tasks.map(t => {
       const st = taskState(t, runsOf(t.id));
@@ -203,8 +208,23 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
       const architectSummary = isHandoffTarget(t.assignee) && st.run?.analysis ? st.run.analysis.recommendation.summary : null;
       return { task: t, assigneeName: name(t.assignee), stateLabel, architectSummary, architectSummaryNote: null };
     });
-    const md = directorPlanToMarkdown({ demandTitle: snap.demand.title, runId: run.id, generatedAt: new Date().toLocaleString("pt-BR"), plan: res, steps, tasks });
+    return directorPlanToMarkdown({ demandTitle: snap.demand.title, runId: run.id, generatedAt: new Date().toLocaleString("pt-BR"), plan: res, steps, tasks });
+  };
+
+  const downloadPlanMarkdown = () => {
+    const md = buildPlanMarkdown();
+    if (!md) return;
     downloadTextFile(planMarkdownFilename(snap.demand.title, run.id), md, "text/markdown;charset=utf-8");
+  };
+
+  const copyPlanMarkdown = () => {
+    const md = buildPlanMarkdown();
+    if (!md) return;
+    if (!navigator.clipboard?.writeText) { toast.error("Não foi possível copiar: a área de transferência não está disponível neste navegador."); return; }
+    navigator.clipboard.writeText(md).then(
+      () => toast.success("Markdown copiado."),
+      () => toast.error("Não foi possível copiar; verifique as permissões do navegador.")
+    );
   };
 
   return (
@@ -394,6 +414,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
 
       <div className="dialog-actions">
         {res && <button className="btn-secondary" onClick={downloadPlanMarkdown}><Download size={14} /> Baixar plano em Markdown</button>}
+        {res && <button className="btn-secondary" onClick={copyPlanMarkdown}><Copy size={14} /> Copiar Markdown</button>}
         {!active && <button className="btn-secondary" onClick={() => onReplan(run)}><RefreshCw size={14} /> Planejar novamente</button>}
       </div>
     </>
