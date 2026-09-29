@@ -93,6 +93,22 @@ async function collectDeliveryChain(task: PlanTask, tasks: PlanTask[], store: Ru
         diffText: diff?.diffText ?? null, diffTruncated: diff?.diffTruncated ?? false,
         note: `Pediu esclarecimento ao modelo; entrega resolvida e validada localmente. ${ev.completion.note}`,
       });
+    } else if (ev.kind === "applied_run_result_validated") {
+      // The FINAL diff is the committed one (what actually landed in the checkout); the Developer run's own
+      // original diff stays in that run's record, referenced by id, untouched.
+      let diffText: string | null = null, diffTruncated = false;
+      if (local?.dirs.length) {
+        try {
+          const repos = await listLocalRepos(local.dirs, local.git);
+          const repo = repos[0];
+          if (repo) { const d = await readCommitDiff(repo.dir, ev.completion.commit, local.git); diffText = d.diffText; diffTruncated = d.diffTruncated; }
+        } catch { /* best effort: the deliverable still lists commit/files/verification without a diff */ }
+      }
+      deliverables.push({
+        taskId: dep.id, title: dep.title, assignee: dep.assignee, origin: "applied_run_result_validated",
+        commit: ev.completion.commit, files: ev.completion.files, verification: ev.completion.verification,
+        diffText, diffTruncated, note: `Resultado da execução ${ev.run.id} do Desenvolvedor, aplicado ao checkout e validado localmente (diff acima = diff final do commit; o diff original continua no registro dessa execução). ${ev.completion.note}`,
+      });
     } else if (ev.kind === "direct_implementation_validated") {
       let diffText: string | null = null, diffTruncated = false;
       if (local?.dirs.length) {

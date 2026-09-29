@@ -474,7 +474,7 @@ export class ExecutorService {
     } | null;
     if (typeof b?.parentRunId !== "string" || !/^[0-9a-f-]{36}$/.test(b.parentRunId)) return err(400, "invalid_body", "parentRunId inválido.");
     if (typeof b.taskId !== "string" || !b.taskId.trim()) return err(400, "invalid_body", "Informe taskId.");
-    if (b.kind !== "resolved_clarification" && b.kind !== "direct_implementation") return err(400, "invalid_body", "kind deve ser resolved_clarification ou direct_implementation.");
+    if (b.kind !== "resolved_clarification" && b.kind !== "direct_implementation" && b.kind !== "applied_run_result") return err(400, "invalid_body", "kind deve ser resolved_clarification, direct_implementation ou applied_run_result.");
     if (typeof b.commit !== "string" || !/^[0-9a-f]{40}$/.test(b.commit)) return err(400, "invalid_body", "Informe o commit (hash de 40 caracteres).");
     if (!Array.isArray(b.files) || !b.files.every(f => typeof f === "string")) return err(400, "invalid_body", "files deve ser uma lista de caminhos.");
     if (typeof b.note !== "string" || !b.note.trim()) return err(400, "invalid_body", "Informe note.");
@@ -492,6 +492,17 @@ export class ExecutorService {
       if (!source || source.kind !== "developer_task" || source.taskId !== b.taskId) return err(404, "source_run_not_found", "sourceRunId não corresponde a uma execução do Desenvolvedor desta tarefa.");
       if (source.status !== "awaiting_clarification" || !source.localResolution) return err(409, "no_local_resolution", "A execução indicada não tem um esclarecimento resolvido localmente (localResolution) para validar.");
       if (source.localResolution.commit !== b.commit) return err(409, "commit_mismatch", "O commit informado não é o mesmo do localResolution da execução indicada.");
+      sourceRunId = b.sourceRunId;
+    } else if (b.kind === "applied_run_result") {
+      // The delivery must point at THE Developer run that produced the diff (same plan, same task, finished for real),
+      // and may list only files that run itself changed — applying the result never widens what the run delivered.
+      if (typeof b.sourceRunId !== "string" || !/^[0-9a-f-]{36}$/.test(b.sourceRunId)) return err(400, "invalid_body", "applied_run_result exige sourceRunId (a execução do Desenvolvedor cujo resultado foi aplicado).");
+      const source = await this.store.get(b.sourceRunId);
+      if (!source || source.kind !== "developer_task" || source.taskId !== b.taskId || source.parentRunId !== b.parentRunId) return err(404, "source_run_not_found", "sourceRunId não corresponde a uma execução do Desenvolvedor desta tarefa neste plano.");
+      if (source.status !== "implementation_ready" || !source.developer?.diff) return err(409, "source_not_ready", "A execução indicada não está concluída (implementation_ready) com um diff registrado.");
+      const delivered = new Set(source.developer.diff.files.map(f => f.path));
+      const extra = (b.files as string[]).filter(f => !delivered.has(f));
+      if (!(b.files as string[]).length || extra.length) return err(409, "files_outside_run_diff", `Os arquivos informados precisam ser os que a execução original alterou; fora do diff dela: ${extra.join(", ") || "(lista vazia)"}.`);
       sourceRunId = b.sourceRunId;
     } else if (b.sourceRunId !== undefined && b.sourceRunId !== null) {
       return err(400, "invalid_body", "direct_implementation não usa sourceRunId (não há execução de origem).");

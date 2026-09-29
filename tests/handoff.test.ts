@@ -1405,6 +1405,60 @@ describe("QA: preparar o envio (dependência real, transitiva, jamais por chamad
   });
 });
 
+describe("TaskCompletion applied_run_result: o resultado da execução do Desenvolvedor, aplicado e validado, vinculado à execução original", () => {
+  const VERIF = (at = "2026-09-29T19:00:00.000Z") => ({
+    typecheck: { ran: true, command: "pnpm exec tsc --noEmit", result: "0 erros", at }, lint: { ran: true, command: "pnpm lint", result: "0 problemas", at },
+    tests: { ran: true, command: "pnpm test", result: "225 passando", at }, build: { ran: true, command: "pnpm build", result: "ok", at },
+  });
+  async function setup() {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithRealImplementation(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const demandId = (await store.get(plan))!.demandId;
+    const devRun = (await store.listForDemands([demandId])).find(r => r.kind === "developer_task" && r.taskId === "t3")!;
+    const full = (await store.get(devRun.id))!;
+    return { repo, plan, svc, full, files: full.developer!.diff!.files.map(f => f.path) };
+  }
+  const req = (plan: string, over: Record<string, unknown>) => ({ parentRunId: plan, taskId: "t3", kind: "applied_run_result", commit: "a".repeat(40), verification: VERIF(), note: "Aplicado e validado.", ...over });
+
+  it("registra vinculado à execução original, sem alterar essa execução, e o QA passa a receber a entrega com commit, arquivos e verificação", async () => {
+    const { repo, plan, svc, full, files } = await setup();
+    const before = JSON.stringify(await store.get(full.id));
+    const r = await svc.recordTaskCompletion(req(plan, { sourceRunId: full.id, files, commit: repo.base }));
+    expect(r.status).toBe(201);
+    const c = body<{ completion: TaskCompletion }>(r).completion;
+    expect(c).toMatchObject({ kind: "applied_run_result", sourceRunId: full.id, taskId: "t3", commit: repo.base, files, validatedBy: "orchestrator" });
+    expect(JSON.stringify(await store.get(full.id))).toBe(before); // histórico da execução original intacto
+    const qa = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
+    const d = (qa.snapshot as QASnapshot).deliverables.find(x => x.taskId === "t3")!;
+    expect(d.origin).toBe("applied_run_result_validated");
+    expect(d.commit).toBe(repo.base);
+    expect(d.files).toEqual(files);
+    expect(d.verification?.tests?.result).toBe("225 passando");
+    expect(d.note).toContain(full.id);
+  });
+
+  it("recusa arquivos que a execução original não alterou, lista vazia, origem de outra tarefa e origem inexistente", async () => {
+    const { plan, svc, full, files } = await setup();
+    const code = async (over: Record<string, unknown>) => body<{ error: { code: string } }>(await svc.recordTaskCompletion(req(plan, over))).error.code;
+    expect(await code({ sourceRunId: full.id, files: [...files, "src/outro.ts"] })).toBe("files_outside_run_diff");
+    expect(await code({ sourceRunId: full.id, files: [] })).toBe("files_outside_run_diff");
+    expect(await code({ sourceRunId: undefined, files })).toBe("invalid_body");
+    expect(await code({ sourceRunId: "00000000-0000-4000-8000-000000000000", files })).toBe("source_run_not_found");
+    expect(await code({ sourceRunId: full.id, files, taskId: "t1" })).toBe("source_run_not_found");
+  });
+
+  it("a regra de dependência só reconhece a conclusão que aponta para a ÚLTIMA execução (uma antiga não sobrepõe o estado real)", () => {
+    const t3: PlanTask = { id: "t3", step_id: "s", assignee: "developer", title: "t3", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: [] };
+    const t4: PlanTask = { id: "t4", step_id: "s", assignee: "developer", title: "t4", scope: "", inputs: "", deliverable: "", acceptance_criteria: [], depends_on: ["t3"] };
+    const old = { id: "old", status: "implementation_ready" } as unknown as RunRecord;
+    const latestFailed = { id: "new", status: "failed" } as unknown as RunRecord;
+    const done = { id: "c", kind: "applied_run_result", sourceRunId: "old", taskId: "t3" } as unknown as TaskCompletion;
+    expect(dependencyBlocker(t4, [t3, t4], () => [old], () => [done])).toBeNull();
+    expect(dependencyBlocker(t4, [t3, t4], () => [latestFailed, old], () => [done])).toBe("Depende de t3: a última execução falhou.");
+  });
+});
+
 describe("QA: aprovação, execução real (simulada) e classificação dos critérios", () => {
   it("execução completa: cada critério da demanda classificado, review_ready, uma única chamada", async () => {
     const repo = makeDevRepo(work);

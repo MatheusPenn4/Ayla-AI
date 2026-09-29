@@ -417,7 +417,7 @@ export type LocalResolution = {
 };
 
 /** How a task's dependency requirement was satisfied — evidence-based, never assumed just because a field exists. */
-export type TaskCompletionKind = "resolved_clarification" | "direct_implementation";
+export type TaskCompletionKind = "resolved_clarification" | "direct_implementation" | "applied_run_result";
 
 /** One real, controlled check the orchestrator ran (never claimed without having actually run it). */
 export type VerificationCheck = { ran: boolean; command: string; result: string; at: string } | null;
@@ -428,7 +428,9 @@ export type Verification = { typecheck: VerificationCheck; lint: VerificationChe
  * this, never a bare `LocalResolution`, is what other tasks' dependencies are allowed to consult (see
  * lib/engine/dependency.ts). `kind: "resolved_clarification"` requires `sourceRunId` to point at a run that
  * itself carries a matching `LocalResolution` (the raw, narrower fact); `kind: "direct_implementation"`
- * covers work implemented directly by the orchestrator outside any hand-off, with no source run at all.
+ * covers work implemented directly by the orchestrator outside any hand-off, with no source run at all;
+ * `kind: "applied_run_result"` records that the diff a Developer run produced (`sourceRunId`, status
+ * implementation_ready) was applied to the checkout, verified and committed — the run itself is untouched.
  */
 export type TaskCompletion = {
   id: string;
@@ -455,7 +457,7 @@ export type QADeliverable = {
   title: string;
   assignee: string;
   /** How this deliverable came to exist — mirrors DependencyEvidence's own distinctions (lib/engine/dependency.ts). */
-  origin: "run_completed" | "resolved_clarification_validated" | "direct_implementation_validated";
+  origin: "run_completed" | "resolved_clarification_validated" | "direct_implementation_validated" | "applied_run_result_validated";
   commit: string | null;
   files: string[];
   verification: Verification | null;

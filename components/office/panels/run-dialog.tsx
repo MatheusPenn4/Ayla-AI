@@ -204,7 +204,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
       const st = taskState(t, runsOf(t.id));
       const base = TASK_STATE_LABEL[st.key];
       const ev = dependencyEvidence(t, runsOf, completionsOf);
-      const stateLabel = ev.kind === "resolved_clarification_validated" || ev.kind === "direct_implementation_validated" ? `${base} — ${evidenceLabel(ev)}` : base;
+      const stateLabel = ev.kind === "resolved_clarification_validated" || ev.kind === "direct_implementation_validated" || ev.kind === "applied_run_result_validated" ? `${base} — ${evidenceLabel(ev)}` : base;
       const architectSummary = isHandoffTarget(t.assignee) && st.run?.analysis ? st.run.analysis.recommendation.summary : null;
       return { task: t, assigneeName: name(t.assignee), stateLabel, architectSummary, architectSummaryNote: null };
     });

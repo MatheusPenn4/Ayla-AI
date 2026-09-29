@@ -323,7 +323,7 @@ export class RunStore {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [row.id, row.demandId, row.parentRunId, row.taskId, row.kind, row.sourceRunId, row.commit, JSON.stringify(row.files), JSON.stringify(row.verification), row.note, row.validatedBy, row.validatedAt, row.createdAt],
     );
-    await this.event(row.parentRunId, "task_completion_recorded", `Entrega validada de ${row.taskId} (${row.kind === "direct_implementation" ? "implementada diretamente, fora do encaminhamento" : "esclarecimento resolvido e validado"}): commit ${row.commit.slice(0, 12)}, ${row.files.length} arquivo(s), validado por ${row.validatedBy}.`, row);
+    await this.event(row.parentRunId, "task_completion_recorded", `Entrega validada de ${row.taskId} (${row.kind === "direct_implementation" ? "implementada diretamente, fora do encaminhamento" : row.kind === "applied_run_result" ? `resultado da execução ${row.sourceRunId?.slice(0, 8)} aplicado e validado` : "esclarecimento resolvido e validado"}): commit ${row.commit.slice(0, 12)}, ${row.files.length} arquivo(s), validado por ${row.validatedBy}.`, row);
     return row;
   }
 

@@ -9,6 +9,8 @@
 //   (a TaskCompletion of kind "resolved_clarification" exists, referencing the run's own LocalResolution);
 // - OR the task was implemented directly by the orchestrator, outside any hand-off, with its own validated
 //   TaskCompletion (kind "direct_implementation").
+// - OR the diff of the dependency's own finished Developer run was applied to the checkout, verified and
+//   committed, with a validated TaskCompletion of kind "applied_run_result" pointing at that very run.
 // A LocalResolution alone (the model asked a question, later answered) never satisfies anything by itself —
 // only a matching, validated TaskCompletion does. This module never writes anything; it only reads.
 import { isExecutableAssignee } from "./handoff-state";
@@ -18,6 +20,7 @@ export type DependencyEvidence =
   | { kind: "run_completed"; run: RunRecord }
   | { kind: "resolved_clarification_validated"; run: RunRecord; completion: TaskCompletion }
   | { kind: "direct_implementation_validated"; completion: TaskCompletion }
+  | { kind: "applied_run_result_validated"; run: RunRecord; completion: TaskCompletion }
   | { kind: "unmet"; reason: "not_executable" | "proposed" | "in_progress" | "clarification_unvalidated" | "failed" | "canceled" };
 
 /** Statuses that mean "this collaborator's own call finished successfully" — one per phase added so far. */
@@ -35,6 +38,11 @@ export function dependencyEvidence(dep: PlanTask, runsOf: (taskId: string) => Ru
   const runs = runsOf(dep.id);
   const latest = runs[0] ?? null;
   if (!latest) return { kind: "unmet", reason: "proposed" };
+  // Only a completion that points at THE latest run counts; a stale one (older run) never overrides what the latest run says.
+  if (latest.status === "implementation_ready") {
+    const applied = completions.find(c => c.kind === "applied_run_result" && c.sourceRunId === latest.id);
+    if (applied) return { kind: "applied_run_result_validated", run: latest, completion: applied };
+  }
   if (COMPLETED_STATUSES.includes(latest.status)) return { kind: "run_completed", run: latest };
   if (latest.status === "awaiting_clarification") {
     const match = latest.localResolution && completions.find(c => c.kind === "resolved_clarification" && c.sourceRunId === latest.id && c.commit === latest.localResolution!.commit);
@@ -62,6 +70,7 @@ export function evidenceLabel(ev: DependencyEvidence): string {
   switch (ev.kind) {
     case "run_completed": return "Execução do agente concluída";
     case "resolved_clarification_validated": return `Esclarecimento resolvido e entrega validada localmente (commit ${ev.completion.commit.slice(0, 8)})`;
+    case "applied_run_result_validated": return `Resultado do Desenvolvedor aplicado e validado localmente (commit ${ev.completion.commit.slice(0, 8)})`;
     case "direct_implementation_validated": return `Implementada diretamente, fora do encaminhamento (commit ${ev.completion.commit.slice(0, 8)})`;
     case "unmet": return "Não satisfeita";
   }
