@@ -37,9 +37,10 @@ export function StatusBadge({ status }: { status: RunStatus | "prepared" }) {
   return <span className={`run-badge st-${status}`}><Icon size={13} className={ACTIVE_STATUSES.includes(status as RunStatus) ? "spin" : ""} aria-hidden />{label}</span>;
 }
 
-export function TaskStateBadge({ state }: { state: TaskStateKey }) {
+/** `label`/`title` override the text only when real evidence says more than the run status alone (e.g. an applied, validated delivery). */
+export function TaskStateBadge({ state, label, title }: { state: TaskStateKey; label?: string; title?: string }) {
   const Icon = state === "working" || state === "queued" ? Loader2 : state === "analysis_ready" ? CheckCircle2 : state === "awaiting_clarification" ? HelpCircle : state === "awaiting_approval" ? Clock : state === "failed" ? XCircle : CircleDashed;
-  return <span className={`task-state ts-${state}`}><Icon size={12} className={state === "working" || state === "queued" ? "spin" : ""} aria-hidden />{TASK_STATE_LABEL[state]}</span>;
+  return <span className={`task-state ts-${state}`} title={title}><Icon size={12} className={state === "working" || state === "queued" ? "spin" : ""} aria-hidden />{label ?? TASK_STATE_LABEL[state]}</span>;
 }
 
 type DialogProps = {
@@ -299,7 +300,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
               const sending = runs.pending.has(`${run.id}:${t.id}`);
               return (
                 <article key={t.id} className={`task-card ${isHandoffTarget(t.assignee) ? "is-handoff" : ""}`}>
-                  <header>{a ? <Avatar look={a.look} color={a.color} size={30} /> : null}<div><b>{t.id} · {t.title}</b><small>{name(t.assignee)} · etapa {t.step_id || "—"}{t.depends_on.length ? ` · depende de ${t.depends_on.join(", ")}` : ""}</small></div><TaskStateBadge state={st.key} /></header>
+                  <header>{a ? <Avatar look={a.look} color={a.color} size={30} /> : null}<div><b>{t.id} · {t.title}</b><small>{name(t.assignee)} · etapa {t.step_id || "—"}{t.depends_on.length ? ` · depende de ${t.depends_on.join(", ")}` : ""}</small></div>{(() => { const ev = dependencyEvidence(t, runsOf, completionsOf); return ev.kind === "applied_run_result_validated" ? <TaskStateBadge state={st.key} label="Implementação aplicada e validada" title={evidenceLabel(ev)} /> : <TaskStateBadge state={st.key} />; })()}</header>
                   <dl>
                     <dt>Escopo</dt><dd>{t.scope}</dd>
                     <dt>Insumos</dt><dd>{t.inputs || "—"}</dd>
