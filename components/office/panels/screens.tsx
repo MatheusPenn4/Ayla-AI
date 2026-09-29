@@ -15,6 +15,7 @@ import { isHandoffTarget, taskState } from "@/lib/engine/handoff-state";
 
 type RunsApi = ReturnType<typeof useRuns>;
 import { presetUpdate } from "@/lib/office/profile";
+import { PHASE_LABEL } from "@/lib/office/phase";
 import type { Agent, Demand } from "@/lib/office/types";
 
 const when = (iso: string) => {
@@ -50,7 +51,7 @@ export function TeamScreen({ agents, status, onOpen, onReview, onHire }: { agent
             </div>
           );
         })}
-        <div className="cap" title="Colaboradores cuja conexão escolhida na ficha está ativa neste computador. Nesta fase só o Diretor executa."><span>Com conexão ativa</span><b>{connected}<small>/{agents.length}</small></b><div className="cap-bar"><i style={{ width: `${agents.length ? (connected / agents.length) * 100 : 0}%` }} /></div></div>
+        <div className="cap" title="Colaboradores cuja conexão escolhida na ficha está ativa neste computador."><span>Com conexão ativa</span><b>{connected}<small>/{agents.length}</small></b><div className="cap-bar"><i style={{ width: `${agents.length ? (connected / agents.length) * 100 : 0}%` }} /></div></div>
       </div>
       <div className="team-grid">
         {agents.map((a, i) => (
@@ -89,8 +90,8 @@ function EngineBanner({ runs, director, onOpenDirector }: { runs: RunsApi; direc
     <div className={`engine-banner ${blocking ? "has-issues" : "is-ready"}`}>
       <div className="engine-head">
         <span className={`led ${blocking ? "amber" : "green"}`} />
-        <b>Motor do Diretor · fase 1</b>
-        <span className="muted">Diretor planeja · Arquiteto analisa (só leitura) e Desenvolvedor implementa (cópia isolada), só com sua revisão e confirmação · GitHub: só repositórios públicos, leitura limitada</span>
+        <b>Motor do Setor IA · {PHASE_LABEL}</b>
+        <span className="muted">Diretor e Arquiteto já executam de verdade · Desenvolvedor implementa em cópia isolada · QA e Revisor existem, mas aguardam validação em execução real · GitHub: só repositórios públicos, leitura limitada</span>
         <button className="btn-ghost" disabled={runs.checking} onClick={() => { void runs.verify(); void runs.refresh(); }}>{runs.checking ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>
         <button className="btn-ghost" onClick={onOpenDirector}>Ficha do Diretor</button>
       </div>

@@ -20,6 +20,7 @@ import { TIER_LABEL, type Tier } from "@/components/office/scene/quality";
 import { useOffice } from "@/hooks/use-office";
 import { useRuns } from "@/hooks/use-runs";
 import { ZONE_LABEL } from "@/lib/office/defaults";
+import { PHASE_LABEL, PHASE_SUMMARY } from "@/lib/office/phase";
 import { presetUpdate } from "@/lib/office/profile";
 import { CAPACITY, STATION_BY_ID, ZONES } from "@/lib/office/layout";
 import { loadPrefs, savePrefs, serializeOffice, type QualityPref } from "@/lib/office/storage";
@@ -188,7 +189,7 @@ export default function Home() {
         <Roster agents={agents} selectedId={selectedIdLive} demandCounts={demandCounts} onSelect={select} onHover={setHoveredId} />
         <button className="add-rail" onClick={() => openHire()} disabled={agents.length >= CAPACITY}><Plus size={15} /> Contratar funcionário</button>
         <div className="rail-spacer" />
-        <div className="phase-card"><b><span className={`led ${runs.status?.executor.reachable ? "green" : "amber"}`} /> FASE 01 · DIRETOR</b><p>O Diretor planeja de verdade pelo executor local (Claude Code ou Codex). O Arquiteto analisa só as tarefas que você aprovar; os demais ainda não executam.</p></div>
+        <div className="phase-card"><b><span className={`led ${runs.status?.executor.reachable ? "green" : "amber"}`} /> {PHASE_LABEL}</b><p>{PHASE_SUMMARY}</p></div>
       </aside>
 
       <div className="stage-shell">
@@ -203,7 +204,7 @@ export default function Home() {
             </div>
           )}
           <div className="hud-actions">
-            <span className="status-pill"><span className="led amber" /> Preparação</span>
+            <span className="status-pill" title={PHASE_SUMMARY}><span className="led amber" /> {PHASE_LABEL}</span>
             <button className="btn-primary" onClick={() => openDemand("director")}><Send size={15} /> <span className="hide-sm">Enviar demanda</span></button>
           </div>
         </header>
