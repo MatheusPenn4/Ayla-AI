@@ -355,7 +355,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                     return (
                       <div className="task-actions">
                         {canSend && (
-                          <button className="btn-primary small" disabled={!!qaBlocker || sending || !runs.status?.executionEnabled} title={qaBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffQA(run.id, t.id)}>
+                          <button className="btn-primary small" disabled={!!qaBlocker || sending || !runs.status?.executionEnabled} title={qaBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffQA(run.id, t.id, tr.some(r => r.status === "review_ready") ? { repeat: true } : undefined)}>
                             {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><Send size={13} /> {st.key === "proposed" ? "Enviar ao QA" : "Enviar ao QA novamente"}</>}
                           </button>
                         )}
@@ -377,7 +377,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                     return (
                       <div className="task-actions">
                         {canSend && (
-                          <button className="btn-primary small" disabled={!!reviewerBlocker || sending || !runs.status?.executionEnabled} title={reviewerBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffReviewer(run.id, t.id)}>
+                          <button className="btn-primary small" disabled={!!reviewerBlocker || sending || !runs.status?.executionEnabled} title={reviewerBlocker ?? runs.status?.disabledReason ?? undefined} onClick={() => onHandoffReviewer(run.id, t.id, tr.some(r => r.status === "concluded") ? { repeat: true } : undefined)}>
                             {sending ? <><Loader2 size={13} className="spin" /> Preparando o envio…</> : <><Send size={13} /> {st.key === "proposed" ? "Enviar ao Revisor" : "Enviar ao Revisor novamente"}</>}
                           </button>
                         )}
