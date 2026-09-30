@@ -118,8 +118,8 @@ export default function Home() {
     if (r.ok) { setRunId(null); setQAHandoffId(r.run.id); }
     else toast.error(r.error, { duration: 9000 });
   };
-  const handoffReviewer = async (planRunId: string, taskId: string) => {
-    const r = await runs.prepareReviewerHandoff(planRunId, taskId, agents);
+  const handoffReviewer = async (planRunId: string, taskId: string, opts: { repeat?: boolean } = {}) => {
+    const r = await runs.prepareReviewerHandoff(planRunId, taskId, agents, opts);
     if (r.ok) { setRunId(null); setReviewerHandoffId(r.run.id); }
     else toast.error(r.error, { duration: 9000 });
   };
@@ -314,7 +314,7 @@ export default function Home() {
         onHandoff={(planRunId, taskId, followUp) => void handoff(planRunId, taskId, followUp)} onReview={openReview}
         onReviewDeveloper={id => { setRunId(null); setDevHandoffId(id); }}
         onHandoffQA={(planRunId, taskId, opts) => void handoffQA(planRunId, taskId, opts)}
-        onHandoffReviewer={(planRunId, taskId) => void handoffReviewer(planRunId, taskId)}
+        onHandoffReviewer={(planRunId, taskId, opts) => void handoffReviewer(planRunId, taskId, opts)}
         onAnswerArchitect={(run, followUp) => { if (run.parentRunId && run.taskId) void handoff(run.parentRunId, run.taskId, { ...followUp, previousRunId: run.id }); }}
       />
       <HandoffDialog

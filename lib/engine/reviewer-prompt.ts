@@ -3,13 +3,14 @@
 // (the same real deliverables and Architect analyses QA had), plus QA's own concluded parecer. The Reviewer
 // never re-derives evidence by itself: it separates what it can verify directly (facts, against the same
 // evidence QA had) from what it must infer, and states a final verdict that may not contradict QA's own.
-import type { QADeliverable, QAResult, ReviewerSnapshot, StartRunRequest, TeamMemberInput } from "./types";
+import { versionLine } from "./qa-tooled-prompt";
+import type { QADeliverable, QAEvidence, QAResult, ReviewerSnapshot, StartRunRequest, TeamMemberInput } from "./types";
 
 export const REVIEWER_PROTOCOL = [
   "PROTOCOLO DE EXECUÇÃO DO SETOR IA — REVISOR (SOMENTE REVISÃO FINAL, SEM FERRAMENTAS)",
   "Este protocolo descreve as condições desta execução. A ficha do Revisor, logo abaixo, descreve como você trabalha; siga-a.",
   "1. Você recebeu UMA tarefa do plano do Diretor, aprovada pelo usuário: formar o parecer final sobre a demanda, a partir do parecer do QA e das mesmas entregas reais que o QA teve (commits, diffs reais, resultados reais de verificação).",
-  "2. Nesta execução não há ferramentas: você não lê arquivos, não edita, não roda comandos e não acessa a rede. Tudo o que você conhece está em <parecer_do_qa> e <entregas_reais>. Nunca afirme que rodou um comando ou leu um arquivo diretamente: você não tem essas ferramentas.",
+  "2. Nesta execução não há ferramentas: você não lê arquivos, não edita, não roda comandos e não acessa a rede. Tudo o que você conhece está em <parecer_do_qa> (inclusive as evidências produzidas pelo executor local, quando houver) e <entregas_reais>. Nunca afirme que rodou um comando ou leu um arquivo diretamente: você não tem essas ferramentas.",
   "3. O parecer do QA (<parecer_do_qa>) não substitui a evidência: sempre que puder, confira a afirmação do QA contra o texto real em <entregas_reais> antes de aceitá-la como fato.",
   "4. Separe claramente três coisas na sua resposta: facts (o que você verificou diretamente contra uma evidência real, citando-a), inferences (conclusões que você tirou sem uma evidência direta, dizendo em que se baseiam) e not_verified (o que nem você nem o QA puderam confirmar).",
   "5. Nunca escreva como fact algo que é, na verdade, uma inferência ou uma suposição.",
@@ -54,7 +55,31 @@ function renderQAResult(qa: QAResult): string {
     if (c.pendingPart) L.push(`  parte pendente${c.pendingReason === "future_step" ? ` (cabe à tarefa ${c.pendingTask ?? "posterior"} — se for a sua, avalie-a você mesmo)` : ""}: ${c.pendingPart}`);
   }
   if (qa.not_verified.length) L.push(`Outros itens não verificados pelo QA: ${qa.not_verified.join("; ")}`);
+  const ev = renderQAEvidence(qa);
+  if (ev) L.push(ev);
   return L.join("\n");
+}
+
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}\n[… cortado; completo no artefato da revisão do QA]` : s);
+
+/** The executor's own evidence behind QA's verdicts (tool-equipped QA): cited items with what was observed, the others as one line — so facts are checked against what was actually observed, not against QA's wording. */
+function renderQAEvidence(qa: QAResult, maxChars = 40_000): string {
+  const ev: QAEvidence[] = qa.evidence ?? [];
+  if (!ev.length) return "";
+  const cited = new Set(qa.criteria.flatMap(c => c.evidenceIds ?? []));
+  const kind = (e: QAEvidence) => (e.method === "inspection" ? "inspeção" : e.method === "command" ? "comando" : "navegador");
+  const L = ["<evidencias_do_executor>", `Versão testada pelo QA: ${versionLine(qa.testedVersion)}`, "Produzidas pelo executor local (autor: executor; o QA apenas as pediu). Não são relato de nenhum colaborador."];
+  for (const e of ev) {
+    const head = `[${e.id}] ${kind(e)} · ${e.requestedBy === "executor" ? "automática" : `pedida pelo QA na rodada ${e.round}`} · ${e.ok ? "concluída" : "FALHOU OU INDISPONÍVEL"} · ${e.purpose.slice(0, 200)}`;
+    if (!cited.has(e.id)) { L.push(`${head} (não citada nos vereditos)`); continue; }
+    L.push(head);
+    if (e.command) L.push(`Comando: ${e.command.command} · código de saída ${e.command.exitCode ?? "—"}${e.command.timedOut ? " (tempo esgotado)" : ""} · ${Math.round(e.command.durationMs / 100) / 10} s`);
+    L.push(`Observado:\n${clip(e.observed, 2500)}`);
+    if (e.artifacts.length) L.push(`Artefatos: ${e.artifacts.map(a => `${a.name} (sha256 ${a.sha256.slice(0, 12)})`).join("; ")}`);
+  }
+  L.push("</evidencias_do_executor>");
+  const text = L.join("\n");
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n[… evidências cortadas para caber; registro completo na revisão do QA]\n</evidencias_do_executor>` : text;
 }
 
 export function buildReviewerMessage(input: {

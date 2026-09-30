@@ -180,7 +180,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
    * only happens after approve().
    */
   const preparingReviewer = useRef(new Set<string>());
-  const prepareReviewerHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[]) => {
+  const prepareReviewerHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], opts: { repeat?: boolean } = {}) => {
     const key = `${planRunId}:${taskId}`;
     if (preparingReviewer.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
     const reviewer = agents.find(a => a.id === "reviewer");
@@ -188,7 +188,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     preparingReviewer.current.add(key);
     setPending(s => new Set(s).add(key));
     try {
-      const { run } = await engineApi.prepareReviewerHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(reviewer, agents) });
+      const { run } = await engineApi.prepareReviewerHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(reviewer, agents), ...(opts.repeat ? { repeat: true } : {}) });
       setRuns(list => [run, ...list.filter(r => r.id !== run.id)]);
       return { ok: true as const, run };
     } catch (e) {

@@ -93,7 +93,7 @@ export const engineApi = {
   prepareQAHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; repeat?: boolean }) =>
     call<{ run: RunDetail; created: boolean }>("/api/qa-handoffs", { method: "POST", body: JSON.stringify(req) }),
   /** Reviewer hand-off step 1: freezes the review. No model is called here. */
-  prepareReviewerHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput }) =>
+  prepareReviewerHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; repeat?: boolean }) =>
     call<{ run: RunDetail; created: boolean }>("/api/reviewer-handoffs", { method: "POST", body: JSON.stringify(req) }),
   /** Hand-off step 2: the user's confirmation of exactly that content (Architect, Developer, QA or Reviewer). */
   approve: (id: string, snapshotHash: string) => call<{ run: RunRecord; approved: boolean }>(`/api/runs/${id}/approve`, { method: "POST", body: JSON.stringify({ snapshotHash }) }),

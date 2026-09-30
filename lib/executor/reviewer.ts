@@ -25,6 +25,8 @@ export const ReviewerHandoffZ = z.object({
   taskId: z.string().min(1).max(64),
   /** The Reviewer's saved sheet (configuration only; it cannot change who runs or what task). */
   agent: MemberZ,
+  /** Explicit new final review after a NEWER QA parecer (the earlier Reviewer parecer stays in the history, untouched). */
+  repeat: z.boolean().optional(),
 });
 export type ReviewerHandoffRequest = z.infer<typeof ReviewerHandoffZ>;
 
@@ -56,7 +58,8 @@ export async function prepareReviewerHandoff(req: ReviewerHandoffRequest, deps: 
   const existing = await store.runsForTask(parent!.id, task!.id);
   const open = existing.find(r => ["awaiting_approval", "queued", "planning"].includes(r.status));
   if (open) return { run: open, created: false };
-  if (existing.some(r => r.status === "concluded")) refuse(409, "already_done", `A tarefa ${task!.id} já tem um parecer final concluído do Revisor.`);
+  const concluded = existing.filter(r => r.status === "concluded");
+  if (concluded.length && !req.repeat) refuse(409, "already_done", `A tarefa ${task!.id} já tem um parecer final concluído do Revisor. Para uma nova revisão final com um parecer do QA mais recente, peça explicitamente “Nova revisão do Revisor” (o parecer anterior continua no histórico).`);
 
   // Structural integrity first, same rule as any other dependency (lib/engine/dependency.ts).
   const { missing, cycles } = findDependencyIssues(plan.tasks);
@@ -72,6 +75,11 @@ export async function prepareReviewerHandoff(req: ReviewerHandoffRequest, deps: 
   const qaRun_ = qaRuns[0];
   if (!qaRun_ || qaRun_.status !== "review_ready" || !qaRun_.qa) refuse(409, "dependency_pending", `A tarefa ${task!.id} depende de ${qaDepId} (QA), que ainda não tem revisão concluída.`, [qaDepId]);
   const qaRun = qaRun_!;
+  // A repeat only makes sense against a QA parecer the last final review did not see (never a paid call on the same input).
+  if (concluded.length && req.repeat) {
+    const lastQA = ((await store.detail(concluded[0].id))?.snapshot as ReviewerSnapshot | undefined)?.qa?.runId;
+    if (lastQA === qaRun.id) refuse(409, "nothing_new", `O último parecer final de ${task!.id} já usou a revisão do QA mais recente (${qaRun.id.slice(0, 8)}). Uma nova revisão final só é preparada com um parecer do QA mais novo.`);
+  }
   const qaDetail = await store.detail(qaRun.id);
   const qaSnap_ = qaDetail?.snapshot as QASnapshot | undefined;
   if (!qaSnap_ || qaSnap_.kind !== "qa_task") refuse(500, "qa_snapshot_missing", "O registro congelado da revisão de QA não foi encontrado.");
@@ -124,7 +132,7 @@ export async function prepareReviewerHandoff(req: ReviewerHandoffRequest, deps: 
   };
   const res = await store.create(nr);
   if (res.created) {
-    await store.event(res.run.id, "prepared", `Tarefa ${task!.id} do plano ${parent!.id.slice(0, 8)} preparada para o Revisor: parecer do QA (${qaDepId}, execução ${qaRun.id.slice(0, 8)}) e ${liveDeliverables.length} entrega(s) real(is) reaproveitada(s) do próprio contexto do QA, cerca de ${estimate} tokens de texto (estimativa). Nenhuma chamada foi feita ainda; ela só começa se você confirmar.`, { qaRunId: qaRun.id, deliverables: liveDeliverables.map(d => d.taskId) });
+    await store.event(res.run.id, "prepared", `Tarefa ${task!.id} do plano ${parent!.id.slice(0, 8)} preparada para o Revisor: parecer do QA (${qaDepId}, execução ${qaRun.id.slice(0, 8)}) e ${liveDeliverables.length} entrega(s) real(is) reaproveitada(s) do próprio contexto do QA, cerca de ${estimate} tokens de texto (estimativa). ${concluded.length ? ` Nova revisão final: o parecer anterior (${concluded[0].id.slice(0, 8)}) continua no histórico, sem alteração.` : ""} Nenhuma chamada foi feita ainda; ela só começa se você confirmar.`, { qaRunId: qaRun.id, deliverables: liveDeliverables.map(d => d.taskId), previousReviewerRunId: concluded[0]?.id ?? null });
     if (omitted.length > qaSnap.contextBudget.omitted.length) await store.event(res.run.id, "context_trim", `${omitted.length - qaSnap.contextBudget.omitted.length} diff(s) adicional(is) reduzido(s) para caber no orçamento da ficha do Revisor; nada foi omitido do commit, dos arquivos ou dos resultados de verificação — só o texto do diff em si.`, { omitted });
     if (budgetTokens > 0 && estimate >= budgetTokens) await store.event(res.run.id, "budget_alert", `Alerta: a estimativa do texto (${estimate}) já passa do orçamento da ficha do Revisor (${budgetTokens}). O orçamento é referência; o cliente não é interrompido no meio da resposta, e a execução só começa se você confirmar.`);
   }

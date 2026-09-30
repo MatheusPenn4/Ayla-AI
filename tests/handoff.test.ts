@@ -1676,6 +1676,39 @@ describe("Revisor: preparar o envio (depende de um QA já concluído; reaproveit
     await svc.idle();
     expect(calls).toHaveLength(0); // preparing never calls the model
   });
+
+  it("nova revisão final só com um parecer do QA mais novo; o parecer final anterior fica intacto; o Revisor recebe o que as evidências do executor mostram", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc } = service([reply(reviewerResultRaw())], { s: store, localRepos: [repo.dir] });
+    const first = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).run;
+    await svc.approve(first.id, { snapshotHash: first.snapshotHash });
+    await svc.idle();
+    const before = (await store.detail(first.id))!;
+    expect(before.status).toBe("concluded");
+    expect(body<{ error: { code: string } }>(await svc.prepareReviewer(reviewerReq(plan, "t6"))).error.code).toBe("already_done");
+    expect(body<{ error: { code: string } }>(await svc.prepareReviewer(reviewerReq(plan, "t6", { repeat: true }))).error.code).toBe("nothing_new"); // same QA parecer: no paid call on the same input
+
+    const { svc: qaSvc } = service(qaTurns(), { s: store, localRepos: [repo.dir] });
+    const qa2 = body<{ run: RunDetail }>(await qaSvc.prepareQA(qaReq(plan, "t5", { repeat: true }))).run;
+    await qaSvc.approve(qa2.id, { snapshotHash: qa2.snapshotHash });
+    await qaSvc.idle();
+
+    const { svc: s2, calls } = service([], { s: store, localRepos: [repo.dir] });
+    const r = body<{ run: RunDetail; created: boolean }>(await s2.prepareReviewer(reviewerReq(plan, "t6", { repeat: true })));
+    expect(r.created).toBe(true);
+    expect(r.run.status).toBe("awaiting_approval");
+    expect((r.run.snapshot as ReviewerSnapshot).qa.runId).toBe(qa2.id);
+    const prepared = (await store.detail(r.run.id))!;
+    expect(prepared.prompt!.user).toContain("<evidencias_do_executor>");
+    expect(prepared.prompt!.user).toMatch(/\[E1\] inspeção · automática · concluída/);
+    expect((await store.events(r.run.id)).find(e => e.kind === "prepared")!.message).toContain(`parecer anterior (${first.id.slice(0, 8)}) continua no histórico`);
+    const after = (await store.detail(first.id))!;
+    expect(after.status).toBe("concluded");
+    expect(after.reviewer).toEqual(before.reviewer); // the earlier final review is untouched
+    await s2.idle();
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe("Revisor: aprovação, execução real (simulada) e veredito final coerente com o QA", { timeout: 30_000 }, () => {

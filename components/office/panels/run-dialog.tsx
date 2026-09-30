@@ -61,7 +61,7 @@ type DialogProps = {
   /** “Enviar ao QA” on a task of a Director plan (prepares the hand-off and opens the review). */
   onHandoffQA: (planRunId: string, taskId: string, opts?: { repeat?: boolean }) => void;
   /** “Enviar ao Revisor” on a task of a Director plan (prepares the hand-off and opens the review). */
-  onHandoffReviewer: (planRunId: string, taskId: string) => void;
+  onHandoffReviewer: (planRunId: string, taskId: string, opts?: { repeat?: boolean }) => void;
   /** Reopens the review of a prepared hand-off (Architect, Developer, QA or Reviewer — resolved by the run's kind). */
   onReview: (handoffRunId: string) => void;
   /** Resolution of the Architect's questions (prepares a new hand-off for review). */
@@ -370,6 +370,10 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                   })()}
                   {t.assignee === "reviewer" && run.status === "plan_ready" && (() => {
                     const reviewerBlocker = dependencyBlocker(t, res.tasks, runsOf, completionsOf);
+                    // A newer concluded QA review than this final review → a new final review can be prepared (the old one stays).
+                    const qaDep = t.depends_on.find(id => res.tasks.find(x => x.id === id)?.assignee === "qa");
+                    const newestQA = qaDep ? runsOf(qaDep)[0] : undefined;
+                    const newerQA = st.key === "concluded" && !!st.run && newestQA?.status === "review_ready" && newestQA.createdAt > st.run.createdAt;
                     return (
                       <div className="task-actions">
                         {canSend && (
@@ -378,6 +382,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                           </button>
                         )}
                         {st.key === "awaiting_approval" && st.run && <button className="btn-primary small" onClick={() => onReview(st.run!.id)}><ShieldCheck size={13} /> Revisar e confirmar envio</button>}
+                        {newerQA && <button className="btn-secondary small" disabled={sending || !runs.status?.executionEnabled} title="Prepara uma nova revisão final com o parecer mais recente do QA; o parecer final atual continua no histórico. Nada é executado antes da sua confirmação." onClick={() => onHandoffReviewer(run.id, t.id, { repeat: true })}>{sending ? <><Loader2 size={13} className="spin" /> Preparando…</> : <><Send size={13} /> Nova revisão do Revisor (parecer mais recente do QA)</>}</button>}
                         {st.run && st.key !== "awaiting_approval" && <button className="btn-secondary small" onClick={() => onOpenRun(st.run!.id)}>{st.key === "concluded" ? "Ver parecer final" : st.key === "awaiting_clarification" ? "Ver dúvidas do Revisor" : "Ver execução do Revisor"}</button>}
                         {(st.key === "queued" || st.key === "working") && st.run && <button className="btn-ghost small" onClick={() => onCancel(st.run!.id)}>Cancelar</button>}
                         {reviewerBlocker && <span className="run-hint">{reviewerBlocker}</span>}
