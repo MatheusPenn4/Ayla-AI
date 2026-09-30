@@ -1342,18 +1342,27 @@ const qaResult = (over: Partial<QAResult> = {}): QAResult => ({
   criteria: [{ criterion: "Botão azul", verdict: "approved", evidence: "O diff real de t3 mostra a classe azul aplicada em src/botao.tsx." }],
   questions: [], not_verified: [], recommendation: "ready_for_review", ...over,
 });
-/** The client always sends every field of the schema (empty string where N/A) — this mirrors that shape for validateQAResult's zod parse, which requires the keys to exist. */
+/**
+ * The client always sends every field of the schema (empty string where N/A) — this mirrors that shape for the
+ * tool-equipped QA's evaluation schema. Approvals/rejections cite E1 by default: the delivered diff, the first
+ * evidence the executor produces automatically (never a narrative report).
+ */
 const qaResultRaw = (over: Partial<QAResult> = {}) => {
   const r = qaResult(over);
   return {
-    ...r,
+    outcome: r.outcome, summary: r.summary, questions: r.questions, not_verified: r.not_verified, recommendation: r.recommendation, followup_operations: [],
     criteria: r.criteria.map(c => ({
-      criterion: c.criterion, verdict: c.verdict,
+      criterion: c.criterion, verdict: c.verdict, evidence_ids: c.evidenceIds ?? (c.verdict === "not_verified" ? [] : ["E1"]),
       steps: c.rejected?.steps ?? "", expected: c.rejected?.expected ?? "", observed: c.rejected?.observed ?? "", impact: c.rejected?.impact ?? "",
       notVerifiedReason: c.notVerifiedReason ?? "", evidence: c.evidence ?? "",
+      pending_reason: c.pendingReason ?? (c.verdict === "not_verified" ? "insufficient_evidence" : ""), evaluated_part: c.evaluatedPart ?? "", pending_part: c.pendingPart ?? "", pending_task: c.pendingTask ?? "",
     })),
   };
 };
+/** First QA call (which operations?) answered with none: the automatic evidence (the diff) is enough for these tests. */
+const QA_NO_OPS = { plan_summary: "O diff entregue (E1) basta para estes critérios.", operations: [] };
+/** The two model calls of a tool-equipped QA run: plan operations, then evaluate. */
+const qaTurns = (over: Partial<QAResult> = {}) => [reply(QA_NO_OPS), reply(qaResultRaw(over))];
 
 /** t1/t2 analyses done, t3 (Developer) implementation_ready for real, in a plan that also has t5 (QA) depending on t3. */
 async function chainWithRealImplementation(repo: { dir: string; base: string }, s: RunStore) {
@@ -1368,7 +1377,7 @@ async function chainWithRealImplementation(repo: { dir: string; base: string }, 
   return { plan };
 }
 
-describe("QA: preparar o envio (dependência real, transitiva, jamais por chamada direta indevida)", () => {
+describe("QA: preparar o envio (dependência real, transitiva, jamais por chamada direta indevida)", { timeout: 30_000 }, () => {
   it("recusa quando a dependência (Desenvolvedor) ainda não tem entrega concluída — inclusive por chamada direta ao serviço", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await localChainWithAnalyses(repo, store, qaChainPlan()); // t3 NOT sent to the Developer yet
@@ -1385,7 +1394,7 @@ describe("QA: preparar o envio (dependência real, transitiva, jamais por chamad
     expect(body<{ error: { code: string } }>(await svc.prepareQA(qaReq(plan, "t3"))).error.code).toBe("not_qa_task");
   });
 
-  it("uma vez satisfeita a dependência, congela a revisão com as entregas reais e as análises da cadeia — sem chamar o modelo", async () => {
+  it("uma vez satisfeita a dependência, congela a revisão com as entregas reais, a versão exata a testar e as ferramentas que o executor de fato oferece — sem chamar o modelo", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await chainWithRealImplementation(repo, store);
     const { svc, calls } = service([], { s: store, localRepos: [repo.dir] });
@@ -1398,14 +1407,25 @@ describe("QA: preparar o envio (dependência real, transitiva, jamais por chamad
     expect(t3d.origin).toBe("run_completed");
     expect(t3d.diffText).toContain("serializador");
     expect(snap.analyses.map(a => a.taskId).sort()).toEqual(["t1", "t2"]); // whole chain, not just the direct dependency
-    expect(snap.tools.every(t => !t.allowed)).toBe(true); // QA: no live tools at all
+    // The exact version: the run's base commit + its persisted diff (not applied anywhere), identified by hash.
+    expect(snap.toolsMode).toBe("executor_operations");
+    expect(snap.testedVersion).toMatchObject({ kind: "commit_plus_patch", commit: repo.base, patchSha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    // Tools come from what the executor detected — this test repo has no lockfile, so no commands/browser, with the reason.
+    const tool = (label: string) => snap.tools.find(t => t.label === label)!;
+    expect(tool("Ler arquivos da versão testada").allowed).toBe(true);
+    expect(tool("Rodar verificações do projeto")).toMatchObject({ allowed: false, how: expect.stringContaining("pnpm-lock.yaml") });
+    expect(tool("Navegador automatizado").allowed).toBe(false);
+    expect(tool("Editar o código da entrega").allowed).toBe(false);
+    expect(tool("Publicar, fazer push ou deploy").allowed).toBe(false);
+    expect(r.run.prompt!.user).toContain("src/serializador.ts"); // the file list of the tested version
     expect(snap.contextBudget.estimatedInputTokens).toBeGreaterThan(0);
     await svc.idle();
     expect(calls).toHaveLength(0); // preparing never calls the model
+    expect(readdirSync(work).some(n => n.endsWith(".qa"))).toBe(false); // nor builds any environment
   });
 });
 
-describe("TaskCompletion applied_run_result: o resultado da execução do Desenvolvedor, aplicado e validado, vinculado à execução original", () => {
+describe("TaskCompletion applied_run_result: o resultado da execução do Desenvolvedor, aplicado e validado, vinculado à execução original", { timeout: 30_000 }, () => {
   const VERIF = (at = "2026-09-29T19:00:00.000Z") => ({
     typecheck: { ran: true, command: "pnpm exec tsc --noEmit", result: "0 erros", at }, lint: { ran: true, command: "pnpm lint", result: "0 problemas", at },
     tests: { ran: true, command: "pnpm test", result: "225 passando", at }, build: { ran: true, command: "pnpm build", result: "ok", at },
@@ -1459,38 +1479,42 @@ describe("TaskCompletion applied_run_result: o resultado da execução do Desenv
   });
 });
 
-describe("QA: aprovação, execução real (simulada) e classificação dos critérios", () => {
-  it("execução completa: cada critério da demanda classificado, review_ready, uma única chamada", async () => {
+describe("QA: aprovação, execução real (simulada) e classificação dos critérios", { timeout: 30_000 }, () => {
+  it("execução completa: cada critério classificado citando evidência do executor, review_ready, duas chamadas (planejar e avaliar)", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await chainWithRealImplementation(repo, store);
-    const { svc, calls } = service([reply(qaResultRaw())], { s: store, localRepos: [repo.dir] });
+    const { svc, calls } = service(qaTurns(), { s: store, localRepos: [repo.dir] });
     const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
     await svc.approve(run.id, { snapshotHash: run.snapshotHash });
     await svc.idle();
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     const done = (await store.detail(run.id))!;
     expect(done.status).toBe("review_ready");
-    expect(done.qa?.criteria).toMatchObject([{ criterion: "Botão azul", verdict: "approved" }]);
+    expect(done.qa?.criteria).toMatchObject([{ criterion: "Botão azul", verdict: "approved", evidenceIds: ["E1"] }]);
     expect(done.qa?.recommendation).toBe("ready_for_review");
+    expect(done.qa?.evidence?.[0]).toMatchObject({ id: "E1", method: "inspection", author: "executor", requestedBy: "executor" });
+    expect(done.qa?.testedVersion).toMatchObject({ kind: "commit_plus_patch", treeHash: expect.stringMatching(/^[0-9a-f]{40}$/) });
+    expect(done.qa?.environment?.modifiedDeliveryFiles).toEqual([]);
+    expect(readdirSync(work).some(n => n.endsWith(".qa"))).toBe(false); // environment removed after the run
   });
 
   it("reprova a resposta do modelo quando falta classificar um critério da demanda, quando falta evidência de aprovação, ou quando reprovação vem sem steps/expected/observed/impact", async () => {
     // Two full real materialized-copy Developer runs in one test (two independent repos/stores) — heavier than most.
     const repo = makeDevRepo(work);
     const { plan: p1 } = await chainWithRealImplementation(repo, store);
-    const { svc: s1, calls: c1 } = service([reply(qaResultRaw({ criteria: [] })), reply(qaResultRaw({ criteria: [] }))], { s: store, localRepos: [repo.dir] });
+    const { svc: s1, calls: c1 } = service([reply(QA_NO_OPS), reply(qaResultRaw({ criteria: [] })), reply(qaResultRaw({ criteria: [] }))], { s: store, localRepos: [repo.dir] });
     const r1 = body<{ run: RunDetail }>(await s1.prepareQA(qaReq(p1, "t5"))).run;
     await s1.approve(r1.id, { snapshotHash: r1.snapshotHash });
     await s1.idle();
-    expect(c1).toHaveLength(2); // one correction attempt, per the standard policy
+    expect(c1).toHaveLength(3); // plan + evaluation + one correction attempt, per the standard policy
     expect((await store.get(r1.id))!.status).toBe("failed");
 
     const root2 = mkdtempSync(path.join(os.tmpdir(), "ayla-hand2-"));
     const repo2 = makeDevRepo(root2);
     const store2 = new RunStore(sqliteDriver(":memory:"));
     const { plan: p2 } = await chainWithRealImplementation(repo2, store2);
-    const bad = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "approved", evidence: "" }] });
-    const { svc: s2 } = service([reply(bad), reply(bad)], { s: store2, localRepos: [repo2.dir] });
+    const bad = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "approved", evidence: "O diff mostra.", evidenceIds: [] }] }); // approval citing no executor evidence
+    const { svc: s2 } = service([reply(QA_NO_OPS), reply(bad), reply(bad)], { s: store2, localRepos: [repo2.dir] });
     const r2 = body<{ run: RunDetail }>(await s2.prepareQA(qaReq(p2, "t5"))).run;
     await s2.approve(r2.id, { snapshotHash: r2.snapshotHash });
     await s2.idle();
@@ -1498,16 +1522,20 @@ describe("QA: aprovação, execução real (simulada) e classificação dos crit
     rmSync(root2, { recursive: true, force: true });
   }, 20000);
 
-  it("build/lint/teste passando não é aceito como prova funcional só por afirmação: recommendation ready_for_review exige todos os critérios aprovados", async () => {
+  it("evidência insuficiente não segue como ready_for_review; pendência só por ferramenta indisponível segue para a revisão final com ressalvas (nunca de volta ao Desenvolvedor)", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await chainWithRealImplementation(repo, store);
-    const bad = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "not_verified", notVerifiedReason: "Sem terminal para rodar." }], recommendation: "ready_for_review" });
-    const { svc, calls } = service([reply(bad), reply(bad)], { s: store, localRepos: [repo.dir] });
+    const bad = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "not_verified", notVerifiedReason: "As evidências não mostram a cor.", pendingReason: "insufficient_evidence" }], recommendation: "ready_for_review" });
+    const toolOnly = qaResultRaw({ criteria: [{ criterion: "Botão azul", verdict: "not_verified", notVerifiedReason: "Sem navegador nesta execução.", pendingReason: "tool_unavailable" }], recommendation: "ready_for_review" });
+    const { svc, calls } = service([reply(QA_NO_OPS), reply(bad), reply(toolOnly)], { s: store, localRepos: [repo.dir] });
     const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
     await svc.approve(run.id, { snapshotHash: run.snapshotHash });
     await svc.idle();
-    expect(calls).toHaveLength(2);
-    expect((await store.get(run.id))!.status).toBe("failed");
+    expect(calls).toHaveLength(3); // the invalid recommendation was corrected once
+    const done = (await store.detail(run.id))!;
+    expect(done.status).toBe("review_ready");
+    expect(done.qa?.criteria[0]).toMatchObject({ verdict: "not_verified", pendingReason: "tool_unavailable" });
+    expect(done.qa?.recommendation).toBe("ready_for_review");
   });
 
   it("clique repetido na confirmação enfileira uma única vez; cancelamento antes da confirmação não chama o modelo", async () => {
@@ -1519,18 +1547,18 @@ describe("QA: aprovação, execução real (simulada) e classificação dos crit
     expect(body<{ canceled: boolean }>(discarded).canceled).toBe(true);
     await sPending.idle();
 
-    const { svc, calls } = service([reply(qaResultRaw())], { s: store, localRepos: [repo.dir] });
+    const { svc, calls } = service(qaTurns(), { s: store, localRepos: [repo.dir] });
     const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
     const [a, b] = await Promise.all([svc.approve(run.id, { snapshotHash: run.snapshotHash }), svc.approve(run.id, { snapshotHash: run.snapshotHash })]);
     expect([a, b].filter(r => body<{ approved: boolean }>(r).approved)).toHaveLength(1);
     await svc.idle();
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2); // one run: plan + evaluation, never twice
   });
 
   it("persistência: o parecer do QA reabre do banco exatamente como gravado (kind qa_task)", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await chainWithRealImplementation(repo, store);
-    const { svc } = service([reply(qaResultRaw())], { s: store, localRepos: [repo.dir] });
+    const { svc } = service(qaTurns(), { s: store, localRepos: [repo.dir] });
     const run = body<{ run: RunDetail }>(await svc.prepareQA(qaReq(plan, "t5"))).run;
     await svc.approve(run.id, { snapshotHash: run.snapshotHash });
     await svc.idle();
@@ -1575,7 +1603,7 @@ async function chainWithQAConcluded(repo: { dir: string; base: string }, s: RunS
   const t3 = body<{ run: RunDetail }>(await devSvc.prepareDeveloper(devReq(plan, "t3"))).run;
   await devSvc.approve(t3.id, { snapshotHash: t3.snapshotHash });
   await devSvc.idle();
-  const { svc: qaSvc } = service([reply(qaResultRaw(qaOverride))], { s, localRepos: [repo.dir] });
+  const { svc: qaSvc } = service(qaTurns(qaOverride), { s, localRepos: [repo.dir] });
   const t5 = body<{ run: RunDetail }>(await qaSvc.prepareQA(qaReq(plan, "t5"))).run;
   await qaSvc.approve(t5.id, { snapshotHash: t5.snapshotHash });
   await qaSvc.idle();
@@ -1608,7 +1636,7 @@ describe("validateReviewerResult: o veredito nunca pode contradizer o próprio p
   });
 });
 
-describe("Revisor: preparar o envio (depende de um QA já concluído; reaproveita o próprio contexto do QA)", () => {
+describe("Revisor: preparar o envio (depende de um QA já concluído; reaproveita o próprio contexto do QA)", { timeout: 30_000 }, () => {
   it("recusa quando a tarefa não depende de nenhuma tarefa do QA", async () => {
     const plan = await directorPlan(reviewerWithoutQaDepPlan());
     const { svc } = service([], { s: store });
@@ -1650,7 +1678,7 @@ describe("Revisor: preparar o envio (depende de um QA já concluído; reaproveit
   });
 });
 
-describe("Revisor: aprovação, execução real (simulada) e veredito final coerente com o QA", () => {
+describe("Revisor: aprovação, execução real (simulada) e veredito final coerente com o QA", { timeout: 30_000 }, () => {
   it("execução completa: veredito aprovado quando o QA aprovou tudo, concluded, uma única chamada", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await chainWithQAConcluded(repo, store);

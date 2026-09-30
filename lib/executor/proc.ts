@@ -71,6 +71,45 @@ function killTree(pid: number | undefined) {
 
 const LINE_BREAK = /\r?\n/;
 
+/** A long-running process (e.g. the app under test) the executor starts, watches and always stops itself. */
+export type BackgroundProcess = {
+  pid: number | undefined;
+  /** Last output lines (stdout and stderr interleaved), capped. */
+  output: () => string;
+  /** Resolves when the process exits (by itself or after stop()). */
+  exited: Promise<number | null>;
+  /** Kills the whole process tree; resolves once it exited (or after a short grace period). */
+  stop: () => Promise<void>;
+};
+
+export type BackgroundSpawner = (spec: Omit<ProcSpec, "timeoutMs" | "stdin" | "onStdoutLine" | "maxStdoutBytes" | "maxStderrBytes">) => BackgroundProcess;
+
+export const spawnBackground: BackgroundSpawner = spec => {
+  let out = "";
+  const keep = (d: string) => { out = (out + d).slice(-60_000); };
+  let child: ChildProcessWithoutNullStreams | null = null;
+  try {
+    child = spawn(spec.command, spec.args, { cwd: spec.cwd, env: spec.env as NodeJS.ProcessEnv, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+  } catch (err) {
+    keep(`Não foi possível iniciar: ${(err as Error).message}`);
+    return { pid: undefined, output: () => out, exited: Promise.resolve(null), stop: async () => {} };
+  }
+  const c = child;
+  c.stdout.setEncoding("utf8"); c.stderr.setEncoding("utf8");
+  c.stdout.on("data", keep); c.stderr.on("data", keep);
+  c.stdin.end();
+  const exited = new Promise<number | null>(resolve => { c.on("close", code => resolve(code)); c.on("error", e => { keep(`\n${e.message}`); resolve(null); }); });
+  let done = false;
+  void exited.then(() => { done = true; });
+  const stop = async () => {
+    if (done) return;
+    killTree(c.pid);
+    await Promise.race([exited, new Promise(r => setTimeout(r, 5000))]);
+  };
+  spec.signal?.addEventListener("abort", () => { void stop(); }, { once: true });
+  return { pid: c.pid, output: () => out, exited, stop };
+};
+
 export const runProcess: Runner = spec =>
   new Promise(resolve => {
     if (/\.(cmd|bat)$/i.test(spec.command)) {

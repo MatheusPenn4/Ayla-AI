@@ -9,6 +9,7 @@
 //   that text), so nothing is read again here.
 // Nothing is simulated: when the client is not usable the run fails with the
 // reason and the recovery steps. No collaborator triggers another one.
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { ANALYSIS_JSON_SCHEMA, partialTexts, validateAnalysis } from "@/lib/engine/analysis-schema";
@@ -23,6 +24,10 @@ import { AgentError, type AgentAdapter, type AgentErrorCode, type AgentProgress 
 import { GithubError, readGithubContext, shrinkGithubText } from "./github";
 import { listLocalRepos, type GitDeps } from "./local-git";
 import { KNOWN_LIMITATIONS } from "./qa";
+import type { AppFixture } from "./qa-browser";
+import type { EnvDeps } from "./qa-env";
+import { runToolQA } from "./qa-run";
+import type { ProjectDeps } from "./projects";
 import type { RunStore } from "./store";
 import { destroyWorktree, diffWorktree, materializeCommit } from "./worktree";
 
@@ -40,7 +45,12 @@ export type PlannerDeps = {
   /** Parent folder for per-call empty working directories. */
   workRoot: string;
   signal?: AbortSignal;
+  /** Tool-equipped QA only: how to build its isolated environment, where its artifacts live, its app fixture. */
+  qa?: { envDeps: EnvDeps; projects: ProjectDeps; artifactsRoot: string; fixture: (planId: string, srcDir: string) => Promise<AppFixture | null> };
 };
+
+/** How a sheet's model choice is described: "" means the client picks it (its own default), never the Setor IA. */
+export const modelPhrase = (model: string) => (model ? `modelo ${model}` : "modelo escolhido pelo próprio cliente (a ficha usa o padrão dele; o modelo usado é registrado ao final)");
 
 /** Rough estimate used only before the call; the reported figures replace it afterwards. */
 export const estimateTokens = (text: string) => Math.ceil(text.length / 3.5);
@@ -223,6 +233,18 @@ function qaLimitations(budget: RunBudget) {
   ];
 }
 
+function toolQALimitations(r: QAResult, budget: RunBudget) {
+  const env = r.environment;
+  const out = [
+    "O modelo do QA não recebeu nenhuma ferramenta: pediu operações de um catálogo fixo e o executor local as executou no ambiente isolado; toda observação citada vem de evidência produzida pelo executor.",
+    "Um build, typecheck, lint ou teste automatizado passando não é, por si só, validação funcional de um critério de aceite do usuário — só evidência de qualidade de código.",
+    "O navegador de QA usou dados simulados somente leitura desta demanda; ações que executariam agentes foram bloqueadas (nenhuma chamada paga partiu dele).",
+    "Isolamento de rede dos comandos não é imposto pelo sistema operacional nesta versão: a preparação de dependências usa o store local sem rede (e só recorre à rede se isso falhar); os comandos rodam sem credenciais nem sessões dos clientes; o navegador só acessa a origem da aplicação em teste.",
+  ];
+  if (env?.modifiedDeliveryFiles.length) out.push(`ATENÇÃO: arquivos versionados da entrega mudaram durante a revisão: ${env.modifiedDeliveryFiles.join(", ")}.`);
+  return [...out, ...usageNotes(budget)];
+}
+
 function qaSpec(deps: PlannerDeps): Spec {
   return {
     who: "QA",
@@ -311,8 +333,10 @@ function developerSpec(deps: PlannerDeps): Spec {
       const touched = [...new Set(d.files.map(f => f.path))];
       const outOfScope = touched.filter(t => !editable.has(t));
       const files = d.files.map(f => ({ ...f, inScope: !outOfScope.includes(f.path) }));
-      await deps.store.event(p.runId!, "diff", `Diff real da cópia isolada: ${files.length} arquivo(s) tocado(s) (${files.filter(f => f.status === "added").length} criado(s), ${files.filter(f => f.status === "modified").length} alterado(s), ${files.filter(f => f.status === "deleted").length} removido(s))${outOfScope.length ? `; FORA DO ESCOPO APROVADO: ${outOfScope.join(", ")}` : "; todos dentro do escopo aprovado"}.`, { files, diffTruncated: d.diffTruncated });
-      const diff: DeveloperDiff = { baseCommit: p.baseCommit!, files, diffText: d.diffText, diffTruncated: d.diffTruncated, outOfScope };
+      await deps.store.event(p.runId!, "diff", `Diff real da cópia isolada: ${files.length} arquivo(s) tocado(s) (${files.filter(f => f.status === "added").length} criado(s), ${files.filter(f => f.status === "modified").length} alterado(s), ${files.filter(f => f.status === "deleted").length} removido(s))${outOfScope.length ? `; FORA DO ESCOPO APROVADO: ${outOfScope.join(", ")}` : "; todos dentro do escopo aprovado"}.`, { files, diffTruncated: d.diffTruncated, diffSha256: createHash("sha256").update(d.diffText).digest("hex") });
+      // The hash is recorded now, when the executor itself computed the diff, and checked again before it is applied anywhere.
+      const diffSha256 = createHash("sha256").update(d.diffText).digest("hex");
+      const diff: DeveloperDiff = { baseCommit: p.baseCommit!, files, diffText: d.diffText, diffTruncated: d.diffTruncated, outOfScope, diffSha256 };
       const v = validateDeveloperResult(output, touched, outOfScope);
       if (!v.ok) return { ok: false, errors: v.errors, diff };
       const status = v.result.outcome === "needs_clarification" ? "awaiting_clarification" : "implementation_ready";
@@ -365,10 +389,54 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
     // 3. Call through the official client, validate, at most one correction.
     mkdirSync(workDir, { recursive: true });
     mkdirSync(scratchDir, { recursive: true });
+
+    // 3'. Tool-equipped QA: the executor runs operations between model calls (see qa-run.ts). Same client, same
+    // read-only profile (the model itself gets no tool), same error handling, usage and cancellation as below.
+    if (run.kind === "qa_task" && (snap as QASnapshot).toolsMode === "executor_operations") {
+      if (!deps.qa) fail({ code: "qa_tools_unavailable", message: "Este executor não tem o ambiente de QA configurado.", retryable: false });
+      let lastOutputEvent = 0;
+      const onProgress = (p: AgentProgress) => {
+        if (p.kind === "model_output" && Date.now() - lastOutputEvent < 20_000) return;
+        if (p.kind === "model_output") lastOutputEvent = Date.now();
+        void store.event(runId, `client_${p.kind}`, p.message, p.data);
+      };
+      const callModel = async (label: string, user: string, schema: Record<string, unknown>) => {
+        if (deps.signal?.aborted) return null;
+        await store.event(runId, "calling", `Chamando ${conn!.client} (${modelPhrase(run.model)})${run.effort ? `, esforço ${run.effort}` : ""} — ${label}. Texto enviado: cerca de ${estimateTokens(prepared.system + user)} tokens (estimativa).`);
+        try {
+          const reply = await adapter.call({ label, system: prepared.system, user, schema, model: run.model, effort: run.effort, timeoutMs: deps.limits.callTimeoutMs, signal: deps.signal, workDir, scratchDir, onProgress, mode: "read_only" });
+          await store.logConnection(conn!.id, true, null);
+          record(reply.usage);
+          await store.update(runId, { rawOutput: reply.text, budget });
+          const total = reply.usage ? reportedTotal(reply.usage) : null;
+          await store.event(runId, "reply", total !== null ? `Resposta recebida (${label}). Uso informado pelo cliente: ${total} tokens${reply.usage?.model ? ` (${reply.usage.model}${run.model ? "" : " — modelo escolhido pelo cliente"})` : ""}.` : `Resposta recebida (${label}). O cliente não informou o uso de tokens.`);
+          return reply;
+        } catch (err) {
+          if (err instanceof AgentError) {
+            record((err as AgentError & { usage?: CallUsage | null }).usage ?? null);
+            if (["not_connected", "session_expired", "auth_busy"].includes(err.code)) await store.logConnection(conn!.id, false, err.code);
+            if (err.code === "canceled") return null;
+            fail({ code: err.code, message: err.code === "timeout" ? `O cliente não terminou dentro do limite de ${Math.round(deps.limits.callTimeoutMs / 60000)} min do executor e foi encerrado.` : err.message, detail: err.detail, retryable: err.retryable, recovery: recoveryFor(err.code, conn, spec.who, deps.limits.callTimeoutMs) });
+          }
+          throw err;
+        }
+      };
+      const outcome = await runToolQA({
+        runId, snap: snap as QASnapshot, prompt: { system: prepared.system, user: prepared.user }, store, envDeps: { ...deps.qa!.envDeps, signal: deps.signal },
+        projects: deps.qa!.projects, workRoot: deps.workRoot, artifactsDir: path.join(deps.qa!.artifactsRoot, runId), fixture: deps.qa!.fixture, planId: run.parentRunId ?? "",
+        callModel, fail: e => fail(e),
+      });
+      if (!outcome) return;
+      const current = await store.get(runId);
+      if (current?.status === "canceled") return;
+      await store.update(runId, { status: outcome.status, result: { ...outcome.result, limitations: toolQALimitations(outcome.result as QAResult, budget) } as RunRecord["result"], finishedAt: new Date().toISOString(), leaseUntil: null, budget }, ["planning"]);
+      await store.event(runId, outcome.status, outcome.message);
+      return;
+    }
     let prompt = prepared.user;
     for (let attempt = 1; attempt <= 2; attempt++) {
       if (deps.signal?.aborted) return;
-      await store.event(runId, "calling", `Chamando ${conn.client}${run.model ? ` (modelo ${run.model})` : " (modelo padrão do cliente)"}${run.effort ? `, esforço ${run.effort}` : ""}. Texto enviado: cerca de ${estimateTokens(prepared.system + prompt)} tokens (estimativa).`);
+      await store.event(runId, "calling", `Chamando ${conn.client} (${modelPhrase(run.model)})${run.effort ? `, esforço ${run.effort}` : ""}. Texto enviado: cerca de ${estimateTokens(prepared.system + prompt)} tokens (estimativa).`);
       let reply;
       try {
         // Progress from the client is recorded as events: start and API retries always, model output at most every 20 s.
@@ -394,7 +462,7 @@ export async function processRun(runId: string, deps: PlannerDeps): Promise<void
       record(reply.usage);
       await store.update(runId, { rawOutput: reply.text, budget });
       const total = reply.usage ? reportedTotal(reply.usage) : null;
-      await store.event(runId, "reply", total !== null ? `Resposta recebida. Uso informado pelo cliente: ${total} tokens${reply.usage?.model ? ` (${reply.usage.model})` : ""}.` : "Resposta recebida. O cliente não informou o uso de tokens.");
+      await store.event(runId, "reply", total !== null ? `Resposta recebida. Uso informado pelo cliente: ${total} tokens${reply.usage?.model ? ` (${reply.usage.model}${run.model ? "" : " — modelo escolhido pelo cliente"})` : ""}.` : "Resposta recebida. O cliente não informou o uso de tokens.");
 
       const v = reply.output === null || typeof reply.output !== "object" ? { ok: false as const, errors: ["A resposta não é um JSON válido."] } : await spec.validate(reply.output, prepared, budget);
       if (v.ok) {

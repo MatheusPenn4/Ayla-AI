@@ -38,6 +38,17 @@ async function git(deps: GitDeps, gitPath: string, dir: string, args: string[], 
   return deps.runner({ command: gitPath, args: ["-C", dir, "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", ...args], cwd: dir, env, timeoutMs: 15_000, maxStdoutBytes });
 }
 
+/**
+ * One git command on an authorized project (structured arguments, no shell, no pager, no prompts), for the
+ * application flow (lib/executor/apply.ts). Unlike the read-only helpers above it may be given stdin (a patch).
+ */
+export async function runGit(deps: GitDeps, dir: string, args: string[], opts: { stdin?: string; maxStdoutBytes?: number; timeoutMs?: number } = {}) {
+  const g = resolveGit(deps);
+  if (!g) return { code: null, stdout: "", stderr: "Git não encontrado neste computador.", timedOut: false, aborted: false, truncated: false, spawnError: "git ausente" };
+  const env = { ...clientEnv(deps.env), GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", LC_ALL: "C" };
+  return deps.runner({ command: g, args: ["-C", dir, "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", ...args], cwd: dir, env, timeoutMs: opts.timeoutMs ?? 20_000, stdin: opts.stdin, maxStdoutBytes: opts.maxStdoutBytes ?? 4_000_000 });
+}
+
 /** "https://github.com/o/r(.git)" or "git@github.com:o/r(.git)" → { owner, repo }. */
 export function parseOrigin(url: string) {
   const m = /github\.com[/:]([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/.exec(url.trim());

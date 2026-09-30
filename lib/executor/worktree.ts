@@ -131,6 +131,43 @@ export async function diffWorktree(m: Pick<Materialized, "workDir" | "hooksDir">
   return { files, diffText: diffTruncated ? `${raw.slice(0, MAX_DIFF_CHARS)}\n[… diff cortado em ${MAX_DIFF_CHARS} caracteres]` : raw, diffTruncated };
 }
 
+/** Applies a persisted patch (stdin, never retranscribed) inside an isolated copy built by materializeCommit. */
+export async function applyPatchInCopy(m: Pick<Materialized, "workDir" | "hooksDir">, patch: string, deps: GitDeps) {
+  const g = resolveGit(deps);
+  if (!g) throw new GithubError("github_unavailable", "Git não encontrado neste computador.");
+  const r = await git(deps, g, m.workDir, m.hooksDir, ["apply", "--whitespace=nowarn", "-"], { stdin: patch });
+  if (r.code !== 0) throw new GithubError("github_unavailable", `O diff não se aplica à cópia isolada: ${(r.stderr || r.stdout).trim().slice(0, 400)}`);
+}
+
+/** Records the current content of an isolated copy as its own commit and returns that commit's tree hash (the version id). */
+export async function snapshotCopy(m: Pick<Materialized, "workDir" | "hooksDir">, message: string, deps: GitDeps): Promise<string> {
+  const g = resolveGit(deps);
+  if (!g) throw new GithubError("github_unavailable", "Git não encontrado neste computador.");
+  await git(deps, g, m.workDir, m.hooksDir, ["add", "-A"]);
+  await git(deps, g, m.workDir, m.hooksDir, ["-c", "user.name=Setor IA", "-c", "user.email=setor-ia@local", "commit", "-q", "--allow-empty", "-m", message]);
+  const t = await git(deps, g, m.workDir, m.hooksDir, ["rev-parse", "HEAD^{tree}"]);
+  const tree = t.stdout.trim();
+  if (t.code !== 0 || !/^[0-9a-f]{40}$/.test(tree)) throw new GithubError("github_unavailable", "Não foi possível identificar a versão da cópia isolada (git rev-parse).");
+  return tree;
+}
+
+/** Tracked files of the recorded version changed or removed since snapshotCopy (build outputs ignored by the project's .gitignore don't count). */
+export async function changedTrackedFiles(m: Pick<Materialized, "workDir" | "hooksDir">, deps: GitDeps): Promise<string[]> {
+  const g = resolveGit(deps);
+  if (!g) return [];
+  const r = await git(deps, g, m.workDir, m.hooksDir, ["status", "--porcelain=v1", "-z", "--untracked-files=no"], { maxStdoutBytes: 8_000_000 });
+  if (r.code !== 0) return ["(não foi possível conferir: git status falhou)"];
+  return r.stdout.split("\0").filter(e => /^.. /.test(e)).map(e => e.slice(3));
+}
+
+/** Tracked file list of the copy (for QA's own reading operations). */
+export async function trackedFiles(m: Pick<Materialized, "workDir" | "hooksDir">, deps: GitDeps): Promise<string[]> {
+  const g = resolveGit(deps);
+  if (!g) return [];
+  const r = await git(deps, g, m.workDir, m.hooksDir, ["ls-files", "-z"], { maxStdoutBytes: 8_000_000 });
+  return r.code === 0 ? r.stdout.split("\0").filter(Boolean) : [];
+}
+
 /** Best-effort cleanup; never throws (the run's outcome must not depend on it). */
 export function destroyWorktree(workDir: string) {
   try { rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }

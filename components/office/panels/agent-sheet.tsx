@@ -15,6 +15,7 @@ import { PresetCompareDialog } from "./preset-compare-dialog";
 import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
 import { connectionLabel } from "@/lib/engine/connections";
 import { ConnectionPanel, type EngineControls } from "./connection-panel";
+import { QAToolingList } from "./qa-tooling";
 import { WORK_ZONES, zoneCapacity } from "@/lib/office/layout";
 import { PRESET_VERSION } from "@/lib/office/presets";
 import { TARGET_LABEL_USER, applyPreset, dismissPreset, presetProfile, presetUpdate } from "@/lib/office/profile";
@@ -253,13 +254,21 @@ function SheetBody({ agent, agents, onSave, onDemand, onDismissPreset, tab, onTa
           </Tabs.Content>
 
           <Tabs.Content value="tools" className="tab-pane">
-            <div className="notice">Permissões <b>planejadas</b> para as próximas etapas; a maioria ainda não tem efeito real. As exceções reais de hoje: <b>GitHub</b> na ficha do Diretor (leitura limitada de repositórios públicos durante o planejamento); <b>Ler arquivos</b> na ficha do Arquiteto (leitura só do texto que o executor envia, sem ferramentas); <b>Editar arquivos</b> na ficha do Desenvolvedor com conexão Claude — assinatura (escrita restrita a uma cópia isolada do commit aprovado, nunca no seu projeto). Terminal e navegador continuam sempre desligados nesta versão, para todos.</div>
+            <div className="notice">Permissões <b>planejadas</b> para as próximas etapas; a maioria ainda não tem efeito real. As exceções reais de hoje: <b>GitHub</b> na ficha do Diretor (leitura limitada de repositórios públicos durante o planejamento); <b>Ler arquivos</b> na ficha do Arquiteto (leitura só do texto que o executor envia, sem ferramentas); <b>Editar arquivos</b> na ficha do Desenvolvedor com conexão Claude — assinatura (escrita restrita a uma cópia isolada do commit aprovado, nunca no seu projeto); e, no <b>QA</b>, leitura, comandos e navegador executados pelo próprio executor num ambiente isolado (abaixo). Nenhum modelo recebe terminal ou navegador diretamente.</div>
+            {draft.id === "qa" && (
+              <section className="run-sec">
+                <h4>Disponível de fato para o QA neste computador</h4>
+                <p className="section-hint">Detectado pelo executor agora (não é a permissão planejada abaixo). Vale para qualquer conexão escolhida — {connectionLabel(draft.connection, engine?.status?.apiConnections)} inclusive —, porque quem executa as operações é o executor, não o modelo.</p>
+                <QAToolingList tooling={engine?.status?.qaTooling} connectionLabel={connectionLabel(draft.connection, engine?.status?.apiConnections)} />
+              </section>
+            )}
             <div className="tool-list">
               {TOOL_INFO.map(t => {
                 const real =
                   t.key === "github" && draft.id === "director" ? "aplicada ao planejamento (só leitura pública)"
                   : t.key === "read" && draft.id === "architect" ? "aplicada ao envio ao Arquiteto (só leitura, sem ferramentas de rede)"
                   : (t.key === "read" || t.key === "edit") && draft.id === "developer" && draft.connection === "claude_code" ? "aplicada ao envio ao Desenvolvedor (cópia isolada do commit aprovado; nunca no seu projeto)"
+                  : (t.key === "read" || t.key === "terminal" || t.key === "browser") && draft.id === "qa" ? "executada pelo executor no ambiente isolado do QA (veja “Disponível de fato”)"
                   : "sem efeito nesta versão";
                 return (
                   <label className="tool-row" key={t.key}>

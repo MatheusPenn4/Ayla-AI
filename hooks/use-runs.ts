@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EngineApiError, buildStartRequest, engineApi, toTeamInput, type HandoffFollowUp } from "@/lib/engine/client";
-import { ACTIVE_STATUSES, type ApiProvider, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
+import { ACTIVE_STATUSES, type ApiProvider, type ApplicationRecord, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
 import type { Agent, Demand } from "@/lib/office/types";
 
 const message = (e: unknown, fallback: string) => (e instanceof EngineApiError ? `${e.message}${e.details?.length ? ` (${e.details.join("; ")})` : ""}` : fallback);
@@ -18,6 +18,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
   const [checking, setChecking] = useState(false);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [completions, setCompletions] = useState<Record<string, TaskCompletion[]>>({});
+  const [applications, setApplications] = useState<Record<string, ApplicationRecord[]>>({});
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [startErrors, setStartErrors] = useState<Record<string, string>>({});
   // One idempotency key per demand while a start request is in flight;
@@ -155,7 +156,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
    * only happens after approve().
    */
   const preparingQA = useRef(new Set<string>());
-  const prepareQAHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[]) => {
+  const prepareQAHandoff = useCallback(async (planRunId: string, taskId: string, agents: Agent[], opts: { repeat?: boolean } = {}) => {
     const key = `${planRunId}:${taskId}`;
     if (preparingQA.current.has(key)) return { ok: false as const, error: "O envio desta tarefa já está sendo preparado." };
     const qa = agents.find(a => a.id === "qa");
@@ -163,7 +164,7 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     preparingQA.current.add(key);
     setPending(s => new Set(s).add(key));
     try {
-      const { run } = await engineApi.prepareQAHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(qa, agents) });
+      const { run } = await engineApi.prepareQAHandoff({ idempotencyKey: `h:${crypto.randomUUID()}`, directorRunId: planRunId, taskId, agent: toTeamInput(qa, agents), ...(opts.repeat ? { repeat: true } : {}) });
       setRuns(list => [run, ...list.filter(r => r.id !== run.id)]);
       return { ok: true as const, run };
     } catch (e) {
@@ -224,6 +225,13 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
   }, []);
   const completionsFor = useCallback((planRunId: string, taskId: string) => (completions[planRunId] ?? []).filter(c => c.taskId === taskId), [completions]);
 
+  /** Applications (and their verification) of one plan's Developer runs. Fetched on demand; the apply dialog polls while a verification runs. */
+  const loadApplications = useCallback(async (planRunId: string) => {
+    try { const { applications: list } = await engineApi.listApplications(planRunId); setApplications(s => ({ ...s, [planRunId]: list })); return list; }
+    catch { return null; }
+  }, []);
+  const applicationsFor = useCallback((planRunId: string, runIds: string[]) => (applications[planRunId] ?? []).filter(a => runIds.includes(a.runId)), [applications]);
+
   const approving = useRef(new Set<string>());
   const approve = useCallback(async (runId: string, snapshotHash: string) => {
     if (approving.current.has(runId)) return { ok: false as const, error: "Confirmação já enviada." };
@@ -243,5 +251,5 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     try { const { run } = await engineApi.cancel(runId); setRuns(list => list.map(r => (r.id === run.id ? run : r))); } catch { /* shown on next refresh */ }
   }, []);
 
-  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, prepareReviewerHandoff, loadCompletions, completionsFor, approve, cancel, refresh, refreshStatus, verify, probe, createApiConnection, verifyApiConnection, deleteApiConnection };
+  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, prepareReviewerHandoff, loadCompletions, completionsFor, loadApplications, applicationsFor, approve, cancel, refresh, refreshStatus, verify, probe, createApiConnection, verifyApiConnection, deleteApiConnection };
 }

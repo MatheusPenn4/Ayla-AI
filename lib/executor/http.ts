@@ -38,6 +38,12 @@ export function checkRequest(req: Pick<IncomingMessage, "headers" | "method">, o
 }
 
 function send(res: ServerResponse, r: Reply) {
+  if (r.raw) {
+    // Artifacts are always served as plain data (never HTML), inline, with sniffing disabled.
+    res.writeHead(r.status, { "content-type": r.raw.contentType, "content-length": String(r.raw.data.length), "cache-control": "no-store", "x-content-type-options": "nosniff", "content-disposition": `inline; filename="${r.raw.filename.replace(/"/g, "")}"` });
+    res.end(r.raw.data);
+    return;
+  }
   const body = JSON.stringify(r.body);
   res.writeHead(r.status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
   res.end(body);
@@ -96,6 +102,22 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "GET" && p === "/v1/handoffs/source-options") return await service.sourceOptions(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");
     if (m === "GET" && p === "/v1/developer-preview") return await service.developerPreview(url.searchParams.get("plan") ?? "", url.searchParams.get("task") ?? "");
     if (m === "POST" && p === "/v1/developer-handoffs") return await service.prepareDeveloper(await readJson(req));
+    if (m === "GET" && p === "/v1/projects") return await service.listProjects();
+    if (m === "POST" && p === "/v1/projects") return await service.registerProject(await readJson(req));
+    r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})$/.exec(p);
+    if (m === "DELETE" && r) return await service.removeProject(r[1]);
+    if (m === "GET" && p === "/v1/apply-review") return await service.applyReview(url.searchParams.get("run") ?? "", url.searchParams.get("project") ?? "");
+    if (m === "POST" && p === "/v1/applications") return await service.applyDiff(await readJson(req));
+    r = /^\/v1\/runs\/([0-9a-f-]{36})\/applications$/.exec(p);
+    if (m === "GET" && r) return await service.applicationsForPlan(r[1]);
+    r = /^\/v1\/applications\/([0-9a-f-]{36})\/verify$/.exec(p);
+    if (m === "POST" && r) return await service.verifyApplication(r[1]);
+    r = /^\/v1\/applications\/([0-9a-f-]{36})\/cancel-verification$/.exec(p);
+    if (m === "POST" && r) return await service.cancelVerification(r[1]);
+    r = /^\/v1\/artifacts\/([0-9a-f-]{36})\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})$/.exec(p);
+    if (m === "GET" && r) return await service.artifact(r[1], r[2]);
+    r = /^\/v1\/runs\/([0-9a-f-]{36})\/annotations$/.exec(p);
+    if (m === "POST" && r) return await service.annotate(r[1], await readJson(req));
     return { status: 404, body: { error: { code: "not_found", message: "Rota inexistente." } } };
   } catch (e) {
     const status = (e as { status?: number }).status ?? 500;

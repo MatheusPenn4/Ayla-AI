@@ -2,7 +2,7 @@
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
 import { randomUUID } from "node:crypto";
-import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
+import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, ApplicationRecord, ApplicationVerification, DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -95,10 +95,49 @@ const SCHEMA = [
     checked_at TEXT,
     created_at TEXT NOT NULL
   )`,
+  // Local Git projects the user authorized through the interface (Configurações → Projetos locais), on top of
+  // AYLA_LOCAL_REPOS. Soft-deleted (removed_at) so earlier applications keep pointing at a known record.
+  `CREATE TABLE IF NOT EXISTS local_projects (
+    id TEXT PRIMARY KEY,
+    dir TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    removed_at TEXT
+  )`,
+  // A reviewed state of an application target (what the user saw before confirming). The confirmation must
+  // present the same token; otherwise it is refused and the difference is shown.
+  `CREATE TABLE IF NOT EXISTS apply_reviews (
+    token TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
+  // Every application of a Developer diff to a local project (append-only; only the verification is updated
+  // while it runs). Never implies a commit: the executor never commits, pushes or deploys.
+  `CREATE TABLE IF NOT EXISTS applications (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    project_dir TEXT NOT NULL,
+    head TEXT NOT NULL,
+    base_commit TEXT NOT NULL,
+    diff_sha256 TEXT NOT NULL,
+    review_token TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    outcome TEXT NOT NULL,
+    message TEXT NOT NULL,
+    files_json TEXT NOT NULL,
+    verification_json TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS applications_by_run ON applications (run_id, created_at)`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off. */
-export const SCHEMA_VERSION = 6;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off; v7 = local projects, applications of Developer diffs (+ task_completions.application_id). */
+export const SCHEMA_VERSION = 7;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
@@ -108,6 +147,8 @@ const ADDED_COLUMNS: [string, string][] = [
   ["rejected_diff_json", "TEXT"],
   ["local_resolution_json", "TEXT"],
 ];
+/** Columns added to task_completions after it was created (v7). */
+const COMPLETION_COLUMNS: [string, string][] = [["application_id", "TEXT"]];
 
 const INDEXES = [
   // At most one active Director plan per demand (no duplicate runs on double click / refresh).
@@ -159,6 +200,16 @@ function toCompletion(r: Row): TaskCompletion {
     kind: r.kind as TaskCompletion["kind"], sourceRunId: (r.source_run_id as string) ?? null, commit: String(r.commit_hash),
     files: parse<string[]>(r.files_json) ?? [], verification: parse<Verification>(r.verification_json)!,
     note: String(r.note), validatedBy: r.validated_by as TaskCompletion["validatedBy"], validatedAt: String(r.validated_at), createdAt: String(r.created_at),
+    applicationId: (r.application_id as string) ?? null,
+  };
+}
+
+function toApplication(r: Row): ApplicationRecord {
+  return {
+    id: String(r.id), runId: String(r.run_id), planId: String(r.plan_id), taskId: String(r.task_id), projectId: String(r.project_id), projectDir: String(r.project_dir),
+    head: String(r.head), baseCommit: String(r.base_commit), diffSha256: String(r.diff_sha256), reviewToken: String(r.review_token), idempotencyKey: String(r.idempotency_key),
+    outcome: r.outcome as ApplicationRecord["outcome"], message: String(r.message), files: parse<ApplicationRecord["files"]>(r.files_json) ?? [],
+    createdAt: String(r.created_at), verification: parse<ApplicationVerification>(r.verification_json),
   };
 }
 
@@ -208,7 +259,9 @@ export class RunStore {
     const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`);
     if (!tables.some(t => t.name === "director_runs")) return false;
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
-    return ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || !tables.some(t => t.name === "task_completions") || !tables.some(t => t.name === "api_connections");
+    if (ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || ["task_completions", "api_connections", "applications", "local_projects", "apply_reviews"].some(n => !tables.some(t => t.name === n))) return true;
+    const ccols = await this.db.all<{ name: string }>(`PRAGMA table_info(task_completions)`);
+    return COMPLETION_COLUMNS.some(([c]) => !ccols.some(x => x.name === c));
   }
 
   /** Consistent copy of the whole database (SQLite VACUUM INTO). */
@@ -224,6 +277,8 @@ export class RunStore {
   private async migrate() {
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
     for (const [c, def] of ADDED_COLUMNS) if (!cols.some(x => x.name === c)) await this.db.exec(`ALTER TABLE director_runs ADD COLUMN ${c} ${def}`);
+    const ccols = await this.db.all<{ name: string }>(`PRAGMA table_info(task_completions)`);
+    for (const [c, def] of COMPLETION_COLUMNS) if (!ccols.some(x => x.name === c)) await this.db.exec(`ALTER TABLE task_completions ADD COLUMN ${c} ${def}`);
     await this.db.exec(`DROP INDEX IF EXISTS director_runs_one_active`);
     // Recreated every boot: an existing database may still have the pre-Developer definition (architect_task only).
     await this.db.exec(`DROP INDEX IF EXISTS runs_one_active_task`);
@@ -319,9 +374,9 @@ export class RunStore {
     await this.ensureSchema();
     const row: TaskCompletion = { ...input, id: randomUUID(), createdAt: nowIso() };
     await this.db.run(
-      `INSERT INTO task_completions (id, demand_id, parent_run_id, task_id, kind, source_run_id, commit_hash, files_json, verification_json, note, validated_by, validated_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [row.id, row.demandId, row.parentRunId, row.taskId, row.kind, row.sourceRunId, row.commit, JSON.stringify(row.files), JSON.stringify(row.verification), row.note, row.validatedBy, row.validatedAt, row.createdAt],
+      `INSERT INTO task_completions (id, demand_id, parent_run_id, task_id, kind, source_run_id, commit_hash, files_json, verification_json, note, validated_by, validated_at, created_at, application_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.id, row.demandId, row.parentRunId, row.taskId, row.kind, row.sourceRunId, row.commit, JSON.stringify(row.files), JSON.stringify(row.verification), row.note, row.validatedBy, row.validatedAt, row.createdAt, row.applicationId ?? null],
     );
     await this.event(row.parentRunId, "task_completion_recorded", `Entrega validada de ${row.taskId} (${row.kind === "direct_implementation" ? "implementada diretamente, fora do encaminhamento" : row.kind === "applied_run_result" ? `resultado da execução ${row.sourceRunId?.slice(0, 8)} aplicado e validado` : "esclarecimento resolvido e validado"}): commit ${row.commit.slice(0, 12)}, ${row.files.length} arquivo(s), validado por ${row.validatedBy}.`, row);
     return row;
@@ -468,6 +523,83 @@ export class RunStore {
     await this.ensureSchema();
     const rows = await this.db.all<{ n: number }>(`SELECT COUNT(*) AS n FROM director_runs WHERE status IN ('queued', 'planning')`);
     return Number(rows[0]?.n ?? 0);
+  }
+
+  // ---- local projects, application reviews, applications ------------------
+
+  async addLocalProject(input: { id: string; dir: string; label: string }) {
+    await this.ensureSchema();
+    await this.db.run(`INSERT INTO local_projects (id, dir, label, created_at, removed_at) VALUES (?, ?, ?, ?, NULL)`, [input.id, input.dir, input.label, nowIso()]);
+  }
+
+  async listLocalProjects(): Promise<{ id: string; dir: string; label: string; createdAt: string }[]> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT id, dir, label, created_at FROM local_projects WHERE removed_at IS NULL ORDER BY created_at`);
+    return rows.map(r => ({ id: String(r.id), dir: String(r.dir), label: String(r.label), createdAt: String(r.created_at) }));
+  }
+
+  async removeLocalProject(id: string) {
+    await this.ensureSchema();
+    const { changes } = await this.db.run(`UPDATE local_projects SET removed_at = ? WHERE id = ? AND removed_at IS NULL`, [nowIso(), id]);
+    return changes > 0;
+  }
+
+  async saveApplyReview(token: string, runId: string, projectId: string, state: unknown) {
+    await this.ensureSchema();
+    await this.db.run(`INSERT INTO apply_reviews (token, run_id, project_id, state_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(token) DO NOTHING`, [token, runId, projectId, JSON.stringify(state), nowIso()]);
+    await this.db.run(`DELETE FROM apply_reviews WHERE created_at < ?`, [new Date(Date.now() - 7 * 86400_000).toISOString()]);
+  }
+
+  async getApplyReview<T>(token: string): Promise<{ runId: string; projectId: string; state: T; createdAt: string } | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM apply_reviews WHERE token = ?`, [token]);
+    return rows[0] ? { runId: String(rows[0].run_id), projectId: String(rows[0].project_id), state: parse<T>(rows[0].state_json)!, createdAt: String(rows[0].created_at) } : null;
+  }
+
+  async createApplication(a: ApplicationRecord) {
+    await this.ensureSchema();
+    await this.db.run(
+      `INSERT INTO applications (id, run_id, plan_id, task_id, project_id, project_dir, head, base_commit, diff_sha256, review_token, idempotency_key, outcome, message, files_json, verification_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [a.id, a.runId, a.planId, a.taskId, a.projectId, a.projectDir, a.head, a.baseCommit, a.diffSha256, a.reviewToken, a.idempotencyKey, a.outcome, a.message, JSON.stringify(a.files), a.verification ? JSON.stringify(a.verification) : null, a.createdAt],
+    );
+    return a;
+  }
+
+  async getApplication(id: string): Promise<ApplicationRecord | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM applications WHERE id = ?`, [id]);
+    return rows[0] ? toApplication(rows[0]) : null;
+  }
+
+  async applicationByKey(key: string): Promise<ApplicationRecord | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM applications WHERE idempotency_key = ?`, [key]);
+    return rows[0] ? toApplication(rows[0]) : null;
+  }
+
+  /** Applications of one Developer run, newest first. */
+  async applicationsFor(runId: string): Promise<ApplicationRecord[]> {
+    await this.ensureSchema();
+    return (await this.db.all(`SELECT * FROM applications WHERE run_id = ? ORDER BY created_at DESC`, [runId])).map(toApplication);
+  }
+
+  /** Applications of every Developer run of one plan, newest first (one query for the whole task list). */
+  async applicationsForPlan(planId: string): Promise<ApplicationRecord[]> {
+    await this.ensureSchema();
+    return (await this.db.all(`SELECT * FROM applications WHERE plan_id = ? ORDER BY created_at DESC`, [planId])).map(toApplication);
+  }
+
+  async setApplicationVerification(id: string, v: ApplicationVerification) {
+    await this.ensureSchema();
+    await this.db.run(`UPDATE applications SET verification_json = ? WHERE id = ?`, [JSON.stringify(v), id]);
+  }
+
+  /** Verifications left "running" by a previous executor process are marked interrupted (nobody runs them any more). */
+  async interruptVerifications() {
+    await this.ensureSchema();
+    const rows = (await this.db.all(`SELECT * FROM applications WHERE verification_json IS NOT NULL`)).map(toApplication);
+    for (const a of rows) if (a.verification?.status === "running") await this.setApplicationVerification(a.id, { ...a.verification, status: "error", finishedAt: nowIso(), message: "Verificação interrompida: o executor local foi encerrado enquanto ela rodava. Você pode verificar de novo." });
   }
 
   // ---- API-key connections -------------------------------------------------

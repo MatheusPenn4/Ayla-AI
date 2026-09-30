@@ -396,6 +396,8 @@ export type DeveloperDiff = {
   diffTruncated: boolean;
   /** Files touched outside the approved edit scope (a non-empty list fails validation). */
   outOfScope: string[];
+  /** SHA-256 of `diffText`, recorded when the executor computed the diff (absent on runs older than this field). Checked again before the diff is applied anywhere. */
+  diffSha256?: string;
 };
 
 /**
@@ -446,6 +448,8 @@ export type TaskCompletion = {
   validatedBy: "orchestrator";
   validatedAt: string;
   createdAt: string;
+  /** Set when the delivery was applied through the interface (see ApplicationRecord): the change is then NOT in `commit` (never committed automatically) — `commit` is the target's HEAD at application time and the applied files are identified by their hashes in that application. */
+  applicationId?: string | null;
 };
 
 /** What the executor lets this QA run do (enforced by client flags, not by the prompt) — read-only, like the Architect. */
@@ -476,7 +480,19 @@ export type QACriterionJudgement = {
   notVerifiedReason?: string;
   /** Required for "approved": the real evidence that justifies it (a file, a test result, a diff line...). */
   evidence?: string;
+  /** Tool-equipped QA: ids of executor-produced evidence (QAEvidence.id) this verdict rests on. */
+  evidenceIds?: string[];
+  /** Criteria spanning several collaborators: the part QA itself evaluated... */
+  evaluatedPart?: string;
+  /** ...and the part that stays pending (never turned into an approval). */
+  pendingPart?: string;
+  /** Why something stays pending: a tool QA did not have, evidence that was not enough, or a later step of the plan (e.g. the Reviewer). */
+  pendingReason?: QAPendingReason;
+  /** future_step only: the downstream task of the plan that owns the pending part. */
+  pendingTask?: string;
 };
+
+export type QAPendingReason = "tool_unavailable" | "insufficient_evidence" | "future_step";
 
 /** The QA's own structured report — self-reported, cross-checked against the real deliverables it was given, never against a live re-run it has no tool to make. */
 export type QAResult = {
@@ -487,6 +503,12 @@ export type QAResult = {
   questions: PlanQuestion[];
   not_verified: string[];
   recommendation: "ready_for_review" | "blocked" | "needs_more_work";
+  /** Tool-equipped QA only: every piece of evidence the executor produced (the only evidence a verdict may cite), the exact version tested and the environment. */
+  evidence?: QAEvidence[];
+  testedVersion?: TestedVersion;
+  environment?: QAEnvironmentReport;
+  /** Tool-equipped QA only: how many model calls this review took. */
+  rounds?: number;
 };
 
 /**
@@ -508,6 +530,130 @@ export type QASnapshot = {
   tools: QATool[];
   /** Estimated size of the frozen text, and what was left out to keep the context proportional to what's needed. */
   contextBudget: { estimatedInputTokens: number; omitted: string[] };
+  /** "executor_operations": QA asks for controlled operations (read, commands, browser) the EXECUTOR runs in an isolated environment of the exact tested version; the model itself still gets no tools. Absent on older, text-only QA runs. */
+  toolsMode?: "executor_operations";
+  /** The exact version QA will test (resolved at prepare time from the delivery evidence). */
+  testedVersion?: TestedVersion;
+  /** What the executor could actually provide when this hand-off was prepared. */
+  tooling?: QAToolingStatus;
+  /** Maximum model calls this review may make (planning, evaluation, one optional extra round) — each may get one format correction. */
+  maxModelCalls?: number;
+};
+
+// ---- Local projects, diff application, isolated verification environments ----------------------
+
+/** A local Git project the user authorized in the executor (AYLA_LOCAL_REPOS or Configurações → Projetos locais). */
+export type LocalProject = {
+  id: string;
+  source: "env" | "ui";
+  dir: string;
+  dirName: string;
+  label: string;
+  owner: string | null;
+  repo: string | null;
+  head: string | null;
+  headSubject: string | null;
+  branch: string | null;
+  /** Uncommitted entries reported by `git status` (null when unreadable). */
+  dirty: number | null;
+  /** Why this project cannot be used right now (null = usable). */
+  problem: string | null;
+  createdAt: string | null;
+};
+
+export type ApplyCheck = { ok: boolean; label: string; detail: string };
+export type ApplyFileState = { path: string; action: DeveloperDiffFile["status"]; exists: boolean; sha256: string | null; localChange: string | null };
+
+/** What the user reviews before "Aplicar ao projeto local". `token` identifies exactly this state of the target. */
+export type ApplyReview = {
+  token: string;
+  createdAt: string;
+  run: { id: string; planId: string; taskId: string; taskTitle: string; baseCommit: string; finishedAt: string | null };
+  project: LocalProject;
+  diff: { text: string; sha256: string; recordedSha256: string | null; integrity: "verified" | "legacy_unrecorded" | "mismatch"; files: DeveloperDiffFile[]; truncated: boolean };
+  checks: ApplyCheck[];
+  target: { head: string; branch: string | null; dirtyTotal: number; dirtyOutside: string[]; affected: ApplyFileState[] };
+  applyCheck: { state: "applies" | "already_present" | "conflict" | "error"; conflicts: { path: string; reason: string }[]; output: string };
+  /** Non-empty = the confirmation is refused, with these reasons. */
+  blockers: string[];
+  applications: ApplicationRecord[];
+};
+
+export type ArtifactRef = { name: string; kind: "log" | "screenshot" | "download" | "clipboard" | "comparison" | "text"; bytes: number; sha256: string; label: string };
+
+/** One real command the executor ran (never claimed without having run it). */
+export type CommandEvidence = {
+  label: string; command: string; cwd: string; exitCode: number | null; durationMs: number; startedAt: string;
+  timedOut: boolean; canceled: boolean; logArtifact: string | null; tail: string;
+};
+
+/** The exact code a verification or a QA run tested, identified by hashes. */
+export type TestedVersion =
+  | { kind: "commit"; projectId: string; dirName: string; commit: string; treeHash: string | null; label: string }
+  | { kind: "commit_plus_patch"; projectId: string; dirName: string; commit: string; patchSha256: string; runId: string; treeHash: string | null; label: string }
+  | { kind: "commit_plus_files"; projectId: string; dirName: string; commit: string; applicationId: string; files: { path: string; sha256: string | null }[]; treeHash: string | null; label: string };
+
+export type ApplicationVerification = {
+  status: "running" | "passed" | "failed" | "canceled" | "error";
+  startedAt: string;
+  finishedAt: string | null;
+  version: TestedVersion | null;
+  checks: CommandEvidence[];
+  message: string;
+  /** TaskCompletion created only once every check passed. */
+  completionId: string | null;
+};
+
+export type ApplicationRecord = {
+  id: string; runId: string; planId: string; taskId: string; projectId: string; projectDir: string;
+  head: string; baseCommit: string; diffSha256: string; reviewToken: string; idempotencyKey: string;
+  outcome: "applied" | "already_present" | "failed_restored" | "failed_unrestored";
+  message: string;
+  files: { path: string; action: string; beforeSha256: string | null; afterSha256: string | null }[];
+  createdAt: string;
+  verification: ApplicationVerification | null;
+};
+
+/** What the executor can provide to a tool-equipped QA on this computer (checked, never assumed). */
+export type QAToolingStatus = {
+  checkedAt: string;
+  git: { ok: boolean; detail: string };
+  packageManager: { ok: boolean; name: string; detail: string };
+  browser: { ok: boolean; detail: string; engine: string | null; executable: string | null };
+  /** Per operation: available or not, and why. */
+  operations: { id: "read" | "search" | "commands" | "browser"; label: string; available: boolean; how: string }[];
+};
+
+export type QAEvidence = {
+  id: string;
+  method: "inspection" | "command" | "browser";
+  /** 1-based indexes of the demand's criteria the requester said this is for (informative). */
+  criteria: number[];
+  purpose: string;
+  /** "executor" = produced automatically (baseline checks, the diff); "qa" = requested by QA in a round. */
+  requestedBy: "executor" | "qa";
+  round: number;
+  version: string;
+  steps: string[];
+  command: CommandEvidence | null;
+  observed: string;
+  /** The operation itself ran to the end (NOT "the criterion passed"). */
+  ok: boolean;
+  artifacts: ArtifactRef[];
+  author: "executor";
+  origin: string;
+};
+
+export type QAEnvironmentReport = {
+  preparedAt: string;
+  dependencies: CommandEvidence | null;
+  network: string;
+  browser: string | null;
+  appUrl: string | null;
+  /** Tracked files of the tested version changed during the review (must be empty). */
+  modifiedDeliveryFiles: string[];
+  apiRequests: { blocked: number; servedFromFixture: number; notFound: number };
+  cleanup: string;
 };
 
 /** One statement the Reviewer verified directly against real evidence (never the model's own say-so). */
@@ -697,4 +843,8 @@ export type EngineStatus = {
   readOnly: Partial<Record<ConnectionId, { safe: boolean; how: string }>>;
   /** Local Git clones the user authorized for read-only reading (AYLA_LOCAL_REPOS). No full paths. */
   localRepos?: { dirName: string; owner: string; repo: string; head: string; headSubject: string }[];
+  /** Authorized local projects (with full paths: this is the user's own computer). */
+  projects?: LocalProject[];
+  /** What a tool-equipped QA can actually use on this computer. */
+  qaTooling?: QAToolingStatus;
 };

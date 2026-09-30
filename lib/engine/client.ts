@@ -3,7 +3,7 @@
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
 import type { DeveloperPreview } from "./developer-preview";
-import type { ApiConnectionRecord, ApiProvider, ConnectionId, ConnectionStatus, EngineStatus, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
+import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -89,8 +89,8 @@ export const engineApi = {
    */
   prepareDeveloperHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; source?: { commit: string }; revisionReason?: string; editScope: { path: string; action: "alterar" | "criar" | "consultar" }[] }) =>
     call<{ run: RunDetail; created: boolean }>("/api/developer-handoffs", { method: "POST", body: JSON.stringify(req) }),
-  /** QA hand-off step 1: freezes the review. No model is called here. */
-  prepareQAHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput }) =>
+  /** QA hand-off step 1: freezes the review (exact version + real tools). No model is called and no environment is built here. repeat = explicit new review of a task that already has one. */
+  prepareQAHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput; repeat?: boolean }) =>
     call<{ run: RunDetail; created: boolean }>("/api/qa-handoffs", { method: "POST", body: JSON.stringify(req) }),
   /** Reviewer hand-off step 1: freezes the review. No model is called here. */
   prepareReviewerHandoff: (req: { idempotencyKey: string; directorRunId: string; taskId: string; agent: TeamMemberInput }) =>
@@ -106,4 +106,19 @@ export const engineApi = {
   /** Real minimal call through the stored key (uses a little of the API's own paid usage). Only on explicit request. */
   verifyApiConnection: (id: string) => call<{ ok: boolean; apiConnection: ApiConnectionRecord; message: string; code?: string; detail?: string }>(`/api/api-connections/${id}/verify`, { method: "POST", body: "{}" }),
   deleteApiConnection: (id: string) => call<{ removed: boolean }>(`/api/api-connections/${id}`, { method: "DELETE" }),
+  /** Local projects the executor may work on (AYLA_LOCAL_REPOS + registered here). */
+  listProjects: () => call<{ projects: LocalProject[] }>("/api/projects"),
+  /** The only request that carries a folder path; the executor validates it and answers with an id. */
+  registerProject: (dir: string, label: string) => call<{ project: LocalProject; created: boolean }>("/api/projects", { method: "POST", body: JSON.stringify({ dir, label }) }),
+  removeProject: (id: string) => call<{ removed: boolean }>(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** "Revisar alterações": review of applying a Developer run's diff to a project (writes nothing). */
+  applyReview: (runId: string, projectId: string) => call<{ review: ApplyReview }>(`/api/apply-review?run=${runId}&project=${encodeURIComponent(projectId)}`),
+  /** "Aplicar ao projeto local": confirmation of one review token. Never commits. */
+  applyDiff: (req: { runId: string; projectId: string; reviewToken: string; idempotencyKey: string }) => call<{ application: ApplicationRecord; duplicate: boolean }>("/api/applications", { method: "POST", body: JSON.stringify(req) }),
+  listApplications: (planRunId: string) => call<{ applications: ApplicationRecord[] }>(`/api/runs/${planRunId}/applications`),
+  verifyApplication: (id: string) => call<{ application: ApplicationRecord; started: boolean }>(`/api/applications/${id}/verify`, { method: "POST", body: "{}" }),
+  cancelVerification: (id: string) => call<{ canceled: boolean; application: ApplicationRecord }>(`/api/applications/${id}/cancel-verification`, { method: "POST", body: "{}" }),
 };
+
+/** Where an artifact the executor produced (log, screenshot, download, comparison) can be opened. */
+export const artifactUrl = (ownerId: string, name: string) => `/api/artifacts/${ownerId}/${encodeURIComponent(name)}`;

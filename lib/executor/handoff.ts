@@ -73,6 +73,10 @@ export type PrepareDeps = {
   github: { fetch?: typeof fetch; token?: string; apiBase?: string; rawBase?: string };
   /** Local clones authorized for reading (AYLA_LOCAL_REPOS) and how to run git. */
   local?: { dirs: string[]; git: GitDeps };
+  /** Authorized projects (AYLA_LOCAL_REPOS + Configurações → Projetos locais) — QA resolves the tested version here. */
+  projects?: import("./projects").ProjectDeps;
+  /** How the isolated QA environment would be built (tool detection at prepare time). */
+  envDeps?: import("./qa-env").EnvDeps;
 };
 
 const cap = <T,>(items: T[], n: number) => ({ items: items.slice(0, n), omitted: Math.max(0, items.length - n) });

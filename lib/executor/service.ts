@@ -1,7 +1,7 @@
 // The executor's application logic, independent from HTTP: run queue,
 // concurrency, cancellation, connection status. State lives in the RunStore
 // (SQLite file); in-memory maps only track processes of this executor.
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { apiConnectionIdOf, apiConnectionStatus, CONNECTION_IDS, isApiConnectionRef } from "@/lib/engine/connections";
@@ -14,9 +14,15 @@ import { detect, LOGIN_STEPS, resolveClient, type ClientDeps } from "./clients";
 import { DeveloperHandoffZ, prepareDeveloperHandoff } from "./developer";
 import { developerPreview } from "./developer-preview";
 import { HandoffRefused, HandoffZ, prepareHandoff, sourceOptions } from "./handoff";
+import { ApplyRefused, applyReviewed, buildApplyReview, type ApplyDeps } from "./apply";
 import { listLocalRepos } from "./local-git";
 import { processRun } from "./planner";
-import type { Runner } from "./proc";
+import { spawnBackground, type BackgroundSpawner, type Runner } from "./proc";
+import { ProjectRefused, authorizedDirs, listProjects, registerProject, removeProject, type ProjectDeps } from "./projects";
+import { isArtifactName, type EnvDeps } from "./qa-env";
+import { buildSetorIaFixture } from "./qa-fixtures";
+import { detectQATooling } from "./qa-ops";
+import { runVerification } from "./verify";
 import { QAHandoffZ, prepareQAHandoff } from "./qa";
 import { ReviewerHandoffZ, prepareReviewerHandoff } from "./reviewer";
 import { EXECUTABLE_AGENTS, buildNewRun, parseStartRequest } from "./runs-service";
@@ -52,9 +58,16 @@ export type ServiceDeps = {
   adapters?: Partial<Record<ConnectionId, AgentAdapter | null>>;
   /** Test hook: replaces client detection. */
   detectors?: Partial<Record<ConnectionId, () => Promise<ConnectionStatus>>>;
+  /** Long-running processes (the app under test). Defaults to the real spawner. */
+  spawnBg?: BackgroundSpawner;
+  /** Test hook for the application flow (a throw simulates a failure right after the files were written). */
+  applyAfterWrite?: () => Promise<void>;
+  /** Test hook: a controlled stand-in for the package manager in isolated environments. */
+  packageManager?: import("./qa-env").PackageManager;
 };
 
-export type Reply = { status: number; body: unknown };
+/** `raw`: a file answer (artifacts) instead of JSON. */
+export type Reply = { status: number; body: unknown; raw?: { contentType: string; data: Buffer; filename: string } };
 
 /**
  * Read-only guarantee per adapter, required before the Architect may use it.
@@ -85,6 +98,8 @@ export class ExecutorService {
   private checking = new Map<ConnectionId, Promise<ConnectionStatus>>();
   private clientDeps: ClientDeps;
   private secretKey: Buffer;
+  /** Verifications of applied deliveries running in this process (cancellable). */
+  private verifying = new Map<string, AbortController>();
 
   constructor(private cfg: ExecutorConfig, private deps: ServiceDeps) {
     mkdirSync(cfg.workRoot, { recursive: true });
@@ -104,10 +119,18 @@ export class ExecutorService {
     return { runner: this.deps.runner, env: this.deps.env, platform: this.clientDeps.platform, exists: this.clientDeps.exists };
   }
 
+  private projectDeps(): ProjectDeps { return { store: this.store, git: this.gitDeps(), envDirs: this.cfg.localRepos ?? [] }; }
+  private envDeps(signal?: AbortSignal): EnvDeps { return { git: this.gitDeps(), spawnBg: this.deps.spawnBg ?? spawnBackground, nodePath: this.deps.nodePath ?? process.execPath, signal, packageManager: this.deps.packageManager }; }
+  private get artifactsRoot() { return path.join(this.cfg.dataDir, "artifacts"); }
+  private applyDeps(): ApplyDeps { return { store: this.store, git: this.gitDeps(), projects: this.projectDeps(), dataDir: this.cfg.dataDir, workRoot: this.cfg.workRoot, afterWrite: this.deps.applyAfterWrite }; }
+  /** AYLA_LOCAL_REPOS + the projects registered in the interface (usable ones). */
+  private authorized() { return authorizedDirs(this.projectDeps()); }
+
   /** Called once at start: runs left "planning" by a previous process are interrupted; queued ones resume. */
   async boot() {
     await this.store.ensureSchema();
     await this.store.interruptOrphans();
+    await this.store.interruptVerifications();
     for (const id of await this.store.queuedIds()) this.enqueue(id);
   }
 
@@ -252,6 +275,7 @@ export class ExecutorService {
   }
 
   async status(force = false): Promise<Omit<EngineStatus, "executionEnabled" | "disabledReason">> {
+    const projects = await listProjects(this.projectDeps());
     let storeOk = true, storeMsg: string | null = null;
     try { await this.store.ensureSchema(); } catch (e) { storeOk = false; storeMsg = (e as Error).message; }
     const connections: EngineStatus["connections"] = {};
@@ -266,7 +290,9 @@ export class ExecutorService {
       executableAgents: EXECUTABLE_AGENTS,
       handoffTargets: [...HANDOFF_TARGETS],
       readOnly: READ_ONLY,
-      localRepos: (await listLocalRepos(this.cfg.localRepos ?? [], this.gitDeps())).map(r => ({ dirName: r.dirName, owner: r.owner, repo: r.repo, head: r.head, headSubject: r.headSubject })),
+      localRepos: (await listLocalRepos(await this.authorized(), this.gitDeps())).map(r => ({ dirName: r.dirName, owner: r.owner, repo: r.repo, head: r.head, headSubject: r.headSubject })),
+      projects,
+      qaTooling: await detectQATooling(this.envDeps(), projects.find(p => !p.problem)?.dir ?? null, true),
     };
   }
 
@@ -309,7 +335,7 @@ export class ExecutorService {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
     try {
-      const { run, created } = await prepareHandoff(req, this.handoffDeps());
+      const { run, created } = await prepareHandoff(req, await this.handoffDeps());
       return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
     } catch (e) {
       if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
@@ -317,21 +343,21 @@ export class ExecutorService {
     }
   }
 
-  private handoffDeps() {
-    return { store: this.store, github: this.cfg.github, local: { dirs: this.cfg.localRepos ?? [], git: this.gitDeps() } };
+  private async handoffDeps() {
+    return { store: this.store, github: this.cfg.github, local: { dirs: await this.authorized(), git: this.gitDeps() }, projects: this.projectDeps(), envDeps: this.envDeps() };
   }
 
   /** Before step 1: commits and files to choose from for a hand-off (read-only; nothing is recorded, no model is called). */
   async sourceOptions(directorRunId: string, taskId: string): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(directorRunId) || !/^[A-Za-z0-9_-]{1,64}$/.test(taskId)) return err(400, "invalid_request", "Plano ou tarefa inválidos.");
-    try { return { status: 200, body: await sourceOptions({ directorRunId, taskId }, this.handoffDeps()) }; }
+    try { return { status: 200, body: await sourceOptions({ directorRunId, taskId }, await this.handoffDeps()) }; }
     catch (e) { if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details); throw e; }
   }
 
   /** Preview of a future Developer hand-off: a view of the records only (no run, no model call, no write access). */
   async developerPreview(directorRunId: string, taskId: string): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(directorRunId) || !/^[A-Za-z0-9_-]{1,64}$/.test(taskId)) return err(400, "invalid_request", "Plano ou tarefa inválidos.");
-    try { return { status: 200, body: { preview: await developerPreview({ directorRunId, taskId }, this.handoffDeps()) } }; }
+    try { return { status: 200, body: { preview: await developerPreview({ directorRunId, taskId }, await this.handoffDeps()) } }; }
     catch (e) { if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details); throw e; }
   }
 
@@ -352,7 +378,7 @@ export class ExecutorService {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
     try {
-      const { run, created } = await prepareDeveloperHandoff(req, this.handoffDeps(), { callTimeoutMs: this.cfg.limits.callTimeoutMs });
+      const { run, created } = await prepareDeveloperHandoff(req, await this.handoffDeps(), { callTimeoutMs: this.cfg.limits.callTimeoutMs });
       return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
     } catch (e) {
       if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
@@ -364,8 +390,9 @@ export class ExecutorService {
 
   /**
    * Step 1: validate against the executor's own records — every dependency of this task, transitively, must
-   * have real, validated evidence (see lib/engine/dependency.ts) — and freeze what will be sent. QA gets no
-   * live tools at all (read_only mode); nothing is called here.
+   * have real, validated evidence (see lib/engine/dependency.ts) — and freeze what will be sent, including
+   * the exact version to test and the operations the executor can really provide. The model still gets no
+   * tool of its own; nothing is called and no environment is built here.
    */
   async prepareQA(body: unknown): Promise<Reply> {
     const parsed = QAHandoffZ.safeParse(body);
@@ -378,7 +405,7 @@ export class ExecutorService {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
     try {
-      const { run, created } = await prepareQAHandoff(req, this.handoffDeps());
+      const { run, created } = await prepareQAHandoff(req, await this.handoffDeps());
       return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
     } catch (e) {
       if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
@@ -404,7 +431,7 @@ export class ExecutorService {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
     try {
-      const { run, created } = await prepareReviewerHandoff(req, this.handoffDeps());
+      const { run, created } = await prepareReviewerHandoff(req, await this.handoffDeps());
       return { status: created ? 201 : 200, body: { run: await this.store.detail(run.id), created } };
     } catch (e) {
       if (e instanceof HandoffRefused) return err(e.status, e.code, e.message, e.details);
@@ -514,6 +541,101 @@ export class ExecutorService {
     return { status: 201, body: { completion } };
   }
 
+  // ---- local projects -------------------------------------------------------
+
+  async listProjects(): Promise<Reply> {
+    return { status: 200, body: { projects: await listProjects(this.projectDeps()) } };
+  }
+
+  /** The only place a folder path typed in the interface is accepted — validated here, then referenced by id only. */
+  async registerProject(body: unknown): Promise<Reply> {
+    try {
+      const { project, created } = await registerProject((body ?? {}) as { dir?: unknown; label?: unknown }, this.projectDeps());
+      return { status: created ? 201 : 200, body: { project, created } };
+    } catch (e) { if (e instanceof ProjectRefused) return err(e.status, e.code, e.message); throw e; }
+  }
+
+  async removeProject(id: string): Promise<Reply> {
+    return { status: 200, body: { removed: await removeProject(id, this.projectDeps()) } };
+  }
+
+  // ---- applying a Developer diff to a local project ------------------------------
+
+  /** "Revisar alterações": everything the user must see before confirming; also freezes the target state behind a token. */
+  async applyReview(runId: string, projectId: string): Promise<Reply> {
+    try { return { status: 200, body: { review: (await buildApplyReview(runId, projectId, this.applyDeps())).review } }; }
+    catch (e) { if (e instanceof ApplyRefused) return err(e.status, e.code, e.message); throw e; }
+  }
+
+  /** "Aplicar ao projeto local": the user's confirmation of one review token. Never commits. */
+  async applyDiff(body: unknown): Promise<Reply> {
+    try {
+      const { application, duplicate } = await applyReviewed((body ?? {}) as Record<string, unknown>, this.applyDeps());
+      return { status: duplicate ? 200 : 201, body: { application, duplicate } };
+    } catch (e) {
+      if (e instanceof ApplyRefused) return { status: e.status, body: { error: { code: e.code, message: e.message, ...(e.details ? { details: e.details } : {}) } } };
+      throw e;
+    }
+  }
+
+  async applicationsForPlan(planId: string): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(planId)) return err(400, "invalid_request", "Plano inválido.");
+    return { status: 200, body: { applications: await this.store.applicationsForPlan(planId) } };
+  }
+
+  /** "Verificar entrega aplicada": starts the project's checks on the applied version in the background (cancellable). */
+  async verifyApplication(id: string): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Aplicação não encontrada.");
+    const app = await this.store.getApplication(id);
+    if (!app) return err(404, "not_found", "Aplicação não encontrada.");
+    if (app.outcome !== "applied" && app.outcome !== "already_present") return err(409, "not_applied", "Só uma aplicação bem-sucedida pode ser verificada.");
+    if (this.verifying.has(id)) return { status: 200, body: { application: app, started: false } };
+    if (app.verification?.status === "passed") return { status: 200, body: { application: app, started: false } };
+    const ac = new AbortController();
+    this.verifying.set(id, ac);
+    await this.store.setApplicationVerification(id, { status: "running", startedAt: new Date().toISOString(), finishedAt: null, version: null, checks: [], message: "Na fila: montando o ambiente isolado…", completionId: null });
+    void runVerification(id, { store: this.store, projects: this.projectDeps(), envDeps: this.envDeps(ac.signal), workRoot: this.cfg.workRoot, artifactsRoot: this.artifactsRoot })
+      .catch(() => {}).finally(() => this.verifying.delete(id));
+    return { status: 202, body: { application: await this.store.getApplication(id), started: true } };
+  }
+
+  async cancelVerification(id: string): Promise<Reply> {
+    const ac = this.verifying.get(id);
+    ac?.abort();
+    return { status: 200, body: { canceled: !!ac, application: await this.store.getApplication(id) } };
+  }
+
+  /** Waits for background verifications (tests). */
+  async verificationsIdle() { while (this.verifying.size) await new Promise(r => setTimeout(r, 20)); }
+
+  // ---- artifacts and audit annotations ----------------------------------------------
+
+  /** A file the executor itself produced for a run or an application (logs, screenshots, downloads, comparisons). */
+  async artifact(ownerId: string, name: string): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(ownerId) || !isArtifactName(name)) return err(404, "not_found", "Artefato não encontrado.");
+    const file = path.join(this.artifactsRoot, ownerId, name);
+    if (!existsSync(file)) return err(404, "not_found", "Artefato não encontrado.");
+    const ext = path.extname(name).toLowerCase();
+    const contentType = ext === ".png" ? "image/png" : ext === ".json" ? "application/json; charset=utf-8" : "text/plain; charset=utf-8";
+    return { status: 200, body: null, raw: { contentType, data: readFileSync(file), filename: name } };
+  }
+
+  /**
+   * Append-only audit note on an existing run (e.g. correcting who actually ran the tests a parecer mentions).
+   * Never touches the run's status or result: the historical parecer stays exactly as it was produced.
+   */
+  async annotate(id: string, body: unknown): Promise<Reply> {
+    if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
+    const b = (body ?? {}) as { kind?: unknown; statement?: unknown; references?: unknown };
+    if (b.kind !== "authorship_correction") return err(400, "invalid_body", "kind deve ser authorship_correction.");
+    if (typeof b.statement !== "string" || b.statement.trim().length < 20 || b.statement.length > 4000) return err(400, "invalid_body", "Informe a correção (20 a 4000 caracteres).");
+    const run = await this.store.get(id);
+    if (!run) return err(404, "not_found", "Execução não encontrada.");
+    const refs = Array.isArray(b.references) ? b.references.filter((x): x is string => typeof x === "string").slice(0, 20) : [];
+    await this.store.event(id, "authorship_correction", b.statement.trim(), { recordedBy: "orchestrator", at: new Date().toISOString(), references: refs, note: "Registro complementar: o parecer original não foi alterado." });
+    return { status: 201, body: { run: await this.store.detail(id) } };
+  }
+
   private enqueue(id: string) {
     if (this.running.has(id) || this.waiting.includes(id)) return;
     this.waiting.push(id);
@@ -535,15 +657,17 @@ export class ExecutorService {
     if (!snap || !run) return;
     const conn = run.connection;
     const adapter = await this.adapterForRef(conn);
+    const dirs = await this.authorized();
     await processRun(id, {
       store: this.store,
       connection: () => this.connectionOrApi(conn, true),
       adapter,
       limits: { callTimeoutMs: this.cfg.limits.callTimeoutMs, leaseMs: this.cfg.limits.leaseMs },
       github: { ...this.cfg.github, permitted: (snap as DirectorSnapshot).director?.tools.github !== false },
-      local: this.cfg.localRepos?.length ? { dirs: this.cfg.localRepos, git: this.gitDeps() } : undefined,
+      local: dirs.length ? { dirs, git: this.gitDeps() } : undefined,
       workRoot: this.cfg.workRoot,
       signal: ac.signal,
+      qa: { envDeps: this.envDeps(ac.signal), projects: this.projectDeps(), artifactsRoot: this.artifactsRoot, fixture: (planId, srcDir) => buildSetorIaFixture(this.store, planId, srcDir) },
     });
     if (!isApiConnectionRef(conn)) this.cache.delete(conn);
   }

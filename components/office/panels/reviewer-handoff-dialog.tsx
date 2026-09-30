@@ -138,7 +138,7 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
               {conn?.state === "connected" ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
               <b>{connectionLabel(run.connection, runs.status?.apiConnections)}</b>
               <span className={`conn-badge ${conn?.state === "connected" ? "ok" : "bad"}`}>{conn ? CONNECTION_STATE_LABEL[conn.state] : executorUp ? "estado desconhecido" : "executor indisponível"}</span>
-              <span className="muted">modelo: {run.model || "padrão do cliente"}{run.effort ? ` · esforço: ${run.effort}` : ""}</span>
+              <span className="muted">modelo: {run.model || "escolhido pelo próprio cliente (padrão dele; o modelo usado é registrado ao final)"}{run.effort ? ` · esforço: ${run.effort}` : ""}</span>
               <span className="grow" />
               <button type="button" className="btn-ghost" onClick={verify} disabled={!!busy}>{busy === "verify" ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>
             </div>

@@ -25,6 +25,8 @@ export async function GET(request: Request) {
     handoffTargets: fromExecutor?.handoffTargets ?? [],
     readOnly: fromExecutor?.readOnly ?? {},
     localRepos: fromExecutor?.localRepos ?? [],
+    projects: fromExecutor?.projects ?? [],
+    qaTooling: fromExecutor?.qaTooling,
   };
   return json(body);
 }

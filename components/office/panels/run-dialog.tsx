@@ -20,7 +20,10 @@ import { PLAN_JSON_SCHEMA } from "@/lib/engine/plan-schema";
 import { connectionLabel } from "@/lib/engine/connections";
 import { TASK_STATE_LABEL, isExecutableAssignee, isHandoffTarget, taskState, type TaskStateKey } from "@/lib/engine/handoff-state";
 import { dependencyBlocker, dependencyEvidence, evidenceLabel } from "@/lib/engine/dependency";
-import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type QASnapshot, type ReviewerSnapshot, type RunDetail, type RunStatus } from "@/lib/engine/types";
+import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ApplicationRecord, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type PlanTask, type QASnapshot, type ReviewerSnapshot, type RunDetail, type RunRecord, type RunStatus, type TaskCompletion } from "@/lib/engine/types";
+import { QA_TOOL_EVAL_SCHEMA } from "@/lib/engine/qa-tooled-schema";
+import { ApplyDialog } from "./apply-dialog";
+import { AuditNotes, EvidenceCard, versionText } from "./qa-tooling";
 import { directorPlanToMarkdown, planMarkdownFilename, type PlanMarkdownStep, type PlanMarkdownTask } from "@/lib/engine/plan-markdown";
 import { downloadTextFile } from "@/lib/utils";
 import type { Agent } from "@/lib/office/types";
@@ -56,7 +59,7 @@ type DialogProps = {
   /** Opens the review of a just-prepared Developer hand-off (kind known at the call site, unlike onReview). Preparing itself only happens through DeveloperPreviewPanel, where the user picks the real edit scope. */
   onReviewDeveloper: (handoffRunId: string) => void;
   /** “Enviar ao QA” on a task of a Director plan (prepares the hand-off and opens the review). */
-  onHandoffQA: (planRunId: string, taskId: string) => void;
+  onHandoffQA: (planRunId: string, taskId: string, opts?: { repeat?: boolean }) => void;
   /** “Enviar ao Revisor” on a task of a Director plan (prepares the hand-off and opens the review). */
   onHandoffReviewer: (planRunId: string, taskId: string) => void;
   /** Reopens the review of a prepared hand-off (Architect, Developer, QA or Reviewer — resolved by the run's kind). */
@@ -161,7 +164,7 @@ function Meta({ run }: { run: RunDetail }) {
     <div className="run-meta">
       <StatusBadge status={run.status} />
       <span>Conexão: <b>{connectionLabel(run.connection)}</b></span>
-      <span>Modelo: <b>{run.model || "padrão do cliente"}</b>{reported ? <small> (informado: {reported})</small> : null}</span>
+      <span>Modelo: <b>{run.model || "escolhido pelo cliente"}</b>{reported ? <small> (informado pelo cliente: {reported})</small> : !run.model ? <small> (a ficha usa o padrão do cliente; o modelo usado é registrado ao final)</small> : null}</span>
       {run.effort && <span>Esforço: <b>{run.effort}</b></span>}
       <span>Criada {time(run.createdAt)}</span>
       {run.finishedAt && <span>Encerrada {time(run.finishedAt)}</span>}
@@ -183,7 +186,8 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   const architectTasks = res?.tasks.filter(t => isHandoffTarget(t.assignee)) ?? [];
   const runsOf = (taskId: string) => runs.taskRunsFor(run.id, taskId);
   const completionsOf = (taskId: string) => runs.completionsFor(run.id, taskId);
-  useEffect(() => { void runs.loadCompletions(run.id); }, [run.id, runs]);
+  useEffect(() => { void runs.loadCompletions(run.id); void runs.loadApplications(run.id); }, [run.id, runs]);
+  const [applyFor, setApplyFor] = useState<{ runId: string; label: string } | null>(null);
   const [sendFor, setSendFor] = useState<string | null>(null);
   const [previewFor, setPreviewFor] = useState<string | null>(null);
   // The Director's own "coherent final result": the first Reviewer task of this plan that reached a concluded
@@ -344,6 +348,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                       </div>
                     );
                   })()}
+                  {t.assignee === "developer" && run.status === "plan_ready" && <DeliveryTrack planId={run.id} task={t} tasks={res.tasks} runsOf={runsOf} completionsOf={completionsOf} runs={runs} onApply={(runId, label) => setApplyFor({ runId, label })} />}
                   {previewFor === t.id && <DeveloperPreviewPanel planRunId={run.id} taskId={t.id} agents={agents} runs={runs} onOpenRun={onOpenRun} onReview={id => { setPreviewFor(null); onReviewDeveloper(id); }} onClose={() => setPreviewFor(null)} />}
                   {t.assignee === "qa" && run.status === "plan_ready" && (() => {
                     const qaBlocker = dependencyBlocker(t, res.tasks, runsOf, completionsOf);
@@ -356,6 +361,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
                         )}
                         {st.key === "awaiting_approval" && st.run && <button className="btn-primary small" onClick={() => onReview(st.run!.id)}><ShieldCheck size={13} /> Revisar e confirmar envio</button>}
                         {st.run && st.key !== "awaiting_approval" && <button className="btn-secondary small" onClick={() => onOpenRun(st.run!.id)}>{st.key === "review_ready" ? "Ver revisão do QA" : st.key === "awaiting_clarification" ? "Ver dúvidas do QA" : "Ver execução do QA"}</button>}
+                        {st.key === "review_ready" && <button className="btn-secondary small" disabled={!!qaBlocker || sending || !runs.status?.executionEnabled} title="Prepara uma nova revisão, com as operações do executor; o parecer atual continua no histórico." onClick={() => onHandoffQA(run.id, t.id, { repeat: true })}>{sending ? <><Loader2 size={13} className="spin" /> Preparando…</> : <><Send size={13} /> Nova revisão do QA (com ferramentas)</>}</button>}
                         {(st.key === "queued" || st.key === "working") && st.run && <button className="btn-ghost small" onClick={() => onCancel(st.run!.id)}>Cancelar</button>}
                         {qaBlocker && <span className="run-hint">{qaBlocker}</span>}
                         {tr.length > 1 && <span className="run-history">Histórico: {tr.map(r => <button key={r.id} className="chip" onClick={() => (r.status === "awaiting_approval" ? onReview(r.id) : onOpenRun(r.id))} title={time(r.createdAt)}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>}
@@ -418,7 +424,37 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
         {res && <button className="btn-secondary" onClick={copyPlanMarkdown}><Copy size={14} /> Copiar Markdown</button>}
         {!active && <button className="btn-secondary" onClick={() => onReplan(run)}><RefreshCw size={14} /> Planejar novamente</button>}
       </div>
+      <ApplyDialog open={!!applyFor} planRunId={run.id} devRunId={applyFor?.runId ?? ""} taskLabel={applyFor?.label ?? ""} runs={runs} onClose={() => { setApplyFor(null); void runs.loadCompletions(run.id); }} />
     </>
+  );
+}
+
+const APP_OUTCOME: Record<ApplicationRecord["outcome"], string> = { applied: "aplicado localmente (sem commit)", already_present: "já estava no projeto", failed_restored: "falhou, arquivos restaurados", failed_unrestored: "falhou, restauração incompleta" };
+
+/** Where a Developer task's delivery stands: diff ready → reviewed/applied locally → verified → handed to QA. Each step shows only what the records say. */
+function DeliveryTrack({ planId, task, tasks, runsOf, completionsOf, runs, onApply }: {
+  planId: string; task: PlanTask; tasks: PlanTask[]; runsOf: (id: string) => RunRecord[]; completionsOf: (id: string) => TaskCompletion[]; runs: BodyProps["runs"]; onApply: (runId: string, label: string) => void;
+}) {
+  const devRuns = runsOf(task.id);
+  const latest = devRuns[0];
+  if (!latest) return null;
+  const diff = latest.status === "implementation_ready" ? latest.developer?.diff ?? null : null;
+  const app = runs.applicationsFor(planId, [latest.id])[0] ?? null;
+  const done = completionsOf(task.id).filter(c => c.kind === "applied_run_result" && c.sourceRunId === latest.id);
+  const external = done.find(c => !c.applicationId) ?? null;
+  const viaApp = app ? done.find(c => c.applicationId === app.id) ?? null : null;
+  const applied = app && (app.outcome === "applied" || app.outcome === "already_present");
+  const v = app?.verification ?? null;
+  const qaTasks = tasks.filter(t => t.assignee === "qa" && t.depends_on.includes(task.id));
+  const step = (ok: boolean | null, label: string, detail: string) => <li className={ok ? "ok" : ok === false ? "bad" : ""}><b>{ok ? "✓" : ok === false ? "✗" : "○"} {label}</b><small>{detail}</small></li>;
+  return (
+    <ol className="delivery-track" aria-label="Andamento da entrega">
+      {step(!!diff, "Diff pronto", diff ? `${diff.files.length} arquivo(s) · base ${diff.baseCommit.slice(0, 8)}${diff.diffTruncated ? " · CORTADO (não aplicável)" : ""}` : "ainda sem implementação concluída")}
+      <li className={app ? "ok" : ""}><b>{app ? "✓" : "○"} Revisão de aplicação</b><small>{diff ? <button className="btn-secondary small" disabled={!runs.status?.executionEnabled} onClick={() => onApply(latest.id, `${task.id} · ${task.title}`)}>Revisar alterações</button> : "disponível quando o diff estiver pronto"}</small></li>
+      {step(applied ? true : app ? false : external ? true : null, "Aplicado localmente", app ? `${APP_OUTCOME[app.outcome]} · ${new Date(app.createdAt).toLocaleString("pt-BR")}` : external ? `aplicado fora do sistema (commit ${external.commit.slice(0, 8)}, registro ${external.id.slice(0, 8)})` : "ainda não aplicado")}
+      {step(v?.status === "passed" || !!viaApp || (!app && !!external) ? true : v && v.status !== "running" ? false : null, "Verificação", v ? (v.status === "running" ? "em andamento…" : v.status === "passed" ? "concluída: todas passaram (entrega validada)" : `${v.status}: ${v.message}`) : external && !app ? `concluída fora do sistema (registro ${external.id.slice(0, 8)}, validado pelo orquestrador)` : applied ? "pendente — aplicado não é verificado" : "pendente")}
+      {step(qaTasks.some(q => ["review_ready"].includes(taskState(q, runsOf(q.id)).key)) ? true : null, "Encaminhamento ao QA", qaTasks.length ? qaTasks.map(q => `${q.id}: ${TASK_STATE_LABEL[taskState(q, runsOf(q.id)).key]}`).join("; ") : "nenhuma tarefa de QA depende desta")}
+    </ol>
   );
 }
 
@@ -718,7 +754,7 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
         <div className="run-live">Envio preparado e aguardando sua aprovação. Nenhuma chamada foi feita ainda.<button className="btn-primary small" onClick={() => onReview(run.id)}><ShieldCheck size={13} /> Revisar e confirmar</button></div>
       )}
       {active && (
-        <div className="run-live"><Loader2 size={15} className="spin" /> {run.status === "queued" ? "Na fila do executor local." : `QA revisando via ${connectionLabel(run.connection)}, sem ferramenta alguma.`} Esta janela atualiza sozinha.
+        <div className="run-live"><Loader2 size={15} className="spin" /> {run.status === "queued" ? "Na fila do executor local." : snap.toolsMode ? `QA revisando via ${connectionLabel(run.connection)}; o executor roda as operações pedidas num ambiente isolado da versão testada (${versionText(snap.testedVersion)}).` : `QA revisando via ${connectionLabel(run.connection)}, sem ferramenta alguma.`} Esta janela atualiza sozinha.
           <button className="btn-ghost" onClick={() => onCancel(run.id)}>Cancelar</button>
         </div>
       )}
@@ -728,7 +764,9 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
         <Tabs.List className="tab-list" aria-label="Detalhes da revisão de QA">
           <Tabs.Trigger value="review">Parecer {q ? `(${q.criteria.filter(c => c.verdict === "approved").length}/${q.criteria.length})` : ""}</Tabs.Trigger>
           <Tabs.Trigger value="questions">Dúvidas {q?.questions.length ? `(${q.questions.length})` : ""}</Tabs.Trigger>
+          {!!q?.evidence?.length && <Tabs.Trigger value="evidence">Evidências ({q.evidence.length})</Tabs.Trigger>}
           <Tabs.Trigger value="deliverables">Entregas revisadas {snap.deliverables.length ? `(${snap.deliverables.length})` : ""}</Tabs.Trigger>
+          <Tabs.Trigger value="tools">Ferramentas</Tabs.Trigger>
           <Tabs.Trigger value="events">Eventos</Tabs.Trigger>
           <Tabs.Trigger value="tokens">Tokens</Tabs.Trigger>
           <Tabs.Trigger value="input">Entrada</Tabs.Trigger>
@@ -738,9 +776,11 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
             {!q && <p className="pane-intro">{active ? "O parecer aparecerá aqui quando o QA terminar." : run.status === "awaiting_approval" ? "O QA ainda não foi acionado." : "Esta execução não produziu um parecer."}</p>}
             {q && (
               <>
+                <AuditNotes events={run.events} />
                 {q.outcome === "needs_clarification" && <div className="notice">O QA não concluiu: ele precisa de respostas (aba Dúvidas).</div>}
                 <section className="run-sec"><h4>Resumo</h4><p>{q.summary || "—"}</p></section>
-                <section className="run-sec"><h4>Recomendação geral</h4><p><span className={`basis ${q.recommendation === "ready_for_review" ? "b-read" : "b-inferred"}`}>{q.recommendation === "ready_for_review" ? "pronto para o Revisor" : q.recommendation === "blocked" ? "bloqueado" : "falta trabalho"}</span></p></section>
+                {q.testedVersion && <section className="run-sec"><h4>Versão testada</h4><p><code>{versionText(q.testedVersion)}</code></p>{q.environment?.modifiedDeliveryFiles.length ? <p className="form-error">Arquivos da entrega mudaram durante a revisão: {q.environment.modifiedDeliveryFiles.join(", ")}</p> : <small className="muted">Nenhum arquivo versionado da versão testada mudou durante a revisão (conferido pelo executor).</small>}</section>}
+                <section className="run-sec"><h4>Recomendação geral</h4><p><span className={`basis ${q.recommendation === "ready_for_review" ? "b-read" : "b-inferred"}`}>{q.recommendation === "ready_for_review" ? (q.criteria.some(c => c.verdict === "not_verified") ? "pronto para a revisão final, com ressalvas" : "pronto para a revisão final") : q.recommendation === "blocked" ? "bloqueado (há reprovação)" : "falta trabalho (evidência insuficiente)"}</span></p></section>
                 <section className="run-sec"><h4>Critérios de aceite da demanda</h4>
                   <table className="ctx-table"><thead><tr><th>Critério</th><th>Veredito</th><th>Evidência / motivo</th></tr></thead>
                     <tbody>{q.criteria.map((c, i) => (
@@ -750,7 +790,10 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
                         <td>
                           {c.verdict === "approved" && c.evidence}
                           {c.verdict === "rejected" && c.rejected && <><b>Passos:</b> {c.rejected.steps}<br /><b>Esperado:</b> {c.rejected.expected}<br /><b>Observado:</b> {c.rejected.observed}<br /><b>Impacto:</b> {c.rejected.impact}</>}
-                          {c.verdict === "not_verified" && c.notVerifiedReason}
+                          {c.verdict === "not_verified" && <>{c.notVerifiedReason}{c.pendingReason && <><br /><small className="muted">Motivo: {c.pendingReason === "tool_unavailable" ? "ferramenta indisponível" : c.pendingReason === "future_step" ? `etapa posterior do plano (${c.pendingTask ?? "?"})` : "evidência insuficiente"}</small></>}</>}
+                          {c.evaluatedPart && <><br /><small><b>Parte avaliada pelo QA:</b> {c.evaluatedPart}</small></>}
+                          {c.pendingPart && <><br /><small><b>Parte pendente:</b> {c.pendingPart}</small></>}
+                          {!!c.evidenceIds?.length && <div className="artifact-links">{c.evidenceIds.map(id => <button key={id} type="button" className="chip" onClick={() => { setTab("evidence"); setTimeout(() => document.getElementById(`ev-${run.id}-${id}`)?.scrollIntoView({ block: "center" }), 60); }}>{id}</button>)}</div>}
                         </td>
                       </tr>
                     ))}</tbody>
@@ -773,6 +816,21 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
             )}
           </Tabs.Content>
 
+          <Tabs.Content value="evidence" className="run-pane">
+            <p className="pane-intro">Tudo o que o QA pôde citar: evidências produzidas pelo executor local (automáticas ou pedidas pelo QA), com a versão testada, os comandos, os passos no navegador e os artefatos (logs, capturas, arquivos baixados, comparações).</p>
+            {q?.environment && <section className="run-sec"><h4>Ambiente isolado</h4><ul>
+              <li>{q.environment.network}</li>
+              {q.environment.browser && <li>Navegador: {q.environment.browser}{q.environment.appUrl ? ` · aplicação em teste em ${q.environment.appUrl}` : ""}</li>}
+              <li>Requisições da aplicação em teste: {q.environment.apiRequests.servedFromFixture} atendidas por dados simulados, {q.environment.apiRequests.blocked} bloqueadas (escrita/execução de agentes), {q.environment.apiRequests.notFound} sem dado simulado.</li>
+              <li>Limpeza: {q.environment.cleanup || "—"}</li>
+            </ul></section>}
+            {q?.evidence?.map(e => <EvidenceCard key={e.id} e={e} runId={run.id} anchor />)}
+          </Tabs.Content>
+          <Tabs.Content value="tools" className="run-pane">
+            <p className="pane-intro">O que esta execução podia fazer de fato, como o executor verificou ao preparar o envio (não as permissões planejadas na ficha).</p>
+            <ul className="tool-grants">{snap.tools.map(t => <li key={t.label} className={t.allowed ? "ok" : "no"}><b>{t.label}: {t.allowed ? "disponível" : "indisponível"}</b><small>{t.how}</small></li>)}</ul>
+            {snap.toolsMode && <p className="form-note">Versão a testar: {versionText(snap.testedVersion)} · até {snap.maxModelCalls ?? 3} chamadas ao modelo (planejar operações, avaliar, uma rodada extra opcional).</p>}
+          </Tabs.Content>
           <Tabs.Content value="deliverables" className="run-pane">
             <p className="pane-intro">Análises e entregas reais que estavam no contexto desta revisão, exatamente como o QA recebeu.</p>
             {!!snap.analyses.length && <section className="run-sec"><h4>Análises do Arquiteto</h4>{snap.analyses.map(a => <div key={a.runId} className="question"><b>{a.taskId} · {a.title}</b><small>{a.recommendation.summary}</small></div>)}</section>}
@@ -785,7 +843,7 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
             ))}
           </Tabs.Content>
           <Tabs.Content value="events" className="run-pane"><Events run={run} /></Tabs.Content>
-          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="QA" prompt={run.prompt} schemaChars={JSON.stringify(QA_JSON_SCHEMA).length} /></Tabs.Content>
+          <Tabs.Content value="tokens" className="run-pane"><UsagePanel budget={run.budget} connection={run.connection} agentLabel="QA" prompt={run.prompt} schemaChars={JSON.stringify(snap.toolsMode ? QA_TOOL_EVAL_SCHEMA : QA_JSON_SCHEMA).length} /></Tabs.Content>
           <Tabs.Content value="input" className="run-pane"><Input run={run} systemTitle="Instruções (protocolo do QA + ficha do QA)" /></Tabs.Content>
         </div>
       </Tabs.Root>
@@ -840,6 +898,7 @@ function ReviewerBody({ run, active, agents, onCancel, onOpenRun, onReview }: Bo
             {!r && <p className="pane-intro">{active ? "O parecer final aparecerá aqui quando o Revisor terminar." : run.status === "awaiting_approval" ? "O Revisor ainda não foi acionado." : "Esta execução não produziu um parecer."}</p>}
             {r && (
               <>
+                <AuditNotes events={run.events} />
                 {r.outcome === "needs_clarification" && <div className="notice">O Revisor não concluiu: ele precisa de respostas (aba Dúvidas).</div>}
                 <section className="run-sec"><h4>Resumo</h4><p>{r.summary || "—"}</p></section>
                 <section className="run-sec"><h4>Veredito final</h4><p><span className={`basis ${r.verdict === "aprovado" ? "b-read" : r.verdict === "reprovado" ? "b-bad" : "b-inferred"}`}>{REVIEWER_VERDICT_LABEL[r.verdict]}</span></p></section>

@@ -8,6 +8,7 @@ import type { ApiProvider, ConnectionId } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
 import { ConnectionBadge, ConnectionSteps } from "./connection-panel";
 import { Field } from "./field";
+import { ProjectsSection } from "./projects-section";
 
 type RunsApi = ReturnType<typeof useRuns>;
 
@@ -177,6 +178,8 @@ export function ConnectionsScreen({ agents, runs }: { agents: Agent[]; runs: Run
           {!apiConnections.length && !adding && <p className="muted">Nenhuma conexão de API cadastrada. Ela é opcional — as contas por assinatura acima continuam sendo o caminho principal.</p>}
         </div>
       </section>
+
+      <ProjectsSection runs={runs} />
 
       <section className="run-sec">
         <h4>Quem está pronto para executar</h4>

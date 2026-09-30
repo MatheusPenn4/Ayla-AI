@@ -616,6 +616,23 @@ svg { flex: none; }
 .clamp { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 details.raw summary { cursor: pointer; color: var(--sky); font-size: 12.5px; margin: 6px 0; }
 .form-note.warn { border-color: #7a5a2a; background: #2a2012; color: #ffe0a8 !important; }
+.form-note.ok { border-color: #2a6a4c; background: #0f2218; color: #c8f0d6 !important; }
+/* Developer delivery: diff ready → review → applied → verified → QA */
+.delivery-track { list-style: none; margin: 8px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+.delivery-track li { padding: 7px 9px; border-radius: 8px; border: 1px solid var(--line); background: #10132c; display: grid; gap: 3px; font-size: 12px; }
+.delivery-track li.ok { border-color: #2a6a4c; }
+.delivery-track li.bad { border-color: #7a2f3d; }
+.delivery-track small { color: var(--muted); line-height: 1.4; }
+.evidence.failed { border-color: #7a2f3d; }
+.artifact-links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.artifact-links .chip { display: inline-flex; align-items: center; gap: 4px; text-decoration: none; }
+.audit-note { display: grid; gap: 4px; margin-bottom: 10px; }
+.audit-note p { margin: 0; }
+.inline-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.inline-form input { flex: 1 1 220px; min-width: 0; }
+.warn-box { border-color: #7a5a2a; }
+.check-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+.check-row input { margin-top: 3px; }
 .arch-chip { border-color: #3d4a8c; }
 .handoff-dialog .run-sec { padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: #0f1230; display: grid; gap: 6px; }
 .handoff-dialog .run-sec ol, .handoff-dialog .run-sec ul { margin: 0; padding-left: 18px; }

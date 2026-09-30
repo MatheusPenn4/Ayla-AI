@@ -49,6 +49,9 @@ function renderQAResult(qa: QAResult): string {
     if (c.verdict === "approved" && c.evidence) L.push(`  evidência citada pelo QA: ${c.evidence}`);
     if (c.verdict === "rejected" && c.rejected) L.push(`  esperado: ${c.rejected.expected} | observado: ${c.rejected.observed} | impacto: ${c.rejected.impact}`);
     if (c.verdict === "not_verified" && c.notVerifiedReason) L.push(`  motivo de não verificado: ${c.notVerifiedReason}`);
+    if (c.evidenceIds?.length) L.push(`  evidências do executor citadas pelo QA: ${c.evidenceIds.join(", ")}`);
+    if (c.evaluatedPart) L.push(`  parte avaliada pelo QA: ${c.evaluatedPart}`);
+    if (c.pendingPart) L.push(`  parte pendente${c.pendingReason === "future_step" ? ` (cabe à tarefa ${c.pendingTask ?? "posterior"} — se for a sua, avalie-a você mesmo)` : ""}: ${c.pendingPart}`);
   }
   if (qa.not_verified.length) L.push(`Outros itens não verificados pelo QA: ${qa.not_verified.join("; ")}`);
   return L.join("\n");

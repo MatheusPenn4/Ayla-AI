@@ -8,6 +8,7 @@ import { toTeamInput } from "@/lib/engine/client";
 import { CONNECTION_STATE_LABEL, connectionLabel, connectionStatusFor } from "@/lib/engine/connections";
 import type { QASnapshot } from "@/lib/engine/types";
 import type { Agent } from "@/lib/office/types";
+import { QAToolingList, versionText } from "./qa-tooling";
 import { useRunDetail } from "./run-dialog";
 
 type RunsApi = ReturnType<typeof useRuns>;
@@ -61,7 +62,7 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
         <span className="eyebrow">REVISAR ANTES DE ENVIAR · TAREFA {snap.task.id} → QA</span>
         <DialogTitle className="run-title">{snap.task.title}</DialogTitle>
         <DialogDescription>
-          {pending ? "Nada foi executado. Nenhuma chamada foi feita ainda — ela só começa se você confirmar. QA não recebe ferramenta alguma; tudo abaixo é o texto exato que ele vai ler." : `Este envio não está mais aguardando aprovação (estado atual: ${run.status}).`}
+          {pending ? (snap.toolsMode ? `Nada foi executado: nenhuma chamada ao modelo e nenhum ambiente montado. Ao confirmar, o executor monta um ambiente isolado da versão exata abaixo, roda as verificações do projeto e as operações que o QA pedir, e faz até ${snap.maxModelCalls ?? 3} chamadas ao modelo (planejar, avaliar, uma rodada extra opcional). O modelo em si não recebe ferramentas.` : "Nada foi executado. Nenhuma chamada foi feita ainda — ela só começa se você confirmar. QA não recebe ferramenta alguma; tudo abaixo é o texto exato que ele vai ler.") : `Este envio não está mais aguardando aprovação (estado atual: ${run.status}).`}
         </DialogDescription>
       </DialogHeader>
       <div className="dialog-scroll run-scroll">
@@ -102,10 +103,18 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
           )) : <p className="muted">Nenhuma entrega real registrada ainda.</p>}
         </section>
 
-        <section className="run-sec"><h4>5. Ferramentas desta execução</h4>
-          <ul className="tool-grants">{snap.tools.map(t => <li key={t.label} className={t.allowed ? "ok" : "no"}><b>{t.label}: {t.allowed ? "permitida" : "bloqueada"}</b><small>{t.how}</small></li>)}</ul>
-          <p className="form-note"><Lock size={13} /> QA roda em modo somente leitura, sem nenhuma ferramenta concedida pelo cliente (igual ao Arquiteto) — tudo o que ele sabe está no texto desta revisão.</p>
-        </section>
+        {snap.toolsMode ? (
+          <section className="run-sec"><h4>5. Versão testada e ferramentas realmente disponíveis</h4>
+            <p><b>Versão exata:</b> <code>{versionText(snap.testedVersion)}</code></p>
+            <QAToolingList tooling={snap.tooling} connectionLabel={connectionLabel(run.connection)} />
+            <p className="form-note"><Lock size={13} /> No navegador de QA, a aplicação usa dados simulados somente leitura desta demanda; ações que executariam agentes são bloqueadas — nenhum clique dele gera chamada paga.</p>
+          </section>
+        ) : (
+          <section className="run-sec"><h4>5. Ferramentas desta execução</h4>
+            <ul className="tool-grants">{snap.tools.map(t => <li key={t.label} className={t.allowed ? "ok" : "no"}><b>{t.label}: {t.allowed ? "permitida" : "bloqueada"}</b><small>{t.how}</small></li>)}</ul>
+            <p className="form-note"><Lock size={13} /> QA roda em modo somente leitura, sem nenhuma ferramenta concedida pelo cliente (igual ao Arquiteto) — tudo o que ele sabe está no texto desta revisão.</p>
+          </section>
+        )}
 
         <section className="run-sec"><h4>6. Limitações conhecidas</h4>
           <ul>
@@ -129,7 +138,7 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
               {conn?.state === "connected" ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
               <b>{connectionLabel(run.connection)}</b>
               <span className={`conn-badge ${conn?.state === "connected" ? "ok" : "bad"}`}>{conn ? CONNECTION_STATE_LABEL[conn.state] : executorUp ? "estado desconhecido" : "executor indisponível"}</span>
-              <span className="muted">modelo: {run.model || "padrão do cliente"}{run.effort ? ` · esforço: ${run.effort}` : ""}</span>
+              <span className="muted">modelo: {run.model || "escolhido pelo próprio cliente (padrão dele; o modelo usado é registrado ao final)"}{run.effort ? ` · esforço: ${run.effort}` : ""}</span>
               <span className="grow" />
               <button type="button" className="btn-ghost" onClick={verify} disabled={!!busy}>{busy === "verify" ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>
             </div>
