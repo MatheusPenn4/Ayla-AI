@@ -25,7 +25,7 @@ export async function callExecutorRaw(path: string): Promise<{ ok: true; data: A
   }
 }
 
-export async function callExecutor(path: string, init: { method?: "GET" | "POST" | "DELETE"; body?: unknown; timeoutMs?: number } = {}): Promise<ExecutorReply> {
+export async function callExecutor(path: string, init: { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown; timeoutMs?: number } = {}): Promise<ExecutorReply> {
   const cfg = serverConfig().executor;
   if (!cfg.token) {
     return { status: 503, body: { error: { code: "executor_not_configured", message: "O token do executor local não está configurado. Rode pnpm executor uma vez (ele cria o token em .dev.vars) e reinicie o pnpm dev." } } };

@@ -1413,7 +1413,7 @@ describe("QA: preparar o envio (dependência real, transitiva, jamais por chamad
     // Tools come from what the executor detected — this test repo has no lockfile, so no commands/browser, with the reason.
     const tool = (label: string) => snap.tools.find(t => t.label === label)!;
     expect(tool("Ler arquivos da versão testada").allowed).toBe(true);
-    expect(tool("Rodar verificações do projeto")).toMatchObject({ allowed: false, how: expect.stringContaining("pnpm-lock.yaml") });
+    expect(tool("Rodar verificações do projeto")).toMatchObject({ allowed: false, how: expect.stringContaining("configuração de execução") });
     expect(tool("Navegador automatizado").allowed).toBe(false);
     expect(tool("Editar o código da entrega").allowed).toBe(false);
     expect(tool("Publicar, fazer push ou deploy").allowed).toBe(false);

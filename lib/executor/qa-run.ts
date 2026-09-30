@@ -15,9 +15,10 @@ import { evalInstruction, evidenceBlock, PLAN_INSTRUCTION, versionLine } from "@
 import type { QAEnvironmentReport, QAEvidence, QAResult, QASnapshot, QAToolingStatus, RunError, RunStatus } from "@/lib/engine/types";
 import type { AgentReply } from "./adapters/types";
 import type { AppFixture } from "./qa-browser";
-import { CHECK_LABEL, buildEnv, checkCatalog, deliveryChanges, destroyEnv, prepareDependencies, resolvePackageManager, runEnvCommand, writeArtifact, type EnvDeps, type QAEnv } from "./qa-env";
+import { buildEnv, deliveryChanges, destroyEnv, prepareDependencies, projectChecks, resolvePackageManager, runEnvCommand, writeArtifact, type EnvDeps, type ExecPlan, type QAEnv } from "./qa-env";
+import { COMMAND_LABEL, parseCommandLine } from "./project-config";
 import { runOperation, runOrientation, type OpsContext } from "./qa-ops";
-import { getProject, type ProjectDeps } from "./projects";
+import { getProject, loadExecPlan, type ProjectDeps } from "./projects";
 import type { RunStore } from "./store";
 import { trackedFiles } from "./worktree";
 
@@ -63,12 +64,19 @@ export async function runToolQA(c: ToolQAContext): Promise<Outcome | null> {
       evidence.push({ id: nextId(), method: "inspection", criteria: [], purpose: `Diff real da entrega de ${d.taskId} (${d.files.join(", ")})`, requestedBy: "executor", round: 0, version: versionLine(version), steps: [`diff registrado pelo executor para ${d.taskId}`], command: null, observed: clipText(d.diffText, 20_000), ok: true, artifacts: [art], author: "executor", origin: "Produzida automaticamente pelo executor a partir do registro da entrega (não é relato de nenhum colaborador)." });
     }
     // 1b. The environment of the exact version.
+    let exec: ExecPlan | null = null;
     let pm = resolvePackageManager(c.envDeps, null);
     if (version) {
       await store.event(runId, "qa_env", `Montando o ambiente isolado da versão testada: ${versionLine(version)}.`);
       try {
         const project = await getProject(version.projectId, c.projects);
         if (!project || project.problem) throw new Error(project?.problem ?? "o projeto local da versão testada não está mais autorizado no executor");
+        exec = await loadExecPlan(project.id, c.projects);
+        // What the user reviewed is what runs: settings changed after the preparation are not silently used.
+        if (exec && (snap.projectConfigAt ?? null) !== (exec.config.updatedAt ?? null)) {
+          await store.event(runId, "qa_config_changed", "A configuração de execução do projeto mudou depois que esta revisão foi preparada; comandos e navegador ficam indisponíveis nesta revisão (prepare uma nova para usar a configuração atual).");
+          exec = null; pm = { ok: false, name: "—", detail: "a configuração de execução do projeto mudou depois que esta revisão foi preparada (prepare uma nova revisão)" };
+        }
         let patch: string | undefined, files: { path: string; content: Buffer }[] | undefined;
         if (version.kind === "commit_plus_patch") patch = (await store.get(version.runId))?.developer?.diff?.diffText;
         if (version.kind === "commit_plus_files") files = version.files.filter(f => f.sha256).map(f => ({ path: f.path, content: readFileSync(path.join(project.dir, ...f.path.split("/"))) }));
@@ -82,30 +90,36 @@ export async function runToolQA(c: ToolQAContext): Promise<Outcome | null> {
     if (signal?.aborted) return null;
 
     if (env) {
-      pm = resolvePackageManager(c.envDeps, env.srcDir);
+      if (exec) pm = resolvePackageManager(c.envDeps, exec);
       if (!pm.ok) disable(pm.detail);
     }
-    if (env && pm.ok) {
-      await store.event(runId, "qa_deps", "Preparando as dependências pelo lockfile do projeto (sem rede, do store local, primeiro).");
-      const deps = await prepareDependencies(env, pm, c.envDeps);
+    if (env && pm.ok && exec) {
+      await store.event(runId, "qa_deps", `Preparando as dependências com ${exec.config.commands.install} (lockfile; sem rede primeiro, quando possível).`);
+      const deps = await prepareDependencies(env, exec, c.envDeps);
       report.dependencies = deps.evidence; report.network = deps.network;
       evidence.push({ id: nextId(), method: "command", criteria: [], purpose: "Preparar dependências (etapa separada dos testes)", requestedBy: "executor", round: 0, version: versionLine(env.version), steps: [deps.evidence.command], command: deps.evidence, observed: `${deps.network} Código de saída ${deps.evidence.exitCode}.\n${deps.evidence.tail.slice(-1200)}`, ok: deps.evidence.exitCode === 0, artifacts: deps.artifacts, author: "executor", origin: "Produzida automaticamente pelo executor." });
       if (signal?.aborted) return null;
+      if (deps.seed) evidence.push({ id: nextId(), method: "command", criteria: [], purpose: "Preparar dados de teste (comando configurado)", requestedBy: "executor", round: 0, version: versionLine(env.version), steps: [deps.seed.evidence.command], command: deps.seed.evidence, observed: `Código de saída ${deps.seed.evidence.exitCode}.\n${deps.seed.evidence.tail.slice(-1200)}`, ok: deps.seed.evidence.exitCode === 0, artifacts: [deps.seed.artifact], author: "executor", origin: "Produzida automaticamente pelo executor." });
       if (deps.evidence.exitCode !== 0) disable("as dependências do projeto não puderam ser preparadas (ver a evidência de preparação)");
+      else if (deps.seed && deps.seed.evidence.exitCode !== 0) disable("a preparação dos dados de teste falhou (ver a evidência de dados de teste)");
       else {
-        for (const chk of checkCatalog(env.srcDir)) {
+        const { configured, notConfigured } = projectChecks(exec);
+        if (notConfigured.length) evidence.push({ id: nextId(), method: "command", criteria: [], purpose: "Verificações sem comando configurado", requestedBy: "executor", round: 0, version: versionLine(env.version), steps: [], command: null, observed: `Não configurado (nada foi executado; NÃO é verificação aprovada): ${notConfigured.map(id => COMMAND_LABEL[id]).join(", ")}.`, ok: false, artifacts: [], author: "executor", origin: "Produzida automaticamente pelo executor a partir da configuração do projeto." });
+        for (const chk of configured) {
           if (signal?.aborted) return null;
-          await store.event(runId, "qa_check", `Rodando ${CHECK_LABEL[chk.id]} no ambiente isolado…`);
-          const r = await runEnvCommand(env, pm as Extract<typeof pm, { ok: true }>, CHECK_LABEL[chk.id], chk.args, `base-${chk.id}.log`, 900_000, c.envDeps);
-          evidence.push({ id: nextId(), method: "command", criteria: [], purpose: `Verificação padrão do projeto: ${CHECK_LABEL[chk.id]}`, requestedBy: "executor", round: 0, version: versionLine(env.version), steps: [r.evidence.command], command: r.evidence, observed: `Código de saída ${r.evidence.exitCode}${r.evidence.timedOut ? " (tempo esgotado)" : ""}. Final da saída:\n${r.evidence.tail.slice(-1500)}`, ok: r.evidence.exitCode === 0, artifacts: [r.artifact], author: "executor", origin: "Produzida automaticamente pelo executor (verificações do próprio projeto)." });
+          await store.event(runId, "qa_check", `Rodando ${chk.label} no ambiente isolado…`);
+          const argv = parseCommandLine(chk.command, { manager: exec.config.packageManager });
+          if (!argv.ok) continue;
+          const r = await runEnvCommand(env, exec, chk.label, argv.argv, `base-${chk.id}.log`, 900_000, c.envDeps);
+          evidence.push({ id: nextId(), method: "command", criteria: [], purpose: `Verificação padrão do projeto: ${chk.label}`, requestedBy: "executor", round: 0, version: versionLine(env.version), steps: [r.evidence.command], command: r.evidence, observed: `Código de saída ${r.evidence.exitCode}${r.evidence.timedOut ? " (tempo esgotado)" : ""}. Final da saída:\n${r.evidence.tail.slice(-1500)}`, ok: r.evidence.exitCode === 0, artifacts: [r.artifact], author: "executor", origin: "Produzida automaticamente pelo executor (verificações do próprio projeto)." });
         }
       }
     }
     if (signal?.aborted) return null;
 
     const tracked = env ? await trackedFiles({ workDir: env.srcDir, hooksDir: env.hooksDir }, c.envDeps.git) : [];
-    const fixture = env ? await c.fixture(c.planId, env.srcDir) : null;
-    const ctx: OpsContext = { env: env!, pm, deps: c.envDeps, tracked, fixture, tooling, versionLabel: versionLine(env?.version ?? version), nextId, app };
+    const fixture = env && exec?.config.browserData === "setor_ia_fixture" ? await c.fixture(c.planId, env.srcDir) : null;
+    const ctx: OpsContext = { env: env!, pm, plan: exec, deps: c.envDeps, tracked, fixture, tooling, versionLabel: versionLine(env?.version ?? version), nextId, app };
     // 1c. Orientation map of the interface (executor-authored; checks no criterion), so call 1 can plan real paths.
     if (env) {
       await store.event(runId, "qa_orientation", "Registrando a orientação da interface (o que cada clicável da tela inicial abre)…");

@@ -538,6 +538,8 @@ export type QASnapshot = {
   tooling?: QAToolingStatus;
   /** Maximum model calls this review may make (planning, evaluation, one optional extra round) — each may get one format correction. */
   maxModelCalls?: number;
+  /** updatedAt of the project execution settings this review was prepared with (a later change is not used silently). */
+  projectConfigAt?: string | null;
 };
 
 // ---- Local projects, diff application, isolated verification environments ----------------------
@@ -559,6 +561,43 @@ export type LocalProject = {
   /** Why this project cannot be used right now (null = usable). */
   problem: string | null;
   createdAt: string | null;
+  /** How the executor runs this project in isolated environments (null = not configured yet: nothing is run). */
+  runConfig?: ProjectRunConfig | null;
+};
+
+/** Package managers the executor can drive in isolated environments (identified by the lockfile). */
+export type SupportedPackageManager = "npm" | "pnpm";
+
+/**
+ * Execution settings of one project (Configurações → Projetos locais), confirmed by the user. Commands are
+ * command lines WITHOUT a shell (no pipes/redirections), starting with the package manager, npx or node;
+ * "" = not configured (shown as "não configurado", never as a passing check). They run the project's own
+ * code, only inside an isolated copy of the tested version, without the user's credentials.
+ */
+export type ProjectRunConfig = {
+  /** Folder of the package (relative to the repository root; "" = the root). */
+  workDir: string;
+  packageManager: SupportedPackageManager;
+  commands: { install: string; typecheck: string; lint: string; test: string; build: string; dev: string; seed: string };
+  /** The application under test: {port} in the dev command (and PORT) receive the port; ready = GET readyPath answers < 400 (and contains readyText, if set). */
+  app: { host: "localhost" | "127.0.0.1"; port: number | null; readyPath: string; readyText: string; timeoutSec: number };
+  /** What the QA browser talks to: the app's own server in the isolated copy, or (Setor IA itself) read-only records served by the executor. */
+  browserData: "app" | "setor_ia_fixture";
+  /** Variables given to the test environment only. Values are kept encrypted in the executor and never returned. */
+  env: { name: string; set: boolean; external: boolean }[];
+  acknowledgedAt: string | null;
+  updatedAt: string | null;
+};
+
+/** What the executor found in the project (suggestions the user can edit; nothing is saved by detection). */
+export type ProjectRunDetection = {
+  workDirs: { dir: string; lockfiles: string[]; manager: string | null; supported: boolean; scripts: string[] }[];
+  chosen: string;
+  manager: { name: string | null; supported: boolean; detail: string };
+  suggestion: ProjectRunConfig | null;
+  notes: string[];
+  fixtureAvailable: boolean;
+  unsupported: string[];
 };
 
 export type ApplyCheck = { ok: boolean; label: string; detail: string };
@@ -603,6 +642,8 @@ export type ApplicationVerification = {
   message: string;
   /** TaskCompletion created only once every check passed. */
   completionId: string | null;
+  /** Checks the project has no command for (listed, never counted as passing). */
+  notConfigured?: string[];
 };
 
 export type ApplicationRecord = {

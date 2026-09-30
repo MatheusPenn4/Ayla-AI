@@ -17,7 +17,7 @@ import { buildNewRun, parseStartRequest } from "@/lib/executor/runs-service";
 import { ExecutorService, type ServiceDeps } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
 import { RunStore } from "@/lib/executor/store";
-import { connected, fakeAdapter, goodPlan, member, reply, request } from "./helpers";
+import { configureProject, connected, fakeAdapter, goodPlan, member, reply, request } from "./helpers";
 
 let work: string;
 let store: RunStore;
@@ -138,6 +138,7 @@ describe("QA com operações do executor, de ponta a ponta", { timeout: 60_000 }
         return reply(evalRaw([crit({ evidence_ids: [read], evidence: `${read} mostra b = 20.` }), future({ evidence_ids: [] })]));
       },
     ]);
+    await configureProject(svc, s.dir);
     const prep = await svc.prepareQA(qaReq(s.planId));
     const run = (prep.body as { run: RunDetail }).run;
     const snap = run.snapshot as QASnapshot;
@@ -150,7 +151,7 @@ describe("QA com operações do executor, de ponta a ponta", { timeout: 60_000 }
     const ev = done.qa!.evidence!;
     expect(ev[0]).toMatchObject({ id: "E1", method: "inspection", requestedBy: "executor" }); // the delivered diff
     expect(ev.find(e => e.purpose.includes("Preparar dependências"))).toMatchObject({ method: "command", ok: true });
-    expect(ev.filter(e => e.requestedBy === "executor" && e.method === "command").map(e => e.command!.label)).toEqual(expect.arrayContaining(["Lint", "Testes automatizados", "Build"]));
+    expect(ev.filter(e => e.requestedBy === "executor" && e.method === "command" && e.command).map(e => e.command!.label)).toEqual(expect.arrayContaining(["Lint", "Testes automatizados", "Build"]));
     const read = ev.find(e => e.steps[0]?.startsWith("ler src/a.ts"))!;
     expect(read.observed).toContain("export const b = 20;"); // the EXACT tested version: base + persisted diff
     expect(ev.find(e => e.steps[0]?.startsWith("buscar"))!.observed).toContain("src/a.ts:2");
@@ -175,6 +176,7 @@ describe("QA com operações do executor, de ponta a ponta", { timeout: 60_000 }
     const pidFile = path.join(work, "pid");
     process.env.FAKE_SLOW = "test"; process.env.FAKE_PID_FILE = pidFile;
     const { svc, calls } = svcWith([]);
+    await configureProject(svc, s.dir);
     const run = ((await svc.prepareQA(qaReq(s.planId))).body as { run: RunDetail }).run;
     await svc.approve(run.id, { snapshotHash: run.snapshotHash });
     let pid = 0;

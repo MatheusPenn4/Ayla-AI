@@ -3,7 +3,7 @@
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
 import type { DeveloperPreview } from "./developer-preview";
-import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
+import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, ProjectRunConfig, ProjectRunDetection, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -111,6 +111,9 @@ export const engineApi = {
   /** The only request that carries a folder path; the executor validates it and answers with an id. */
   registerProject: (dir: string, label: string) => call<{ project: LocalProject; created: boolean }>("/api/projects", { method: "POST", body: JSON.stringify({ dir, label }) }),
   removeProject: (id: string) => call<{ removed: boolean }>(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Execution settings (names of variables only) + editable suggestions detected by the executor. */
+  projectConfig: (id: string, workDir?: string) => call<{ project: LocalProject; config: ProjectRunConfig | null; detection: ProjectRunDetection; supportedManagers: string[] }>(`/api/projects/${encodeURIComponent(id)}/config${workDir !== undefined ? `?workDir=${encodeURIComponent(workDir)}` : ""}`),
+  saveProjectConfig: (id: string, config: unknown, acknowledgeCodeExecution: boolean) => call<{ project: LocalProject; config: ProjectRunConfig }>(`/api/projects/${encodeURIComponent(id)}/config`, { method: "PUT", body: JSON.stringify({ config, acknowledgeCodeExecution }) }),
   /** "Revisar alterações": review of applying a Developer run's diff to a project (writes nothing). */
   applyReview: (runId: string, projectId: string) => call<{ review: ApplyReview }>(`/api/apply-review?run=${runId}&project=${encodeURIComponent(projectId)}`),
   /** "Aplicar ao projeto local": confirmation of one review token. Never commits. */

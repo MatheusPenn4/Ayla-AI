@@ -14,7 +14,7 @@ import { isHandoffTarget } from "@/lib/engine/handoff-state";
 import { QA_ASSIGNEE, type DependencyAnalysis, type DirectorSnapshot, type PlanTask, type QADeliverable, type QASnapshot, type QATool, type QAToolingStatus, type RunBudget, type RunRecord, type TestedVersion } from "@/lib/engine/types";
 import { scanPatch, sha256 as sha256Hex } from "./apply";
 import { detectQATooling } from "./qa-ops";
-import { listProjects } from "./projects";
+import { listProjects, loadExecPlan } from "./projects";
 import { dependencyAnalysis, HandoffRefused, type PrepareDeps } from "./handoff";
 import { listLocalRepos, listTreeEntries, readCommitDiff, runGit } from "./local-git";
 import { estimateTokens } from "./planner";
@@ -226,7 +226,8 @@ export async function prepareQAHandoff(req: QAHandoffRequest, deps: PrepareDeps)
   const agent = req.agent;
   const pSnap0 = (await store.snapshot(parent!.id)) as DirectorSnapshot;
   const resolved = await resolveTestedVersion(hint, pSnap0.demand.repo, deps);
-  const tooling = deps.envDeps ? await detectQATooling(deps.envDeps, resolved.projectDir, !!resolved.version) : null;
+  const exec = resolved.version && deps.projects ? await loadExecPlan(resolved.version.projectId, deps.projects) : null;
+  const tooling = deps.envDeps ? await detectQATooling(deps.envDeps, exec, !!resolved.version) : null;
   if (!tooling) refuse(503, "qa_tools_unavailable", "Este executor não tem o ambiente de QA configurado.");
   if (resolved.reason) tooling!.operations = tooling!.operations.map(o => ({ ...o, available: false, how: resolved.reason! }));
   const tools = toolQATools(tooling!);
@@ -236,7 +237,7 @@ export async function prepareQAHandoff(req: QAHandoffRequest, deps: PrepareDeps)
     dependents: plan.tasks.filter(t => t.depends_on.includes(task!.id)).map(t => ({ id: t.id, title: t.title, assignee: t.assignee })),
   };
 
-  const system = buildToolQASystem(agent);
+  const system = buildToolQASystem(agent, exec?.config.browserData ?? "app");
   const build = (deliv: QADeliverable[]) => buildToolQAMessage({ demand, task: task!, plan: planExcerpt, team, analyses, deliverables: deliv, version: resolved.version, tooling: tooling!, files: resolved.files });
   const schemaText = JSON.stringify(QA_OPS_SCHEMA) + JSON.stringify(QA_TOOL_EVAL_SCHEMA);
   const budgetTokens = Math.max(0, Math.floor(agent.budget));
@@ -260,7 +261,7 @@ export async function prepareQAHandoff(req: QAHandoffRequest, deps: PrepareDeps)
 
   const snapshot: QASnapshot = {
     kind: "qa_task", agent, team, demand, task: task!, plan: planExcerpt, analyses, deliverables: liveDeliverables, tools, contextBudget: { estimatedInputTokens: estimate, omitted },
-    toolsMode: "executor_operations", testedVersion: resolved.version ?? undefined, tooling: tooling!, maxModelCalls: 3,
+    toolsMode: "executor_operations", testedVersion: resolved.version ?? undefined, tooling: tooling!, maxModelCalls: 3, projectConfigAt: exec?.config.updatedAt ?? null,
   };
   const prompt = { system, user };
   const budget: RunBudget = { sheetTokens: budgetTokens, estimatedInputTokens: estimate, calls: [], reportedTotalTokens: null, exceeded: false };

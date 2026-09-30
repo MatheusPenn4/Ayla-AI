@@ -5,5 +5,5 @@ export const PHASE_LABEL = "Piloto local";
 
 export const PHASE_SUMMARY =
   "Diretor e Arquiteto já executam de verdade neste computador; o Desenvolvedor já produziu código em uma cópia isolada. " +
-  "Os fluxos de QA e de Revisor existem, mas ainda aguardam validação em uma execução real. " +
+  "O QA verifica pedindo operações ao executor (leitura, comandos e navegador numa cópia isolada da versão testada, sem editar o código); o Revisor forma o parecer final sem ferramentas. " +
   "Conexões e execução funcionam só aqui; o uso hospedado depende de uma integração futura ainda não feita.";

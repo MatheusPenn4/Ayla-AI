@@ -4,9 +4,11 @@
 // verification/QA environments from. A path typed here is sent ONCE; the executor validates it (absolute,
 // the real top level of a Git repository) and from then on everything refers to the project by id.
 import { useState } from "react";
-import { FolderGit2, Loader2, Plus, Trash2 } from "lucide-react";
+import { FolderGit2, Loader2, Plus, Settings2, Trash2 } from "lucide-react";
 import type { useRuns } from "@/hooks/use-runs";
 import { EngineApiError, engineApi } from "@/lib/engine/client";
+import type { ProjectRunConfig } from "@/lib/engine/types";
+import { ProjectConfigEditor } from "./project-config-editor";
 
 type RunsApi = ReturnType<typeof useRuns>;
 
@@ -16,6 +18,7 @@ export function ProjectsSection({ runs }: { runs: RunsApi }) {
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState<"" | "add" | string>("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
 
   const add = async () => {
     setBusy("add"); setMsg(null);
@@ -45,11 +48,14 @@ export function ProjectsSection({ runs }: { runs: RunsApi }) {
               <span className={`conn-badge ${p.problem ? "bad" : "ok"}`}>{p.problem ? "indisponível" : "autorizado"}</span>
               <span className="muted">{p.source === "env" ? "via AYLA_LOCAL_REPOS (.dev.vars)" : `cadastrado aqui${p.createdAt ? ` em ${new Date(p.createdAt).toLocaleString("pt-BR")}` : ""}`}</span>
               <span className="grow" />
+              {!p.problem && <button type="button" className="btn-secondary small" aria-expanded={editing === p.id} onClick={() => setEditing(editing === p.id ? null : p.id)}><Settings2 size={13} /> Configurar execução</button>}
               {p.source === "ui" && <button type="button" className="btn-ghost small danger" disabled={!!busy} onClick={() => void remove(p.id)}>{busy === p.id ? <Loader2 size={13} className="spin" /> : <Trash2 size={13} />} Remover</button>}
             </div>
             <p className="conn-msg"><code>{p.dir}</code></p>
             <p className="conn-msg">{p.owner ? `${p.owner}/${p.repo}` : "sem origin do GitHub"} · branch {p.branch ?? "—"} · HEAD <code>{p.head?.slice(0, 12) ?? "—"}</code>{p.headSubject ? ` (${p.headSubject})` : ""} · {p.dirty === null ? "estado local desconhecido" : p.dirty ? `${p.dirty} alteração(ões) local(is) não commitada(s)` : "sem alterações locais"}</p>
             {p.problem && <p className="conn-msg bad">{p.problem}</p>}
+            {!p.problem && <p className={`conn-msg ${p.runConfig?.acknowledgedAt ? "ok" : "bad"}`}>{runSummary(p.runConfig ?? null)}</p>}
+            {editing === p.id && <ProjectConfigEditor project={p} onSaved={() => void runs.refreshStatus(true)} onClose={() => setEditing(null)} />}
           </div>
         ))}
         {!projects.length && <p className="muted">Nenhum projeto autorizado ainda.</p>}
@@ -66,4 +72,12 @@ export function ProjectsSection({ runs }: { runs: RunsApi }) {
       {msg && <p className={msg.ok ? "form-note" : "form-error"} role={msg.ok ? undefined : "alert"}>{msg.text}</p>}
     </section>
   );
+}
+
+/** One line: what the isolated environments will run for this project (or that nothing runs yet). */
+function runSummary(c: ProjectRunConfig | null) {
+  if (!c?.acknowledgedAt) return "Execução não configurada: verificação da entrega e QA com ferramentas não rodam comandos nem navegador neste projeto até você confirmar a configuração.";
+  const k = ([["typecheck", "tipos"], ["lint", "lint"], ["test", "testes"], ["build", "build"], ["dev", "servidor"]] as const);
+  const on = k.filter(([id]) => c.commands[id].trim()).map(([, l]) => l), off = k.filter(([id]) => !c.commands[id].trim()).map(([, l]) => l);
+  return `Execução: ${c.packageManager} em ${c.workDir || "(raiz)"} · configurado: ${on.join(", ") || "nada"}${off.length ? ` · não configurado: ${off.join(", ")}` : ""}${c.env.length ? ` · ${c.env.length} variável(is) de teste` : ""} · navegador: ${c.browserData === "setor_ia_fixture" ? "dados simulados do Setor IA" : "servidor da própria aplicação"}.`;
 }

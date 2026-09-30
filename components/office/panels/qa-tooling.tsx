@@ -59,12 +59,12 @@ export function EvidenceCard({ e, runId, anchor }: { e: QAEvidence; runId: strin
 
 /** Append-only audit notes recorded on a run after the fact (e.g. correcting who ran the tests a parecer mentions). */
 export function AuditNotes({ events }: { events: RunEvent[] }) {
-  const notes = events.filter(e => e.kind === "authorship_correction");
+  const notes = events.filter(e => e.kind === "authorship_correction" || e.kind === "complementary_evidence");
   if (!notes.length) return null;
   return (
     <div className="notice audit-note">
       <b>Registro complementar (auditável) — o parecer abaixo não foi alterado</b>
-      {notes.map(n => <p key={n.seq}><small>{new Date(n.at).toLocaleString("pt-BR")}:</small> {n.message}</p>)}
+      {notes.map(n => <p key={n.seq}><small>{new Date(n.at).toLocaleString("pt-BR")} · {n.kind === "complementary_evidence" ? "evidência complementar" : "correção de autoria"}:</small> {n.message}</p>)}
     </div>
   );
 }

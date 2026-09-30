@@ -7,7 +7,7 @@
 //   branch --contains): no checkout, no status, no fetch, no writes, and
 //   uncommitted changes are never included;
 // - structured arguments, no shell, time limit, output cap.
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type { DeveloperDiffFile, SourceComparison, SourceContext } from "@/lib/engine/types";
 import { ARCHITECT_GITHUB_LIMITS, GithubError, assembleContext, type RequestedFile, type TreeEntry } from "./github";
@@ -55,20 +55,62 @@ export function parseOrigin(url: string) {
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 
+// ---- identity of a clone (origin + HEAD), read once per state of its .git ------------------------------
+// Every preparation, run and screen asks "which repository is this folder and what is its HEAD?" — two git
+// processes each time (~80 ms apiece on Windows). The answer only changes when .git/HEAD, the current branch's
+// ref (loose or packed) or .git/config change, so it is kept per folder under a fingerprint of exactly those
+// files (their content/size/mtime) and re-read as soon as any of them differs. Folders whose .git is not a plain
+// directory (worktrees, submodules) are never cached.
+type RepoIdentity = { originUrl: string | null; head: string | null; subject: string; branch: string | null };
+const identityCache = new Map<string, { fp: string; value: RepoIdentity }>();
+
+function gitFingerprint(dir: string): { fp: string; branch: string | null } | null {
+  try {
+    const gitDir = path.join(dir, ".git");
+    if (!statSync(gitDir).isDirectory()) return null;
+    const headText = readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
+    const cfg = statSync(path.join(gitDir, "config"));
+    const parts = [headText, `${cfg.size}:${cfg.mtimeMs}`];
+    const ref = /^ref: (refs\/.+)$/.exec(headText)?.[1] ?? null;
+    if (ref) {
+      const loose = path.join(gitDir, ...ref.split("/"));
+      parts.push(existsSync(loose) ? readFileSync(loose, "utf8").trim() : "sem-ref-solta");
+      const packed = path.join(gitDir, "packed-refs");
+      if (existsSync(packed)) { const p = statSync(packed); parts.push(`${p.size}:${p.mtimeMs}`); }
+    }
+    return { fp: parts.join("|"), branch: ref ? ref.replace(/^refs\/heads\//, "") : "HEAD" };
+  } catch { return null; }
+}
+
+/** origin URL, HEAD commit/subject and branch of an authorized clone (cached per state of its .git, see above). */
+export async function repoIdentity(dir: string, deps: GitDeps): Promise<RepoIdentity> {
+  const f = gitFingerprint(dir);
+  const hit = f ? identityCache.get(dir) : undefined;
+  if (f && hit && hit.fp === f.fp) return hit.value;
+  const g = resolveGit(deps);
+  if (!g) return { originUrl: null, head: null, subject: "", branch: null };
+  const origin = await git(deps, g, dir, ["remote", "get-url", "origin"]);
+  const log = await git(deps, g, dir, ["log", "-1", "--format=%H%n%s"]);
+  const [sha, subject] = log.code === 0 ? log.stdout.trim().split(/\r?\n/) : ["", ""];
+  let branch = f?.branch ?? null;
+  if (!f) { const br = await git(deps, g, dir, ["rev-parse", "--abbrev-ref", "HEAD"]); branch = br.code === 0 ? br.stdout.trim() || null : null; }
+  const value: RepoIdentity = { originUrl: origin.code === 0 ? origin.stdout.trim() : null, head: /^[0-9a-f]{40}$/.test(sha ?? "") ? sha : null, subject: (subject ?? "").slice(0, 120), branch };
+  // Only a state read back unchanged is cached (the fingerprint is taken again after reading).
+  const after = f ? gitFingerprint(dir) : null;
+  if (f && after && after.fp === f.fp) identityCache.set(dir, { fp: f.fp, value });
+  return value;
+}
+
 /** Authorized local clones and what their HEAD is (for the review screen). */
 export async function listLocalRepos(dirs: string[], deps: GitDeps): Promise<LocalRepoInfo[]> {
-  const g = resolveGit(deps);
-  if (!g) return [];
+  if (!resolveGit(deps)) return [];
   const out: LocalRepoInfo[] = [];
   for (const dir of dirs) {
     if (!path.isAbsolute(dir) || !(deps.exists ?? existsSync)(path.join(dir, ".git"))) continue;
-    const origin = await git(deps, g, dir, ["remote", "get-url", "origin"]);
-    const o = origin.code === 0 ? parseOrigin(origin.stdout) : null;
-    const head = await git(deps, g, dir, ["log", "-1", "--format=%H%n%s"]);
-    if (!o || head.code !== 0) continue;
-    const [sha, subject] = head.stdout.trim().split(/\r?\n/);
-    if (!/^[0-9a-f]{40}$/.test(sha)) continue;
-    out.push({ dir, dirName: path.basename(dir), owner: o.owner, repo: o.repo, head: sha, headSubject: (subject ?? "").slice(0, 120) });
+    const id = await repoIdentity(dir, deps);
+    const o = id.originUrl ? parseOrigin(id.originUrl) : null;
+    if (!o || !id.head) continue;
+    out.push({ dir, dirName: path.basename(dir), owner: o.owner, repo: o.repo, head: id.head, headSubject: id.subject });
   }
   return out;
 }

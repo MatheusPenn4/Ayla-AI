@@ -91,7 +91,7 @@ function EngineBanner({ runs, director, onOpenDirector }: { runs: RunsApi; direc
       <div className="engine-head">
         <span className={`led ${blocking ? "amber" : "green"}`} />
         <b>Motor do Setor IA · {PHASE_LABEL}</b>
-        <span className="muted">Diretor e Arquiteto já executam de verdade · Desenvolvedor implementa em cópia isolada · QA e Revisor existem, mas aguardam validação em execução real · GitHub: só repositórios públicos, leitura limitada</span>
+        <span className="muted">Diretor e Arquiteto já executam de verdade · Desenvolvedor implementa em cópia isolada · QA verifica pedindo leitura, comandos e navegador ao executor (cópia isolada, sem editar código) · Revisor dá o parecer final · GitHub: só repositórios públicos, leitura limitada</span>
         <button className="btn-ghost" disabled={runs.checking} onClick={() => { void runs.verify(); void runs.refresh(); }}>{runs.checking ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />} Verificar conexão</button>
         <button className="btn-ghost" onClick={onOpenDirector}>Ficha do Diretor</button>
       </div>

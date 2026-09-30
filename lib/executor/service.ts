@@ -18,9 +18,10 @@ import { ApplyRefused, applyReviewed, buildApplyReview, type ApplyDeps } from ".
 import { listLocalRepos } from "./local-git";
 import { processRun } from "./planner";
 import { spawnBackground, type BackgroundSpawner, type Runner } from "./proc";
-import { ProjectRefused, authorizedDirs, listProjects, registerProject, removeProject, type ProjectDeps } from "./projects";
+import { ProjectRefused, authorizedDirs, getProject, listProjects, loadExecPlan, registerProject, removeProject, type ProjectDeps } from "./projects";
 import { isArtifactName, type EnvDeps } from "./qa-env";
 import { buildSetorIaFixture } from "./qa-fixtures";
+import { SUPPORTED_MANAGERS, detectProject, validateConfig } from "./project-config";
 import { detectQATooling } from "./qa-ops";
 import { runVerification } from "./verify";
 import { QAHandoffZ, prepareQAHandoff } from "./qa";
@@ -119,7 +120,7 @@ export class ExecutorService {
     return { runner: this.deps.runner, env: this.deps.env, platform: this.clientDeps.platform, exists: this.clientDeps.exists };
   }
 
-  private projectDeps(): ProjectDeps { return { store: this.store, git: this.gitDeps(), envDirs: this.cfg.localRepos ?? [] }; }
+  private projectDeps(): ProjectDeps { return { store: this.store, git: this.gitDeps(), envDirs: this.cfg.localRepos ?? [], decrypt: box => decryptSecret(this.secretKey, parseBox(box)) }; }
   private envDeps(signal?: AbortSignal): EnvDeps { return { git: this.gitDeps(), spawnBg: this.deps.spawnBg ?? spawnBackground, nodePath: this.deps.nodePath ?? process.execPath, signal, packageManager: this.deps.packageManager }; }
   private get artifactsRoot() { return path.join(this.cfg.dataDir, "artifacts"); }
   private applyDeps(): ApplyDeps { return { store: this.store, git: this.gitDeps(), projects: this.projectDeps(), dataDir: this.cfg.dataDir, workRoot: this.cfg.workRoot, afterWrite: this.deps.applyAfterWrite }; }
@@ -292,7 +293,7 @@ export class ExecutorService {
       readOnly: READ_ONLY,
       localRepos: (await listLocalRepos(await this.authorized(), this.gitDeps())).map(r => ({ dirName: r.dirName, owner: r.owner, repo: r.repo, head: r.head, headSubject: r.headSubject })),
       projects,
-      qaTooling: await detectQATooling(this.envDeps(), projects.find(p => !p.problem)?.dir ?? null, true),
+      qaTooling: await detectQATooling(this.envDeps(), await (async () => { const p = projects.find(x => !x.problem && x.runConfig?.acknowledgedAt); return p ? loadExecPlan(p.id, this.projectDeps()) : null; })(), true),
     };
   }
 
@@ -559,6 +560,36 @@ export class ExecutorService {
     return { status: 200, body: { removed: await removeProject(id, this.projectDeps()) } };
   }
 
+  /** The saved execution settings (variable names only) and what the executor detects in the project, as editable suggestions. */
+  async projectConfig(id: string, workDir?: string | null): Promise<Reply> {
+    const project = await getProject(id, this.projectDeps());
+    if (!project) return err(404, "not_found", "Projeto não encontrado.");
+    if (project.problem) return err(409, "project_unavailable", project.problem);
+    const detection = detectProject(project.dir, workDir ?? project.runConfig?.workDir);
+    return { status: 200, body: { project, config: project.runConfig ?? null, detection, supportedManagers: SUPPORTED_MANAGERS } };
+  }
+
+  /**
+   * Saves the execution settings. They run the project's own code, so the user must acknowledge that
+   * explicitly (acknowledgeCodeExecution); values of variables are encrypted here and never returned.
+   */
+  async saveProjectConfig(id: string, body: unknown): Promise<Reply> {
+    const project = await getProject(id, this.projectDeps());
+    if (!project) return err(404, "not_found", "Projeto não encontrado.");
+    if (project.problem) return err(409, "project_unavailable", project.problem);
+    const b = (body ?? {}) as { config?: unknown; acknowledgeCodeExecution?: unknown };
+    if (b.acknowledgeCodeExecution !== true) return err(400, "acknowledgement_required", "Confirme que entende que estes comandos executam código do próprio projeto neste computador (numa cópia isolada, sem as suas credenciais).");
+    const saved = await this.store.getProjectConfig(id);
+    const v = validateConfig(b.config, project.dir, saved?.config.env.map(e => e.name) ?? [], name => (saved?.secrets[name] ? decryptSecret(this.secretKey, parseBox(saved.secrets[name])) : null));
+    if (!v.ok) return err(400, "invalid_config", "A configuração não foi salva.", v.errors);
+    const secrets: Record<string, string> = {};
+    for (const e of v.config.env) secrets[e.name] = v.setValues[e.name] !== undefined ? serializeBox(encryptSecret(this.secretKey, v.setValues[e.name])) : saved!.secrets[e.name];
+    const now = new Date().toISOString();
+    await this.store.saveProjectConfig(id, { ...v.config, env: v.config.env.map(e => ({ ...e, set: true })), acknowledgedAt: now, updatedAt: now }, secrets);
+    const after = await getProject(id, this.projectDeps());
+    return { status: 200, body: { project: after, config: after?.runConfig ?? null } };
+  }
+
   // ---- applying a Developer diff to a local project ------------------------------
 
   /** "Revisar alterações": everything the user must see before confirming; also freezes the target state behind a token. */
@@ -621,18 +652,18 @@ export class ExecutorService {
   }
 
   /**
-   * Append-only audit note on an existing run (e.g. correcting who actually ran the tests a parecer mentions).
+   * Append-only audit note on an existing run: correcting who actually ran the tests a parecer mentions, or complementary evidence produced later (e.g. a re-run of one check).
    * Never touches the run's status or result: the historical parecer stays exactly as it was produced.
    */
   async annotate(id: string, body: unknown): Promise<Reply> {
     if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
     const b = (body ?? {}) as { kind?: unknown; statement?: unknown; references?: unknown };
-    if (b.kind !== "authorship_correction") return err(400, "invalid_body", "kind deve ser authorship_correction.");
+    if (b.kind !== "authorship_correction" && b.kind !== "complementary_evidence") return err(400, "invalid_body", "kind deve ser authorship_correction ou complementary_evidence.");
     if (typeof b.statement !== "string" || b.statement.trim().length < 20 || b.statement.length > 4000) return err(400, "invalid_body", "Informe a correção (20 a 4000 caracteres).");
     const run = await this.store.get(id);
     if (!run) return err(404, "not_found", "Execução não encontrada.");
     const refs = Array.isArray(b.references) ? b.references.filter((x): x is string => typeof x === "string").slice(0, 20) : [];
-    await this.store.event(id, "authorship_correction", b.statement.trim(), { recordedBy: "orchestrator", at: new Date().toISOString(), references: refs, note: "Registro complementar: o parecer original não foi alterado." });
+    await this.store.event(id, b.kind, b.statement.trim(), { recordedBy: "orchestrator", at: new Date().toISOString(), references: refs, note: "Registro complementar: o parecer original não foi alterado." });
     return { status: 201, body: { run: await this.store.detail(id) } };
   }
 

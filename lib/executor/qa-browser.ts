@@ -2,9 +2,10 @@
 // download), always headless, always a fresh temporary profile (never the user's own profile, cookies or
 // sessions), and limited to the application under test:
 // - every request to another origin is aborted;
-// - the application's own API (/api/*) never reaches a real server: GETs are answered from a fixture frozen
-//   by the executor (read-only records of this demand), and every other method gets a 403 — so no click in
-//   the QA browser can start, approve or pay for any agent call;
+// - the application under test is the copy running in the isolated environment, with the project's TEST
+//   variables only; with a fixture (Setor IA itself, whose API would reach the real executor) its /api/* never
+//   reaches a server: GETs are answered from read-only records frozen by the executor and every other method
+//   gets a 403 — so no click in the QA browser can start, approve or pay for any agent call;
 // - scenario steps come from a fixed catalog (open, click, wait, read the real clipboard, download, compare…);
 //   there is no free-form JavaScript;
 // - the headless browser keeps its own clipboard (checked on this machine: the user's system clipboard is not
@@ -26,7 +27,7 @@ export type AppFixture = { localStorage: Record<string, string>; api: Record<str
 export type StepLog = { index: number; action: string; args: string; ok: boolean; observed: string; ms: number };
 export type ScenarioResult = {
   ok: boolean; steps: StepLog[]; artifacts: ArtifactRef[]; consoleErrors: string[];
-  api: { blocked: number; servedFromFixture: number; notFound: number; externalBlocked: number };
+  api: { blocked: number; servedFromFixture: number; notFound: number; externalBlocked: number; passedToApp: number };
   browserVersion: string; observed: string;
 };
 
@@ -75,7 +76,9 @@ export function compareTexts(a: string, b: string, ignoreLineRegex: string) {
 }
 
 export async function runScenario(o: {
-  appUrl: string; name: string; steps: BrowserStep[]; fixture: AppFixture; artifactsDir: string; executable: string;
+  appUrl: string; name: string; steps: BrowserStep[]; artifactsDir: string; executable: string;
+  /** Read-only records served instead of the app's /api (Setor IA only); null = the app's own server answers. */
+  fixture: AppFixture | null;
   signal?: AbortSignal; evidenceId: string;
   /** Orientation map instead of (before) steps: what each control of the first screen opens. */
   explore?: { maxClicks: number };
@@ -86,7 +89,7 @@ export async function runScenario(o: {
   const artifacts: ArtifactRef[] = [];
   const steps: StepLog[] = [];
   const consoleErrors: string[] = [];
-  const api = { blocked: 0, servedFromFixture: 0, notFound: 0, externalBlocked: 0 };
+  const api = { blocked: 0, servedFromFixture: 0, notFound: 0, externalBlocked: 0, passedToApp: 0 };
   const apiLog: string[] = [];
   const saved = new Map<string, { text: string; source: string }>();
   const prefix = `${o.evidenceId}-${o.name}`.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 60);
@@ -102,6 +105,7 @@ export async function runScenario(o: {
       try { u = new URL(req.url()); } catch { api.externalBlocked++; return route.abort("blockedbyclient"); }
       if (u.origin !== origin) { api.externalBlocked++; apiLog.push(`BLOQUEADO (outra origem) ${req.method()} ${u.origin}${u.pathname}`); return route.abort("blockedbyclient"); }
       if (!u.pathname.startsWith("/api/")) return route.continue();
+      if (!o.fixture) { api.passedToApp++; apiLog.push(`APLICAÇÃO EM TESTE ${req.method()} ${u.pathname}`); return route.continue(); }
       if (req.method() !== "GET") {
         api.blocked++; apiLog.push(`BLOQUEADO (ambiente de QA) ${req.method()} ${u.pathname}`);
         return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ error: { code: "qa_environment", message: o.fixture.note } }) });
@@ -112,7 +116,7 @@ export async function runScenario(o: {
       return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "qa_fixture_missing", message: "Ambiente de QA: sem dado simulado para esta leitura." } }) });
     });
     // Seeds the fixture only when absent, so a reload keeps whatever the page itself saved meanwhile.
-    await ctx.addInitScript({ content: `(function () { if (location.origin !== ${JSON.stringify(origin)}) return; var d = ${JSON.stringify(o.fixture.localStorage)}; for (var k in d) { if (localStorage.getItem(k) === null) localStorage.setItem(k, d[k]); } })();` });
+    if (o.fixture) await ctx.addInitScript({ content: `(function () { if (location.origin !== ${JSON.stringify(origin)}) return; var d = ${JSON.stringify(o.fixture?.localStorage ?? {})}; for (var k in d) { if (localStorage.getItem(k) === null) localStorage.setItem(k, d[k]); } })();` });
     const page = await ctx.newPage();
     page.on("console", m => { if (m.type() === "error") consoleErrors.push(clip(m.text(), 300)); });
     page.on("pageerror", e => consoleErrors.push(clip(`pageerror: ${e.message}`, 300)));
@@ -331,7 +335,7 @@ export async function runScenario(o: {
     try { finalClickables = await clickables(); } catch { /* page may be gone */ }
     artifacts.push(writeArtifact(o.artifactsDir, `${prefix}-requisicoes.log`, [
       `Requisições da página ao servidor da aplicação em teste (/api/*) e a outras origens:`, ...apiLog,
-      "", `Bloqueadas (escrita/execução): ${api.blocked} · atendidas por fixture: ${api.servedFromFixture} · sem fixture: ${api.notFound} · outras origens bloqueadas: ${api.externalBlocked}`,
+      "", o.fixture ? `Bloqueadas (escrita/execução): ${api.blocked} · atendidas por fixture: ${api.servedFromFixture} · sem fixture: ${api.notFound} · outras origens bloqueadas: ${api.externalBlocked}` : `Atendidas pelo servidor da aplicação em teste (cópia isolada): ${api.passedToApp} · outras origens bloqueadas: ${api.externalBlocked}`,
       `Permissão de escrita ao final: ${writePermission}`,
     ].join("\n"), "log", "Requisições interceptadas (nenhuma chegou a um executor real)"));
     artifacts.push(writeArtifact(o.artifactsDir, `${prefix}-passos.log`, steps.map(s => `${s.index}. ${s.ok ? "OK " : "FALHOU "} ${s.action} ${s.args} — ${s.observed} (${s.ms} ms)`).join("\n") + (consoleErrors.length ? `\n\nErros de console:\n${consoleErrors.join("\n")}` : ""), "log", "Passos executados no navegador"));

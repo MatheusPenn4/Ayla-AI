@@ -290,7 +290,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
           </Tabs.Content>
 
           <Tabs.Content value="tasks" className="run-pane">
-            <p className="pane-intro">Propostas de delegação do Diretor. Tarefas do <b>Arquiteto</b> (só leitura), do <b>Desenvolvedor</b> (escrita numa cópia isolada), do <b>QA</b> (revisão, só leitura) e do <b>Revisor</b> (parecer final, só leitura) podem ser enviadas, uma de cada vez e só depois que você revisar e confirmar.</p>
+            <p className="pane-intro">Propostas de delegação do Diretor. Tarefas do <b>Arquiteto</b> (só leitura), do <b>Desenvolvedor</b> (escrita numa cópia isolada), do <b>QA</b> (verificação: pede leitura, comandos e navegador ao executor numa cópia isolada; nunca edita o código) e do <b>Revisor</b> (parecer final, só leitura) podem ser enviadas, uma de cada vez e só depois que você revisar e confirmar.</p>
             {res && run.status === "plan_ready" && !architectTasks.length && (
               <div className="notice">Nenhuma tarefa deste plano foi atribuída ao Arquiteto: não há encaminhamento arquitetural neste plano.</div>
             )}

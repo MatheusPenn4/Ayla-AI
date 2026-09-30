@@ -238,7 +238,9 @@ function toolQALimitations(r: QAResult, budget: RunBudget) {
   const out = [
     "O modelo do QA não recebeu nenhuma ferramenta: pediu operações de um catálogo fixo e o executor local as executou no ambiente isolado; toda observação citada vem de evidência produzida pelo executor.",
     "Um build, typecheck, lint ou teste automatizado passando não é, por si só, validação funcional de um critério de aceite do usuário — só evidência de qualidade de código.",
-    "O navegador de QA usou dados simulados somente leitura desta demanda; ações que executariam agentes foram bloqueadas (nenhuma chamada paga partiu dele).",
+    (env?.apiRequests.servedFromFixture ?? 0) > 0 || (env?.apiRequests.blocked ?? 0) > 0
+      ? "O navegador de QA usou dados simulados somente leitura desta demanda; ações que executariam agentes foram bloqueadas (nenhuma chamada paga partiu dele)."
+      : "O navegador de QA usou a aplicação em teste rodando na cópia isolada, com as variáveis de teste configuradas no projeto; outras origens foram bloqueadas.",
     "Isolamento de rede dos comandos não é imposto pelo sistema operacional nesta versão: a preparação de dependências usa o store local sem rede (e só recorre à rede se isso falhar); os comandos rodam sem credenciais nem sessões dos clientes; o navegador só acessa a origem da aplicação em teste.",
   ];
   if (env?.modifiedDeliveryFiles.length) out.push(`ATENÇÃO: arquivos versionados da entrega mudaram durante a revisão: ${env.modifiedDeliveryFiles.join(", ")}.`);

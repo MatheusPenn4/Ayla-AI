@@ -6,11 +6,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import type { LocalProject } from "@/lib/engine/types";
-import { parseOrigin, runGit, type GitDeps } from "./local-git";
+import type { LocalProject, ProjectRunConfig } from "@/lib/engine/types";
+import type { ExecPlan } from "./qa-env";
+import { parseOrigin, repoIdentity, runGit, type GitDeps } from "./local-git";
 import type { RunStore } from "./store";
 
-export type ProjectDeps = { store: RunStore; git: GitDeps; envDirs: string[] };
+export type ProjectDeps = {
+  store: RunStore; git: GitDeps; envDirs: string[];
+  /** Decrypts a stored test-variable value (SecretBox JSON); only the executor holds the key. */
+  decrypt?: (box: string) => string;
+};
 
 const win = (deps: GitDeps) => (deps.platform ?? process.platform) === "win32";
 /** Canonical form used to compare two folder paths (case-insensitive on Windows, forward slashes, no trailing slash). */
@@ -24,16 +29,11 @@ async function describe(base: { id: string; source: LocalProject["source"]; dir:
   const out: LocalProject = { ...base, dirName: path.basename(base.dir), owner: null, repo: null, head: null, headSubject: null, branch: null, dirty: null, problem: null };
   if (!existsSync(base.dir)) return { ...out, problem: "A pasta não existe mais neste computador." };
   if (!existsSync(path.join(base.dir, ".git"))) return { ...out, problem: "A pasta não é mais um repositório Git (sem .git)." };
-  const origin = await runGit(deps, base.dir, ["remote", "get-url", "origin"]);
-  const o = origin.code === 0 ? parseOrigin(origin.stdout) : null;
+  const id = await repoIdentity(base.dir, deps);
+  const o = id.originUrl ? parseOrigin(id.originUrl) : null;
   if (o) { out.owner = o.owner; out.repo = o.repo; }
-  const head = await runGit(deps, base.dir, ["log", "-1", "--format=%H%n%s"]);
-  if (head.code === 0) {
-    const [sha, subject] = head.stdout.trim().split(/\r?\n/);
-    if (/^[0-9a-f]{40}$/.test(sha)) { out.head = sha; out.headSubject = (subject ?? "").slice(0, 120); }
-  }
-  const br = await runGit(deps, base.dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (br.code === 0) out.branch = br.stdout.trim() || null;
+  if (id.head) { out.head = id.head; out.headSubject = id.subject; }
+  out.branch = id.branch;
   const st = await runGit(deps, base.dir, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], { maxStdoutBytes: 8_000_000 });
   if (st.code === 0) out.dirty = st.stdout.split("\0").filter(x => /^.. /.test(x)).length;
   if (!out.head) out.problem = "Não foi possível ler o commit atual (HEAD) deste repositório.";
@@ -41,23 +41,28 @@ async function describe(base: { id: string; source: LocalProject["source"]; dir:
   return out;
 }
 
+type ProjectBase = { id: string; source: LocalProject["source"]; dir: string; label: string; createdAt: string | null };
+
+/** The authorized folders with their ids, without running anything (AYLA_LOCAL_REPOS first, deduplicated by folder). */
+async function projectBases(deps: ProjectDeps): Promise<ProjectBase[]> {
+  const seen = new Set<string>();
+  const out: ProjectBase[] = [];
+  const add = (b: ProjectBase) => { const key = canonicalDir(b.dir, win(deps.git)); if (seen.has(key)) return; seen.add(key); out.push(b); };
+  for (const dir of deps.envDirs) if (path.isAbsolute(dir)) add({ id: envId(dir), source: "env", dir, label: path.basename(dir), createdAt: null });
+  for (const p of await deps.store.listLocalProjects()) add({ id: p.id, source: "ui", dir: p.dir, label: p.label, createdAt: p.createdAt });
+  return out;
+}
+
+async function describeWithConfig(b: ProjectBase, deps: ProjectDeps) {
+  const d = await describe(b, deps.git);
+  d.runConfig = await runConfigView(b.id, deps);
+  return d;
+}
+
 /** Every authorized project (AYLA_LOCAL_REPOS first, then the ones registered in the interface), deduplicated by folder. */
 export async function listProjects(deps: ProjectDeps): Promise<LocalProject[]> {
-  const seen = new Set<string>();
   const out: LocalProject[] = [];
-  for (const dir of deps.envDirs) {
-    if (!path.isAbsolute(dir)) continue;
-    const key = canonicalDir(dir, win(deps.git));
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(await describe({ id: envId(dir), source: "env", dir, label: path.basename(dir), createdAt: null }, deps.git));
-  }
-  for (const p of await deps.store.listLocalProjects()) {
-    const key = canonicalDir(p.dir, win(deps.git));
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(await describe({ id: p.id, source: "ui", dir: p.dir, label: p.label, createdAt: p.createdAt }, deps.git));
-  }
+  for (const b of await projectBases(deps)) out.push(await describeWithConfig(b, deps));
   return out;
 }
 
@@ -77,9 +82,32 @@ export async function authorizedDirs(deps: ProjectDeps): Promise<string[]> {
   return out;
 }
 
+/** The saved settings as the interface may see them: variable NAMES and whether a value is set — never the values. */
+async function runConfigView(id: string, deps: ProjectDeps): Promise<ProjectRunConfig | null> {
+  const saved = await deps.store.getProjectConfig(id);
+  if (!saved) return null;
+  return { ...saved.config, env: saved.config.env.map(e => ({ name: e.name, external: e.external, set: !!saved.secrets[e.name] })) };
+}
+
+/** What the isolated environments run for this project; null until the user confirmed the settings. */
+export async function loadExecPlan(projectId: string, deps: ProjectDeps): Promise<ExecPlan | null> {
+  const saved = await deps.store.getProjectConfig(projectId);
+  if (!saved || !saved.config.acknowledgedAt) return null;
+  const vars: Record<string, string> = {};
+  for (const e of saved.config.env) {
+    const box = saved.secrets[e.name];
+    if (!box) continue;
+    if (!deps.decrypt) throw new Error("Este executor não consegue ler as variáveis protegidas do projeto.");
+    vars[e.name] = deps.decrypt(box);
+  }
+  return { config: saved.config, vars };
+}
+
 export async function getProject(id: string, deps: ProjectDeps): Promise<LocalProject | null> {
   if (typeof id !== "string" || !/^[A-Za-z0-9-]{4,64}$/.test(id)) return null;
-  return (await listProjects(deps)).find(p => p.id === id) ?? null;
+  // Only the requested project is described (describing every authorized folder costs git processes each).
+  const b = (await projectBases(deps)).find(p => p.id === id);
+  return b ? describeWithConfig(b, deps) : null;
 }
 
 export class ProjectRefused extends Error {

@@ -13,7 +13,7 @@ import { buildNewRun, parseStartRequest } from "@/lib/executor/runs-service";
 import { ExecutorService, type ExecutorConfig, type ServiceDeps } from "@/lib/executor/service";
 import { sqliteDriver } from "@/lib/executor/sqlite";
 import { RunStore } from "@/lib/executor/store";
-import { connected, goodPlan, member, request } from "./helpers";
+import { configureProject, connected, goodPlan, member, request } from "./helpers";
 
 let work: string;
 let store: RunStore;
@@ -336,6 +336,7 @@ async function appliedDelivery(svc: ExecutorService) {
   const base = p.g("rev-parse", "HEAD");
   const { runId, planId } = await developerRun({ ...p, base }, p.diffOf(editA));
   const proj = await register(svc, p.dir);
+  await configureProject(svc, p.dir);
   const rv = await review(svc, runId, proj.id);
   const app = body<{ application: ApplicationRecord }>(await apply(svc, runId, proj.id, rv.token)).application;
   return { p, runId, planId, app };

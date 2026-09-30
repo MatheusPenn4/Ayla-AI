@@ -106,6 +106,9 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "POST" && p === "/v1/projects") return await service.registerProject(await readJson(req));
     r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})$/.exec(p);
     if (m === "DELETE" && r) return await service.removeProject(r[1]);
+    r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})\/config$/.exec(p);
+    if (m === "GET" && r) return await service.projectConfig(r[1], url.searchParams.get("workDir"));
+    if (m === "PUT" && r) return await service.saveProjectConfig(r[1], await readJson(req));
     if (m === "GET" && p === "/v1/apply-review") return await service.applyReview(url.searchParams.get("run") ?? "", url.searchParams.get("project") ?? "");
     if (m === "POST" && p === "/v1/applications") return await service.applyDiff(await readJson(req));
     r = /^\/v1\/runs\/([0-9a-f-]{36})\/applications$/.exec(p);

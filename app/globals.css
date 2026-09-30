@@ -672,3 +672,12 @@ button.link { background: none; border: 0; padding: 0; color: var(--sky); text-d
 .ctx-table { max-width: 100%; }
 @media (max-width: 760px) { .send-form, .dev-preview { padding: 10px; } .dev-preview .ctx-table { display: block; overflow-x: auto; } }
 .question input[type="checkbox"], .question input[type="radio"] { width: auto; flex: none; margin-top: 3px; }
+
+/* Projetos locais → Configurar execução */
+.project-config { display: grid; gap: 12px; margin-top: 10px; }
+.project-config h5 { margin: 0; font-size: 13px; }
+.config-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.project-config .field > span { flex-wrap: wrap; }
+.project-config .field > span code { font-size: 11px; }
+.project-config .inline-form { flex-wrap: wrap; }
+.project-config .form-error ul { margin: 6px 0 0; padding-left: 18px; }

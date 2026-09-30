@@ -59,3 +59,21 @@ export const reply = (body: unknown, u: ReturnType<typeof usage> | null = usage(
   text: typeof body === "string" ? body : JSON.stringify(body),
   usage: u,
 });
+
+/**
+ * Confirms the execution settings of an authorized project exactly as the interface does: the executor's own
+ * detection (suggestions) is saved with the explicit acknowledgement that the commands run the project's code.
+ */
+export async function configureProject(svc: { listProjects(): Promise<{ body: unknown }>; projectConfig(id: string): Promise<{ status: number; body: unknown }>; saveProjectConfig(id: string, body: unknown): Promise<{ status: number; body: unknown }> }, dir: string, over: Record<string, unknown> = {}) {
+  const norm = (p: string) => p.replaceAll("\\", "/").toLowerCase().replace(/\/+$/, "");
+  const projects = (await svc.listProjects()).body as { projects: { id: string; dir: string }[] };
+  const p = projects.projects.find(x => norm(x.dir) === norm(dir));
+  if (!p) throw new Error(`projeto não autorizado: ${dir}`);
+  const got = await svc.projectConfig(p.id);
+  const suggestion = (got.body as { detection: { suggestion: Record<string, unknown> | null } }).detection.suggestion;
+  if (!suggestion) throw new Error(`sem sugestão para ${dir}: ${JSON.stringify(got.body)}`);
+  const config = { ...suggestion, ...over, commands: { ...(suggestion.commands as object), ...((over.commands as object) ?? {}) }, app: { ...(suggestion.app as object), ...((over.app as object) ?? {}) } };
+  const saved = await svc.saveProjectConfig(p.id, { config, acknowledgeCodeExecution: true });
+  if (saved.status !== 200) throw new Error(`configuração recusada: ${JSON.stringify(saved.body)}`);
+  return { projectId: p.id, config: (saved.body as { config: unknown }).config };
+}

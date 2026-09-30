@@ -2,7 +2,7 @@
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
 import { randomUUID } from "node:crypto";
-import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, ApplicationRecord, ApplicationVerification, DeveloperDiff, LocalResolution, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
+import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, ApplicationRecord, ApplicationVerification, DeveloperDiff, LocalResolution, ProjectRunConfig, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -134,10 +134,18 @@ const SCHEMA = [
     created_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS applications_by_run ON applications (run_id, created_at)`,
+  // Execution settings of a local project (commands, folder, app readiness). secrets_json maps a variable name
+  // to its value ENCRYPTED with the machine key (SecretBox); values are never returned to the interface.
+  `CREATE TABLE IF NOT EXISTS project_configs (
+    project_id TEXT PRIMARY KEY,
+    config_json TEXT NOT NULL,
+    secrets_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+  )`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off; v7 = local projects, applications of Developer diffs (+ task_completions.application_id). */
-export const SCHEMA_VERSION = 7;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off; v7 = local projects, applications of Developer diffs (+ task_completions.application_id); v8 = per-project execution settings. */
+export const SCHEMA_VERSION = 8;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
@@ -259,7 +267,7 @@ export class RunStore {
     const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`);
     if (!tables.some(t => t.name === "director_runs")) return false;
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
-    if (ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || ["task_completions", "api_connections", "applications", "local_projects", "apply_reviews"].some(n => !tables.some(t => t.name === n))) return true;
+    if (ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || ["task_completions", "api_connections", "applications", "local_projects", "apply_reviews", "project_configs"].some(n => !tables.some(t => t.name === n))) return true;
     const ccols = await this.db.all<{ name: string }>(`PRAGMA table_info(task_completions)`);
     return COMPLETION_COLUMNS.some(([c]) => !ccols.some(x => x.name === c));
   }
@@ -542,6 +550,17 @@ export class RunStore {
     await this.ensureSchema();
     const { changes } = await this.db.run(`UPDATE local_projects SET removed_at = ? WHERE id = ? AND removed_at IS NULL`, [nowIso(), id]);
     return changes > 0;
+  }
+
+  async getProjectConfig(projectId: string): Promise<{ config: ProjectRunConfig; secrets: Record<string, string>; updatedAt: string } | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM project_configs WHERE project_id = ?`, [projectId]);
+    return rows[0] ? { config: parse<ProjectRunConfig>(rows[0].config_json)!, secrets: parse<Record<string, string>>(rows[0].secrets_json) ?? {}, updatedAt: String(rows[0].updated_at) } : null;
+  }
+
+  async saveProjectConfig(projectId: string, config: ProjectRunConfig, secrets: Record<string, string>) {
+    await this.ensureSchema();
+    await this.db.run(`INSERT INTO project_configs (project_id, config_json, secrets_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET config_json = excluded.config_json, secrets_json = excluded.secrets_json, updated_at = excluded.updated_at`, [projectId, JSON.stringify(config), JSON.stringify(secrets), nowIso()]);
   }
 
   async saveApplyReview(token: string, runId: string, projectId: string, state: unknown) {

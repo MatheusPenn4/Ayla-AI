@@ -107,12 +107,12 @@ function Review({ runId, agents, runs, onClose, onApproved }: { runId: string; a
           <section className="run-sec"><h4>5. Versão testada e ferramentas realmente disponíveis</h4>
             <p><b>Versão exata:</b> <code>{versionText(snap.testedVersion)}</code></p>
             <QAToolingList tooling={snap.tooling} connectionLabel={connectionLabel(run.connection)} />
-            <p className="form-note"><Lock size={13} /> No navegador de QA, a aplicação usa dados simulados somente leitura desta demanda; ações que executariam agentes são bloqueadas — nenhum clique dele gera chamada paga.</p>
+            <p className="form-note"><Lock size={13} /> O QA não edita o código: pede operações e o executor as roda numa cópia isolada. O navegador de QA só acessa a origem da aplicação em teste. {snap.tooling?.operations.find(o => o.id === "browser")?.how.includes("dados simulados") ? "Aqui a aplicação usa dados simulados somente leitura desta demanda; ações que executariam agentes são bloqueadas — nenhum clique dele gera chamada paga." : "A aplicação em teste usa só as variáveis de teste configuradas no projeto — nunca as suas credenciais."}</p>
           </section>
         ) : (
           <section className="run-sec"><h4>5. Ferramentas desta execução</h4>
             <ul className="tool-grants">{snap.tools.map(t => <li key={t.label} className={t.allowed ? "ok" : "no"}><b>{t.label}: {t.allowed ? "permitida" : "bloqueada"}</b><small>{t.how}</small></li>)}</ul>
-            <p className="form-note"><Lock size={13} /> QA roda em modo somente leitura, sem nenhuma ferramenta concedida pelo cliente (igual ao Arquiteto) — tudo o que ele sabe está no texto desta revisão.</p>
+            <p className="form-note"><Lock size={13} /> Revisão preparada no formato anterior ao QA com ferramentas: somente leitura, sem nenhuma operação do executor — tudo o que ele sabe está no texto desta revisão.</p>
           </section>
         )}
 
