@@ -248,6 +248,27 @@ describe("aplicar o diff persistido ao projeto local (git real, sem modelo)", { 
     expect(rec.outcome).toBe("already_present");
   });
 
+  it("diff já incorporado ao histórico (commit registrado como entrega, ancestral do HEAD) e arquivo alterado depois: não é tratado como conflito nem reaplicado", async () => {
+    const p = makeProject();
+    const text = p.diffOf(editA);
+    const { runId, planId } = await developerRun(p, text);
+    editA(p.dir);
+    p.g("commit", "-q", "-am", "entrega aplicada fora do sistema");
+    const delivered = p.g("rev-parse", "HEAD");
+    await store.recordTaskCompletion({ demandId: "d", parentRunId: planId, taskId: "t2", kind: "applied_run_result", sourceRunId: runId, commit: delivered, files: ["src/a.ts"], verification: { typecheck: null, lint: null, tests: null, build: null }, note: "aplicado fora", validatedBy: "orchestrator", validatedAt: new Date().toISOString() });
+    writeFileSync(path.join(p.dir, "src", "a.ts"), readFileSync(path.join(p.dir, "src", "a.ts"), "utf8").replace("export const a = 1;", "export const a = 100; // depois"));
+    p.g("commit", "-q", "-am", "mudança posterior no mesmo trecho");
+    const svc = service();
+    const proj = await register(svc, p.dir);
+    const rv = await review(svc, runId, proj.id);
+    expect(rv.applyCheck).toMatchObject({ state: "incorporated", incorporatedIn: delivered });
+    expect(rv.blockers.join(" ")).toContain("Nada a aplicar");
+    expect(rv.blockers.join(" ")).not.toContain("Conflito");
+    const before = readFileSync(path.join(p.dir, "src", "a.ts"));
+    expect(body<{ error: { code: string } }>(await apply(svc, runId, proj.id, rv.token)).error.code).toBe("blocked");
+    expect(readFileSync(path.join(p.dir, "src", "a.ts")).equals(before)).toBe(true);
+  });
+
   it("destino alterado depois da revisão: a confirmação é invalidada e a diferença é mostrada", async () => {
     const p = makeProject();
     const text = p.diffOf(editA);

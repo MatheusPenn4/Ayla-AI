@@ -222,11 +222,17 @@ describe.skipIf(!browser)("navegador controlado (Edge/Chrome instalado, perfil t
       step({ action: "clipboard_permission", setting: "deny" }), step({ action: "click", target: "Copiar" }), step({ action: "wait_for_text", target: "Falhou: NotAllowedError" }),
       step({ action: "clipboard_permission", setting: "grant" }), step({ action: "disable_clipboard_api" }), step({ action: "click", target: "Copiar" }), step({ action: "wait_for_text", target: "Sem API" }),
       step({ action: "reload" }), step({ action: "expect_text", target: "Sem API" }),
+      step({ action: "expect_text", target: "Copiar" }), step({ action: "read_text" }),
     ] });
     srv.close();
     expect(res.ok).toBe(true);
     expect(res.steps.find(s => s.action === "read_clipboard")!.observed).toContain("gerado em");
     expect(res.steps.find(s => s.action === "compare")!.observed).toMatch(/^IGUAIS/);
+    // expect_text tells a real control from the same words in plain text; read_text lists what can be clicked next.
+    expect(res.steps.find(s => s.action === "expect_text" && s.args.includes("Copiar"))!.observed).toContain("COMO BOTÃO");
+    expect(res.steps.find(s => s.action === "expect_text" && s.args.includes("Sem API"))!.observed).toMatch(/AUSENTE/);
+    expect(res.steps.find(s => s.action === "read_text")!.observed).toMatch(/Clicáveis visíveis: .*Copiar.*Baixar \[link\]/);
+    expect(res.observed).toContain("Tela ao final — clicáveis visíveis:");
     expect(res.api.blocked).toBe(2); // the page POSTs on each load (open + reload): both blocked, none reached the server
     expect(posts).toEqual([]);
     expect(res.artifacts.some(a => a.kind === "download") && res.artifacts.some(a => a.kind === "clipboard") && res.artifacts.some(a => a.kind === "screenshot")).toBe(true);

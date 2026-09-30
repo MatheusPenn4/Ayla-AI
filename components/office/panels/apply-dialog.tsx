@@ -126,6 +126,7 @@ function Body({ planRunId, devRunId, taskLabel, runs, onClose }: { planRunId: st
               {review.applyCheck.state === "applies" && <p className="form-note ok"><CheckCircle2 size={13} /> O diff se aplica ao estado atual do projeto (git apply --check).</p>}
               {review.applyCheck.state === "already_present" && <p className="form-note"><CheckCircle2 size={13} /> As alterações deste diff já estão no projeto. Confirmar apenas registra isso; nenhum arquivo é escrito de novo.</p>}
               {review.applyCheck.state === "conflict" && <div className="run-error" role="alert"><AlertTriangle size={16} /><div><b>Conflito: a aplicação é recusada e nada é alterado.</b><ul>{review.applyCheck.conflicts.map(c => <li key={c.path}><code>{c.path}</code> — {c.reason}</li>)}</ul><small>Suas alterações locais são preservadas. Resolva-as você mesmo (ou prepare um novo envio ao Desenvolvedor sobre o commit atual) e revise de novo.</small></div></div>}
+              {review.applyCheck.state === "incorporated" && <p className="form-note"><CheckCircle2 size={13} /> {review.applyCheck.output} Nada é escrito.</p>}
               {review.applyCheck.state === "error" && <p className="muted">{review.applyCheck.output}</p>}
             </section>
 

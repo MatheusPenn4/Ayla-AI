@@ -143,6 +143,22 @@ export async function runScenario(o: {
       return null;
     };
     const visibleButtons = async () => (await page.getByRole("button").allInnerTexts()).map(t => t.trim().replace(/\s+/g, " ")).filter(Boolean).slice(0, 40).join(" | ");
+    /** Visible buttons/links/tabs by accessible name — what a scenario can actually click next (the dialog's own first when one is open). */
+    const clickables = async () => {
+      const scope = (await page.getByRole("dialog").count()) ? page.getByRole("dialog").last() : page.locator("body");
+      const names: string[] = [];
+      for (const role of ["button", "link", "tab"] as const) {
+        const l = scope.getByRole(role);
+        const n = Math.min(await l.count(), 80);
+        for (let k = 0; k < n; k++) {
+          const el = l.nth(k);
+          if (!(await el.isVisible().catch(() => false))) continue;
+          const t = ((await el.getAttribute("aria-label").catch(() => null)) || (await el.innerText().catch(() => ""))).trim().replace(/\s+/g, " ");
+          if (t && !names.includes(`${t}`)) names.push(role === "button" ? t : `${t} [${role === "link" ? "link" : "aba"}]`);
+        }
+      }
+      return names.slice(0, 80).join(" | ") || "(nenhum)";
+    };
     const shot = async (label: string) => { artifacts.push(writeArtifact(o.artifactsDir, `${prefix}-${label}.png`, await page.screenshot({ fullPage: false }), "screenshot", `Captura: ${label}`)); };
 
     let ok = true;
@@ -177,15 +193,25 @@ export async function runScenario(o: {
             break;
           }
           case "expect_text": {
-            const n = await page.getByText(s.target, { exact: false }).count();
-            const vis = n ? await page.getByText(s.target, { exact: false }).first().isVisible() : false;
-            observed = vis ? `Presente e visível: “${s.target}”.` : `AUSENTE (ou invisível): “${s.target}”.`;
+            // Says WHERE the text is: a button/link with that name is not the same as the words appearing in a paragraph.
+            let control: "button" | "link" | "tab" | "menuitem" | null = null;
+            for (const role of ["button", "link", "tab", "menuitem"] as const) {
+              const l = page.getByRole(role, { name: s.target });
+              if (!control && (await l.count()) && (await l.first().isVisible().catch(() => false))) control = role;
+            }
+            const hits = page.getByText(s.target, { exact: false });
+            const n = await hits.count();
+            let visibleText: string | null = null;
+            for (let k = 0; k < Math.min(n, 20) && !visibleText; k++) if (await hits.nth(k).isVisible().catch(() => false)) visibleText = (await hits.nth(k).evaluate(e => `<${e.tagName.toLowerCase()}> “${(e.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 120)}”`)) as string;
+            observed = control ? `Presente e visível COMO ${control === "button" ? "BOTÃO" : control === "link" ? "LINK" : control === "tab" ? "ABA" : "ITEM DE MENU"} com o nome “${s.target}”.`
+              : visibleText ? `Presente e visível só COMO TEXTO (nenhum botão, link ou aba com esse nome): em ${visibleText}.`
+                : `AUSENTE (ou invisível): “${s.target}”.`;
             break;
           }
           case "read_text": {
             const dialog = page.getByRole("dialog");
             const t = (await dialog.count()) ? await dialog.last().innerText() : await page.locator("body").innerText();
-            observed = `Texto da tela${(await dialog.count()) ? " (diálogo aberto)" : ""}: ${clip(t.replace(/\s+/g, " "), 1500)}`;
+            observed = `Texto da tela${(await dialog.count()) ? " (diálogo aberto)" : ""}: ${clip(t.replace(/\s+/g, " "), 3500)}\nClicáveis visíveis${(await dialog.count()) ? " no diálogo" : ""}: ${await clickables()}`;
             break;
           }
           case "reload": {
@@ -263,6 +289,8 @@ export async function runScenario(o: {
       }
     }
     try { await shot("final"); } catch { /* ignore */ }
+    let finalClickables = "";
+    try { finalClickables = await clickables(); } catch { /* page may be gone */ }
     artifacts.push(writeArtifact(o.artifactsDir, `${prefix}-requisicoes.log`, [
       `Requisições da página ao servidor da aplicação em teste (/api/*) e a outras origens:`, ...apiLog,
       "", `Bloqueadas (escrita/execução): ${api.blocked} · atendidas por fixture: ${api.servedFromFixture} · sem fixture: ${api.notFound} · outras origens bloqueadas: ${api.externalBlocked}`,
@@ -272,7 +300,7 @@ export async function runScenario(o: {
     const version = browser.version();
     await readerCtx.close();
     await ctx.close();
-    return { ok, steps, artifacts, consoleErrors, api, browserVersion: version, observed: steps.map(s => `${s.index}. ${s.ok ? "" : "[FALHOU] "}${s.action}${s.args ? ` (${s.args})` : ""}: ${s.observed}`).join("\n") };
+    return { ok, steps, artifacts, consoleErrors, api, browserVersion: version, observed: steps.map(s => `${s.index}. ${s.ok ? "" : "[FALHOU] "}${s.action}${s.args ? ` (${s.args})` : ""}: ${s.observed}`).join("\n") + (finalClickables ? `\nTela ao final — clicáveis visíveis: ${finalClickables}` : "") };
   } finally {
     o.signal?.removeEventListener("abort", onAbort);
     await browser.close().catch(() => {});

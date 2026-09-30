@@ -573,7 +573,8 @@ export type ApplyReview = {
   diff: { text: string; sha256: string; recordedSha256: string | null; integrity: "verified" | "legacy_unrecorded" | "mismatch"; files: DeveloperDiffFile[]; truncated: boolean };
   checks: ApplyCheck[];
   target: { head: string; branch: string | null; dirtyTotal: number; dirtyOutside: string[]; affected: ApplyFileState[] };
-  applyCheck: { state: "applies" | "already_present" | "conflict" | "error"; conflicts: { path: string; reason: string }[]; output: string };
+  /** incorporated = the diff is already in a commit of the project's history (ancestor of HEAD) and the files changed afterwards: nothing to apply. */
+  applyCheck: { state: "applies" | "already_present" | "incorporated" | "conflict" | "error"; conflicts: { path: string; reason: string }[]; output: string; incorporatedIn?: string };
   /** Non-empty = the confirmation is refused, with these reasons. */
   blockers: string[];
   applications: ApplicationRecord[];

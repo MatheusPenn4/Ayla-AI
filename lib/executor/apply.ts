@@ -224,9 +224,14 @@ export async function buildApplyReview(runId: string, projectId: string, deps: A
       applyCheck = rev.code === 0
         ? { state: "already_present", conflicts: [], output: "Aplicar o diff ao contrário funcionaria: as alterações dele já estão no projeto." }
         : { state: "conflict", conflicts: parseApplyErrors(fwd.stderr), output: (fwd.stderr || fwd.stdout).trim().slice(0, 4000) };
+      if (applyCheck.state === "conflict") {
+        const inc = await incorporatedIn(run.id, parentCommits(await deps.store.taskCompletionsForPlan(run.parentRunId ?? ""), run.id), project.dir, text, recordedPaths, deps);
+        if (inc) applyCheck = { state: "incorporated", conflicts: [], incorporatedIn: inc, output: `As alterações deste diff já estão no commit ${inc.slice(0, 12)}, que faz parte do histórico do HEAD; os arquivos mudaram depois dele, então não há o que aplicar.` };
+      }
     }
   }
   if (applyCheck.state === "conflict") blockers.push(`Conflito: ${applyCheck.conflicts.map(c => `${c.path} (${c.reason})`).join("; ") || applyCheck.output.slice(0, 300)}`);
+  if (applyCheck.state === "incorporated") blockers.push(`Nada a aplicar: ${applyCheck.output}`);
 
   const head = project.head ?? "";
   const state: ReviewState = { head, branch: project.branch, affected, applyState: applyCheck.state, diffSha256: actual };
@@ -244,6 +249,39 @@ export async function buildApplyReview(runId: string, projectId: string, deps: A
     applications: await deps.store.applicationsFor(runId),
   };
   return { review, state };
+}
+
+/** Commits recorded as this run's delivery (applied outside the interface and committed). */
+function parentCommits(completions: { kind: string; sourceRunId: string | null; commit: string; applicationId?: string | null }[], runId: string) {
+  return [...new Set(completions.filter(c => c.kind === "applied_run_result" && c.sourceRunId === runId && !c.applicationId).map(c => c.commit))];
+}
+
+/**
+ * Is the persisted diff already part of one of those commits, and is that commit in HEAD's history? Checked
+ * for real: the affected files are read from that commit (git show) into a scratch folder outside every
+ * project and the diff must reverse-apply there. Read-only for the project.
+ */
+async function incorporatedIn(runId: string, commits: string[], dir: string, patch: string, paths: string[], deps: ApplyDeps): Promise<string | null> {
+  for (const c of commits) {
+    if (!/^[0-9a-f]{40}$/.test(c)) continue;
+    if ((await runGit(deps.git, dir, ["merge-base", "--is-ancestor", c, "HEAD"])).code !== 0) continue;
+    const scratch = path.join(deps.workRoot, `incorporated-${runId.slice(0, 8)}-${c.slice(0, 8)}-${Date.now()}`);
+    try {
+      mkdirSync(scratch, { recursive: true });
+      for (const p of paths) {
+        const r = await runGit(deps.git, dir, ["show", `${c}:${p}`], { maxStdoutBytes: 8_000_000 });
+        if (r.code !== 0) continue;
+        const dest = path.join(scratch, ...p.split("/"));
+        mkdirSync(path.dirname(dest), { recursive: true });
+        writeFileSync(dest, r.stdout.replace(/\r\n/g, "\n"));
+      }
+      await runGit(deps.git, scratch, ["init", "-q", "--template="]);
+      if ((await runGit(deps.git, scratch, ["-c", "core.autocrlf=false", "apply", "--reverse", "--check", "-"], { stdin: patch })).code === 0) return c;
+    } finally {
+      try { rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  }
+  return null;
 }
 
 const locks = new Map<string, Promise<unknown>>();
