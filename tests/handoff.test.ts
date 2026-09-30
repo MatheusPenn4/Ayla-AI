@@ -1677,6 +1677,15 @@ describe("Revisor: preparar o envio (depende de um QA já concluído; reaproveit
     expect(calls).toHaveLength(0); // preparing never calls the model
   });
 
+  it("orçamento pequeno: cada diff é reduzido uma única vez (sem registrar a mesma redução repetida)", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await chainWithQAConcluded(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const snap = body<{ run: RunDetail }>(await svc.prepareReviewer(reviewerReq(plan, "t6", { agent: reviewerSheet({ budget: 50 }) }))).run.snapshot as ReviewerSnapshot;
+    const cuts = snap.contextBudget.omitted.filter(o => o.startsWith("Diff de t3"));
+    expect(cuts.length).toBeLessThanOrEqual(1);
+  });
+
   it("nova revisão final só com um parecer do QA mais novo; o parecer final anterior fica intacto; o Revisor recebe o que as evidências do executor mostram", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await chainWithQAConcluded(repo, store);

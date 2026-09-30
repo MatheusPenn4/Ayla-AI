@@ -246,9 +246,11 @@ export async function prepareQAHandoff(req: QAHandoffRequest, deps: PrepareDeps)
   let user = build(liveDeliverables);
   let estimate = estimateTokens(system + user + schemaText);
   const omitted: string[] = [];
+  const trimmed = new Set<number>(); // each diff is reduced at most once (reducing it again changes nothing)
   for (let i = 0; i < 4 && budgetTokens > 0 && estimate > budgetTokens * 0.7; i++) {
-    const idx = liveDeliverables.reduce((best, d, j) => (d.diffText && (best < 0 || (liveDeliverables[best].diffText?.length ?? 0) < d.diffText.length) ? j : best), -1);
+    const idx = liveDeliverables.reduce((best, d, j) => (d.diffText && !trimmed.has(j) && (best < 0 || (liveDeliverables[best].diffText?.length ?? 0) < d.diffText.length) ? j : best), -1);
     if (idx < 0) break;
+    trimmed.add(idx);
     const cut = liveDeliverables[idx];
     omitted.push(`Diff de ${cut.taskId} (${cut.diffText?.length ?? 0} caracteres) reduzido para caber no orçamento; commit, arquivos e verificação continuam presentes; o diff completo continua no registro da execução ${cut.taskId}.`);
     liveDeliverables = liveDeliverables.map((d, j) => (j === idx ? { ...d, diffText: d.diffText ? `${d.diffText.slice(0, 2000)}\n[… reduzido para caber no orçamento; diff completo no registro de ${d.taskId}]` : null, diffTruncated: true } : d));
