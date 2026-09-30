@@ -91,7 +91,11 @@ export function sandboxEnv(base: EnvVars, env: Pick<QAEnv, "tmpDir" | "sourceDir
   out.HOME = home; out.USERPROFILE = home; out.APPDATA = path.join(home, "AppData", "Roaming"); out.LOCALAPPDATA = path.join(home, "AppData", "Local");
   // The user's .npmrc may hold registry tokens; git's global config may hold credential helpers.
   out.NPM_CONFIG_USERCONFIG = emptyRc; out.npm_config_cache = caches.npmCache; out.npm_config_store_dir = caches.pnpmStore;
-  out.GIT_CONFIG_GLOBAL = emptyGit; out.GIT_CONFIG_NOSYSTEM = "1"; out.GIT_TERMINAL_PROMPT = "0";
+  // The system config stays (Git for Windows keeps core.fscache/core.autocrlf there — dropping it doubled the
+  // time of git-heavy test suites); only its credential helper is neutralized: an empty credential.helper
+  // resets the helper list, so nothing run here can reach the user's saved Git credentials.
+  out.GIT_CONFIG_GLOBAL = emptyGit; out.GIT_TERMINAL_PROMPT = "0"; out.GCM_INTERACTIVE = "never";
+  out.GIT_CONFIG_COUNT = "1"; out.GIT_CONFIG_KEY_0 = "credential.helper"; out.GIT_CONFIG_VALUE_0 = "";
   // Empty folders instead of the user's Claude Code / Codex logins: nothing run here can reach those sessions.
   out.CLAUDE_CONFIG_DIR = path.join(env.tmpDir, "sem-sessao-claude");
   out.CODEX_HOME = path.join(env.tmpDir, "sem-sessao-codex");
