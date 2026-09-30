@@ -114,7 +114,7 @@ export function evidenceBlock(evidence: QAEvidence[], maxChars = 90_000) {
   return `<evidencias_do_executor>\n${text}\n</evidencias_do_executor>`;
 }
 
-export const PLAN_INSTRUCTION = "Primeira rodada: peça as operações de que você precisa para verificar cada critério (no máximo 12). As evidências automáticas já estão acima; não peça de novo o que já existe. Use cenários de navegador para comportamento visível ao usuário.";
+export const PLAN_INSTRUCTION = "Primeira rodada: peça as operações de que você precisa para verificar cada critério (no máximo 12). As evidências automáticas já estão acima; não peça de novo o que já existe. Use cenários de navegador para comportamento visível ao usuário; monte os caminhos com a evidência de orientação da interface (o que cada clicável da tela inicial abre) e com os nomes de botões que aparecem no código e no diff — ela só orienta, não verifica critério.";
 export const evalInstruction = (allowFollowups: boolean) => allowFollowups
   ? "Classifique cada critério citando as evidências por id. Se precisar de mais operações antes de concluir, liste-as em followup_operations (no máximo 8; haverá uma única rodada extra); caso contrário deixe vazio e conclua."
   : "Última rodada: classifique cada critério citando as evidências por id. followup_operations deve ficar vazio.";

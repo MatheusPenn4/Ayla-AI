@@ -16,7 +16,7 @@ import type { QAEnvironmentReport, QAEvidence, QAResult, QASnapshot, QAToolingSt
 import type { AgentReply } from "./adapters/types";
 import type { AppFixture } from "./qa-browser";
 import { CHECK_LABEL, buildEnv, checkCatalog, deliveryChanges, destroyEnv, prepareDependencies, resolvePackageManager, runEnvCommand, writeArtifact, type EnvDeps, type QAEnv } from "./qa-env";
-import { runOperation, type OpsContext } from "./qa-ops";
+import { runOperation, runOrientation, type OpsContext } from "./qa-ops";
 import { getProject, type ProjectDeps } from "./projects";
 import type { RunStore } from "./store";
 import { trackedFiles } from "./worktree";
@@ -106,6 +106,13 @@ export async function runToolQA(c: ToolQAContext): Promise<Outcome | null> {
     const tracked = env ? await trackedFiles({ workDir: env.srcDir, hooksDir: env.hooksDir }, c.envDeps.git) : [];
     const fixture = env ? await c.fixture(c.planId, env.srcDir) : null;
     const ctx: OpsContext = { env: env!, pm, deps: c.envDeps, tracked, fixture, tooling, versionLabel: versionLine(env?.version ?? version), nextId, app };
+    // 1c. Orientation map of the interface (executor-authored; checks no criterion), so call 1 can plan real paths.
+    if (env) {
+      await store.event(runId, "qa_orientation", "Registrando a orientação da interface (o que cada clicável da tela inicial abre)…");
+      const o = await runOrientation(ctx).catch(e => { if (signal?.aborted) return null; void store.event(runId, "qa_orientation_failed", `A orientação da interface falhou: ${(e as Error).message.slice(0, 300)}. Os cenários pedidos pelo QA seguem normalmente.`); return null; });
+      if (o) { evidence.push(o); report.browser = tooling.browser.detail; report.appUrl = app.current?.url ?? null; }
+    }
+    if (signal?.aborted) return null;
     const runOps = async (ops: OperationRequest[], round: number) => {
       for (const op of ops) {
         if (signal?.aborted) return false;

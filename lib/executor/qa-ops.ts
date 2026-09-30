@@ -69,6 +69,19 @@ function readConfined(ctx: OpsContext, rel: string): { text: string } | { error:
   return { text: readFileSync(real, "utf8") };
 }
 
+/** Automatic orientation evidence (executor-authored, checks no criterion): what each control of the first screen opens. Null when the browser is unavailable. */
+export async function runOrientation(ctx: OpsContext): Promise<QAEvidence | null> {
+  if (!available(ctx, "browser")?.available || !ctx.pm.ok || !ctx.tooling.browser.executable || !ctx.fixture) return null;
+  const b = { id: ctx.nextId(), method: "browser" as const, criteria: [], purpose: "Orientação da interface: o que cada clicável da tela inicial abre (não verifica nenhum critério; serve para montar os caminhos dos cenários)", requestedBy: "executor" as const, round: 0, version: ctx.versionLabel, author: "executor" as const, origin: "Produzida automaticamente pelo executor antes da primeira chamada ao QA (orientação, não verificação)." };
+  if (!ctx.app.current && !ctx.app.error) {
+    try { ctx.app.current = await startApp(ctx.env, ctx.pm, ctx.deps); }
+    catch (e) { ctx.app.error = (e as Error).message; }
+  }
+  if (!ctx.app.current) return { ...b, steps: [], command: null, ok: false, artifacts: [], observed: `A aplicação em teste não subiu: ${ctx.app.error}` };
+  const res = await runScenario({ appUrl: ctx.app.current.url, name: "orientacao", steps: [], explore: { maxClicks: 24 }, fixture: ctx.fixture, artifactsDir: ctx.env.artifactsDir, executable: ctx.tooling.browser.executable, signal: ctx.deps.signal, evidenceId: b.id });
+  return { ...b, steps: ["abrir / e, para cada clicável da tela inicial, recarregar, clicar e registrar o que abriu"], command: null, ok: res.ok, artifacts: res.artifacts, observed: `Navegador ${ctx.tooling.browser.detail.split(",")[0]} ${res.browserVersion}, perfil temporário, aplicação em ${ctx.app.current.url}.\n${res.steps[0]?.observed ?? res.observed}\nRequisições /api: ${res.api.servedFromFixture} atendidas por dados simulados, ${res.api.blocked} bloqueadas (escrita/execução), ${res.api.notFound} sem dado simulado; ${res.api.externalBlocked} requisição(ões) a outras origens bloqueada(s).` };
+}
+
 export async function runOperation(ctx: OpsContext, op: OperationRequest, round: number): Promise<QAEvidence> {
   const unavailable = (method: QAEvidence["method"], id: "read" | "search" | "commands" | "browser"): QAEvidence => ({
     ...base(ctx, op, round, method), steps: [`${op.type} pedido`], command: null, ok: false, artifacts: [],

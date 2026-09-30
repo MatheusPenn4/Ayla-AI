@@ -239,6 +239,21 @@ describe.skipIf(!browser)("navegador controlado (Edge/Chrome instalado, perfil t
     for (const a of res.artifacts) expect(existsSync(path.join(artifactsDir, a.name))).toBe(true);
   });
 
+  it("orientação: registra o que cada clicável da tela inicial abre (diálogo e controles novos), sem verificar critério", async () => {
+    const page = `<!doctype html><meta charset=utf-8><button id=a>Abrir plano</button><button id=l>Lista</button><div id=x></div><script>
+      document.getElementById('a').onclick=function(){ document.getElementById('x').innerHTML='<div role=dialog><h2>Plano do Diretor</h2><button>Copiar Markdown</button></div>'; };
+      document.getElementById('l').onclick=function(){ document.getElementById('x').innerHTML='<button>Ver execução</button><p>Copiar Markdown na descrição</p>'; };</script>`;
+    const srv = http.createServer((_q, r) => { r.writeHead(200, { "content-type": "text/html; charset=utf-8" }); r.end(page); }).listen(0, "127.0.0.1");
+    await new Promise(r => srv.once("listening", r));
+    const port = (srv.address() as { port: number }).port;
+    const res = await runScenario({ appUrl: `http://localhost:${port}`, name: "o", evidenceId: "E9", executable: browser!.executable, artifactsDir: path.join(work, "art-o"), fixture: { localStorage: {}, api: {}, note: "" }, steps: [], explore: { maxClicks: 10 } });
+    srv.close();
+    const map = res.steps[0].observed;
+    expect(map).toContain("Tela inicial (/) — clicáveis visíveis: Abrir plano | Lista");
+    expect(map).toMatch(/BOTÃO “Abrir plano” → abre diálogo “Plano do Diretor”; clicáveis no diálogo: Copiar Markdown/);
+    expect(map).toMatch(/BOTÃO “Lista” → mesma tela; clicáveis novos: Ver execução$/m); // plain text is not listed as a control
+  });
+
   it("compare normaliza só quebras de linha e no máximo 3 linhas do padrão permitido", () => {
     expect(compareTexts("a\r\nb\r\n", "a\nb", "").equal).toBe(true);
     expect(compareTexts("a\ngerado em 1\nc", "a\ngerado em 2\nc", "^gerado em ").equal).toBe(true);

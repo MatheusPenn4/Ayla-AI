@@ -77,6 +77,8 @@ export function compareTexts(a: string, b: string, ignoreLineRegex: string) {
 export async function runScenario(o: {
   appUrl: string; name: string; steps: BrowserStep[]; fixture: AppFixture; artifactsDir: string; executable: string;
   signal?: AbortSignal; evidenceId: string;
+  /** Orientation map instead of (before) steps: what each control of the first screen opens. */
+  explore?: { maxClicks: number };
 }): Promise<ScenarioResult> {
   const pw = await loadPlaywright();
   if (!pw) throw new Error("playwright-core não está disponível para o executor.");
@@ -131,37 +133,73 @@ export async function runScenario(o: {
     await rcdp.send("Browser.setPermission", { permission: { name: "clipboard-write" }, setting: "granted", origin, browserContextId: rinfo.browserContextId });
     await reader.evaluate(() => navigator.clipboard.writeText("")).catch(() => {});
 
-    const locate = async (text: string) => {
-      for (const role of ["button", "link", "tab", "menuitem"] as const) {
-        const l = page.getByRole(role, { name: text, exact: true });
-        if (await l.count()) return l.first();
-      }
-      const l = page.getByText(text, { exact: true });
-      if (await l.count()) return l.first();
-      const b = page.getByRole("button", { name: text });
-      if (await b.count()) return b.first();
-      return null;
+    /** By role + accessible name first (visible ones), then the exact text; says which one it found so a click on plain text is never reported as a click on a control. */
+    const ROLE_LABEL = { button: "BOTÃO", link: "LINK", tab: "ABA", menuitem: "ITEM DE MENU" } as const;
+    const firstVisible = async (l: import("playwright-core").Locator) => {
+      const n = Math.min(await l.count(), 20);
+      for (let k = 0; k < n; k++) if (await l.nth(k).isVisible().catch(() => false)) return { l: l.nth(k), total: n };
+      return n ? { l: l.first(), total: n } : null;
     };
-    const visibleButtons = async () => (await page.getByRole("button").allInnerTexts()).map(t => t.trim().replace(/\s+/g, " ")).filter(Boolean).slice(0, 40).join(" | ");
+    const locateHow = async (text: string): Promise<{ l: import("playwright-core").Locator; how: string } | null> => {
+      for (const role of ["button", "link", "tab", "menuitem"] as const) {
+        const f = await firstVisible(page.getByRole(role, { name: text, exact: true }));
+        if (f) return { l: f.l, how: `${ROLE_LABEL[role]} com o nome acessível “${text}”${f.total > 1 ? ` (o primeiro visível de ${f.total})` : ""}` };
+      }
+      const t = await firstVisible(page.getByText(text, { exact: true }));
+      if (t) return { l: t.l, how: `TEXTO “${text}” (<${await t.l.evaluate(e => e.tagName.toLowerCase()).catch(() => "?")}>, não é botão, link nem aba)` };
+      const b = await firstVisible(page.getByRole("button", { name: text }));
+      if (b) return { l: b.l, how: `BOTÃO cujo nome acessível contém “${text}”: “${((await b.l.getAttribute("aria-label").catch(() => null)) || (await b.l.innerText().catch(() => ""))).trim().slice(0, 80)}”` };
+      return null;
+    };    const visibleButtons = async () => (await page.getByRole("button").allInnerTexts()).map(t => t.trim().replace(/\s+/g, " ")).filter(Boolean).slice(0, 40).join(" | ");
     /** Visible buttons/links/tabs by accessible name — what a scenario can actually click next (the dialog's own first when one is open). */
-    const clickables = async () => {
+    const clickableItems = async () => {
       const scope = (await page.getByRole("dialog").count()) ? page.getByRole("dialog").last() : page.locator("body");
-      const names: string[] = [];
+      const items: { role: "button" | "link" | "tab"; name: string; label: string }[] = [];
       for (const role of ["button", "link", "tab"] as const) {
         const l = scope.getByRole(role);
         const n = Math.min(await l.count(), 80);
         for (let k = 0; k < n; k++) {
           const el = l.nth(k);
           if (!(await el.isVisible().catch(() => false))) continue;
-          const t = ((await el.getAttribute("aria-label").catch(() => null)) || (await el.innerText().catch(() => ""))).trim().replace(/\s+/g, " ");
-          if (t && !names.includes(`${t}`)) names.push(role === "button" ? t : `${t} [${role === "link" ? "link" : "aba"}]`);
+          const name = ((await el.getAttribute("aria-label").catch(() => null)) || (await el.innerText().catch(() => ""))).trim().replace(/\s+/g, " ");
+          const short = name.length > 90 ? `${name.slice(0, 90)}…` : name;
+          const label = role === "button" ? short : `${short} [${role === "link" ? "link" : "aba"}]`;
+          if (name && !items.some(x => x.label === label)) items.push({ role, name, label });
         }
       }
-      return names.slice(0, 80).join(" | ") || "(nenhum)";
+      return items.slice(0, 80);
     };
+    const clickables = async () => (await clickableItems()).map(x => x.label).join(" | ") || "(nenhum)";
     const shot = async (label: string) => { artifacts.push(writeArtifact(o.artifactsDir, `${prefix}-${label}.png`, await page.screenshot({ fullPage: false }), "screenshot", `Captura: ${label}`)); };
 
     let ok = true;
+    if (o.explore) {
+      // Orientation only (no criterion is checked here): from a fresh load of "/", what each visible control of
+      // the first screen opens, and which NEW controls appear — so the QA can plan its first scenarios instead of
+      // guessing where a screen or dialog lives. Writes stay blocked (403) like in any scenario.
+      const started = Date.now();
+      const go = async () => { await page.goto(origin + "/", { waitUntil: "load", timeout: 60_000 }); await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {}); };
+      await go();
+      const home = await clickableItems();
+      const homeLabels = new Set(home.map(x => x.label));
+      const lines = [`Tela inicial (/) — clicáveis visíveis: ${home.map(x => x.label).join(" | ") || "(nenhum)"}`];
+      for (const it of home.slice(0, o.explore.maxClicks)) {
+        if (o.signal?.aborted) throw new Error("Cancelado.");
+        await go();
+        const f = await firstVisible(page.getByRole(it.role, { name: it.name, exact: true }));
+        const what = `${ROLE_LABEL[it.role]} “${it.name}”`;
+        if (!f) { lines.push(`- ${what}: não localizado de novo após recarregar.`); continue; }
+        try { await f.l.click({ timeout: 5000 }); } catch (e) { lines.push(`- ${what}: não clicável (${(e as Error).message.split("\n")[0].slice(0, 120)}).`); continue; }
+        await page.waitForTimeout(500);
+        const dlg = page.getByRole("dialog");
+        const inDialog = (await dlg.count()) > 0;
+        const title = inDialog ? ((await dlg.last().getByRole("heading").first().innerText({ timeout: 1000 }).catch(() => "")).trim().replace(/\s+/g, " ")) : "";
+        const fresh = (await clickableItems()).map(x => x.label).filter(l => inDialog || !homeLabels.has(l));
+        lines.push(`- ${what} → ${inDialog ? `abre diálogo${title ? ` “${title.slice(0, 80)}”` : ""}; clicáveis no diálogo` : "mesma tela; clicáveis novos"}: ${fresh.slice(0, 40).join(" | ") || "(nenhum)"}`);
+      }
+      if (home.length > o.explore.maxClicks) lines.push(`(${home.length - o.explore.maxClicks} clicável(is) da tela inicial não explorado(s): ${home.slice(o.explore.maxClicks).map(x => x.label).join(" | ")})`);
+      steps.push({ index: 1, action: "explore", args: `até ${o.explore.maxClicks} cliques a partir de /`, ok: true, observed: lines.join("\n"), ms: Date.now() - started });
+    }
     for (let i = 0; i < o.steps.length && ok; i++) {
       if (o.signal?.aborted) throw new Error("Cancelado.");
       const s = o.steps[i];
@@ -179,12 +217,12 @@ export async function runScenario(o: {
             break;
           }
           case "click": {
-            const l = await locate(s.target);
-            if (!l) throw new Error(`Nenhum elemento visível com o texto “${s.target}”. Botões visíveis: ${await visibleButtons()}`);
-            await l.scrollIntoViewIfNeeded({ timeout });
-            await l.click({ timeout });
+            const f = await locateHow(s.target);
+            if (!f) throw new Error(`Nenhum elemento visível com o texto “${s.target}”. Botões visíveis: ${await visibleButtons()}`);
+            await f.l.scrollIntoViewIfNeeded({ timeout });
+            await f.l.click({ timeout });
             await page.waitForTimeout(250);
-            observed = `Clique real (mouse) em “${s.target}”.`;
+            observed = `Clique real (mouse) em ${f.how}.`;
             break;
           }
           case "wait_for_text": {
@@ -245,9 +283,9 @@ export async function runScenario(o: {
             break;
           }
           case "download": {
-            const l = await locate(s.target);
-            if (!l) throw new Error(`Nenhum elemento visível com o texto “${s.target}”. Botões visíveis: ${await visibleButtons()}`);
-            const [dl] = await Promise.all([page.waitForEvent("download", { timeout: Math.max(timeout, 10_000) }), l.click({ timeout })]);
+            const f = await locateHow(s.target);
+            if (!f) throw new Error(`Nenhum elemento visível com o texto “${s.target}”. Botões visíveis: ${await visibleButtons()}`);
+            const [dl] = await Promise.all([page.waitForEvent("download", { timeout: Math.max(timeout, 10_000) }), f.l.click({ timeout })]);
             const tmp = path.join(os.tmpdir(), `ayla-dl-${Date.now()}-${Math.random().toString(36).slice(2)}`);
             await dl.saveAs(tmp);
             const buf = readFileSync(tmp);
@@ -255,7 +293,7 @@ export async function runScenario(o: {
             saved.set(name, { text: buf.toString("utf8"), source: `arquivo baixado “${dl.suggestedFilename()}”` });
             artifacts.push(writeArtifact(o.artifactsDir, `${prefix}-${name}-${dl.suggestedFilename()}`, buf, "download", `Arquivo realmente baixado: ${dl.suggestedFilename()}`));
             try { (await import("node:fs")).rmSync(tmp, { force: true }); } catch { /* best effort */ }
-            observed = `Download real: “${dl.suggestedFilename()}”, ${buf.length} bytes.`;
+            observed = `Download real ao clicar em ${f.how}: “${dl.suggestedFilename()}”, ${buf.length} bytes.`;
             break;
           }
           case "compare": {
