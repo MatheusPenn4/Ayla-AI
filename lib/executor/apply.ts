@@ -7,8 +7,8 @@
 //   (hash recorded when the diff was computed), binary/symlink/submodule, or when any path could leave
 //   the project (".." segments, absolute paths, ".git", links on the way);
 // - the review token is a hash of the target's state (HEAD, content and local-change status of every
-//   affected file, the dry-run outcome): a confirmation made against a different state is refused and the
-//   difference is shown;
+//   affected file, the local changes outside the diff that the review listed, the dry-run outcome): a
+//   confirmation made against a different state is refused and the difference is shown;
 // - local changes are preserved: git apply only touches the patch's own hunks and refuses (atomically) on
 //   conflict; the affected files are backed up first and restored if anything fails afterwards;
 // - never stages, commits, pushes or deploys.
@@ -127,10 +127,11 @@ export function parseApplyErrors(stderr: string): { path: string; reason: string
   return out;
 }
 
-type ReviewState = { head: string; branch: string | null; affected: ApplyFileState[]; applyState: ApplyReview["applyCheck"]["state"]; diffSha256: string };
+/** outside = "XY path" of every local change outside the diff (what the review showed as "alterações locais fora do diff"). */
+type ReviewState = { head: string; branch: string | null; affected: ApplyFileState[]; applyState: ApplyReview["applyCheck"]["state"]; diffSha256: string; outside?: string[] };
 
 function tokenOf(runId: string, projectId: string, st: ReviewState) {
-  return sha256(JSON.stringify({ runId, projectId, head: st.head, branch: st.branch, diff: st.diffSha256, apply: st.applyState, affected: st.affected.map(a => [a.path, a.exists, a.sha256, a.localChange]) }));
+  return sha256(JSON.stringify({ runId, projectId, head: st.head, branch: st.branch, diff: st.diffSha256, apply: st.applyState, affected: st.affected.map(a => [a.path, a.exists, a.sha256, a.localChange]), outside: st.outside ?? [] }));
 }
 
 /** What changed between the reviewed state and now (shown when a confirmation is refused). */
@@ -147,6 +148,9 @@ export function describeChanges(before: ReviewState, now: ReviewState): string[]
   }
   if (before.applyState !== now.applyState) out.push(`O resultado da verificação de aplicação mudou: ${before.applyState} → ${now.applyState}.`);
   if (before.diffSha256 !== now.diffSha256) out.push("O diff registrado mudou depois da revisão (integridade comprometida).");
+  const was = new Set(before.outside ?? []), is = new Set(now.outside ?? []);
+  for (const x of is) if (!was.has(x)) out.push(`Nova alteração local fora do diff depois da revisão: ${x.slice(3)} (${x.slice(0, 2).trim()}).`);
+  for (const x of was) if (!is.has(x)) out.push(`Alteração local fora do diff que a revisão mostrou não existe mais: ${x.slice(3)}.`);
   return out.length ? out : ["O estado do projeto mudou depois da revisão."];
 }
 
@@ -234,7 +238,8 @@ export async function buildApplyReview(runId: string, projectId: string, deps: A
   if (applyCheck.state === "incorporated") blockers.push(`Nada a aplicar: ${applyCheck.output}`);
 
   const head = project.head ?? "";
-  const state: ReviewState = { head, branch: project.branch, affected, applyState: applyCheck.state, diffSha256: actual };
+  const outsideState = [...status.entries()].filter(([p]) => !recordedPaths.includes(p)).map(([p, code]) => `${code.padEnd(2)} ${p}`).sort();
+  const state: ReviewState = { head, branch: project.branch, affected, applyState: applyCheck.state, diffSha256: actual, outside: outsideState };
   const token = tokenOf(runId, projectId, state);
   await deps.store.saveApplyReview(token, runId, projectId, state);
   const review: ApplyReview = {

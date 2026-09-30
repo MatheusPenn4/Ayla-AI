@@ -307,7 +307,7 @@ describe("aprovação e execução do Arquiteto", () => {
     await svc.idle();
     expect(aborted).toBe(true);
     expect((await store.get(run.id))!.status).toBe("canceled");
-    expect((await store.detail(run.id))!.events.at(-1)?.message).toContain("processo do cliente oficial foi encerrado");
+    expect((await store.detail(run.id))!.events.at(-1)?.message).toContain("processos iniciados por ela (cliente oficial, ambiente isolado, aplicação em teste) foram encerrados");
   });
 });
 

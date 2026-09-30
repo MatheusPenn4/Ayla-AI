@@ -104,6 +104,9 @@ export async function runScenario(o: {
       let u: URL;
       try { u = new URL(req.url()); } catch { api.externalBlocked++; return route.abort("blockedbyclient"); }
       if (u.origin !== origin) { api.externalBlocked++; apiLog.push(`BLOQUEADO (outra origem) ${req.method()} ${u.origin}${u.pathname}`); return route.abort("blockedbyclient"); }
+      // The orientation map only LOOKS: it clicks every control of the first screen, so no write may reach the app
+      // (a click on "Excluir" or "Zerar" would change the very state the QA scenarios then test).
+      if (o.explore && req.method() !== "GET" && req.method() !== "HEAD") { api.blocked++; apiLog.push(`BLOQUEADO (orientação somente leitura) ${req.method()} ${u.pathname}`); return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ error: { code: "qa_orientation_read_only", message: "Orientação da interface: somente leitura." } }) }); }
       if (!u.pathname.startsWith("/api/")) return route.continue();
       if (!o.fixture) { api.passedToApp++; apiLog.push(`APLICAÇÃO EM TESTE ${req.method()} ${u.pathname}`); return route.continue(); }
       if (req.method() !== "GET") {
@@ -202,6 +205,7 @@ export async function runScenario(o: {
         lines.push(`- ${what} → ${inDialog ? `abre diálogo${title ? ` “${title.slice(0, 80)}”` : ""}; clicáveis no diálogo` : "mesma tela; clicáveis novos"}: ${fresh.slice(0, 40).join(" | ") || "(nenhum)"}`);
       }
       if (home.length > o.explore.maxClicks) lines.push(`(${home.length - o.explore.maxClicks} clicável(is) da tela inicial não explorado(s): ${home.slice(o.explore.maxClicks).map(x => x.label).join(" | ")})`);
+      lines.push(`Somente leitura: ${api.blocked} escrita(s) disparada(s) pelos cliques foram bloqueadas (o estado da aplicação não mudou).`);
       steps.push({ index: 1, action: "explore", args: `até ${o.explore.maxClicks} cliques a partir de /`, ok: true, observed: lines.join("\n"), ms: Date.now() - started });
     }
     for (let i = 0; i < o.steps.length && ok; i++) {

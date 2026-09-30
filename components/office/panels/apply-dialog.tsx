@@ -47,18 +47,20 @@ function Body({ planRunId, devRunId, taskLabel, runs, onClose }: { planRunId: st
     catch (e) { setReview(null); setError(e instanceof EngineApiError ? e.message : "Não foi possível revisar."); }
     finally { setLoading(false); }
   }, [devRunId]);
+  // Stable callbacks only (`runs` is a new object on every render and would reload in a loop).
+  const { loadApplications, loadCompletions } = runs;
   useEffect(() => {
-    const t = setTimeout(() => { void load(projectId); void runs.loadApplications(planRunId); }, 0);
+    const t = setTimeout(() => { void load(projectId); void loadApplications(planRunId); }, 0);
     return () => clearTimeout(t);
-  }, [projectId, load, planRunId, runs]);
+  }, [projectId, load, planRunId, loadApplications]);
 
   // While a verification runs, follow it (the executor records every step as it goes).
   const verifying = latest?.verification?.status === "running";
   useEffect(() => {
     if (!verifying) return;
-    const t = setInterval(() => { void runs.loadApplications(planRunId).then(list => { if (list?.find(a => a.id === latest?.id)?.verification?.status !== "running") void runs.loadCompletions(planRunId); }); }, 2000);
+    const t = setInterval(() => { void loadApplications(planRunId).then(list => { if (list?.find(a => a.id === latest?.id)?.verification?.status !== "running") void loadCompletions(planRunId); }); }, 2000);
     return () => clearInterval(t);
-  }, [verifying, planRunId, runs, latest?.id]);
+  }, [verifying, planRunId, loadApplications, loadCompletions, latest?.id]);
 
   const apply = async () => {
     if (!review || busy) return;

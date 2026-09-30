@@ -269,6 +269,26 @@ describe("aplicar o diff persistido ao projeto local (git real, sem modelo)", { 
     expect(readFileSync(path.join(p.dir, "src", "a.ts")).equals(before)).toBe(true);
   });
 
+  it("nova alteração local FORA do diff depois da revisão também invalida a confirmação (a revisão mostrava o projeto sem ela)", async () => {
+    const p = makeProject();
+    const text = p.diffOf(editA);
+    const { runId } = await developerRun(p, text);
+    const svc = service();
+    const proj = await register(svc, p.dir);
+    const rv = await review(svc, runId, proj.id);
+    writeFileSync(path.join(p.dir, "src", "b.ts"), "export const outro = false; // mexi depois da revisão\n");
+    const r = await apply(svc, runId, proj.id, rv.token);
+    expect(r.status).toBe(409);
+    const e = body<{ error: { code: string; details: { changes: string[]; review: ApplyReview } } }>(r).error;
+    expect(e.code).toBe("target_changed");
+    expect(e.details.changes.join(" ")).toContain("Nova alteração local fora do diff depois da revisão: src/b.ts");
+    expect(readFileSync(path.join(p.dir, "src", "a.ts"), "utf8")).toBe(A); // nothing applied
+    // Reviewing again (the user now sees the local change) allows the application; the local change is kept.
+    const ok = await apply(svc, runId, proj.id, e.details.review.token);
+    expect(ok.status).toBe(201);
+    expect(readFileSync(path.join(p.dir, "src", "b.ts"), "utf8")).toContain("mexi depois da revisão");
+  });
+
   it("destino alterado depois da revisão: a confirmação é invalidada e a diferença é mostrada", async () => {
     const p = makeProject();
     const text = p.diffOf(editA);

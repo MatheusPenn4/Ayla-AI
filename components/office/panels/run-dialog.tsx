@@ -186,7 +186,10 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   const architectTasks = res?.tasks.filter(t => isHandoffTarget(t.assignee)) ?? [];
   const runsOf = (taskId: string) => runs.taskRunsFor(run.id, taskId);
   const completionsOf = (taskId: string) => runs.completionsFor(run.id, taskId);
-  useEffect(() => { void runs.loadCompletions(run.id); void runs.loadApplications(run.id); }, [run.id, runs]);
+  // Stable callbacks as dependencies: `runs` itself is a new object on every render (depending on it reloaded,
+  // re-rendered and reloaded again in a loop — hundreds of requests per second while this dialog was open).
+  const { loadCompletions, loadApplications } = runs;
+  useEffect(() => { void loadCompletions(run.id); void loadApplications(run.id); }, [run.id, loadCompletions, loadApplications]);
   const [applyFor, setApplyFor] = useState<{ runId: string; label: string } | null>(null);
   const [sendFor, setSendFor] = useState<string | null>(null);
   const [previewFor, setPreviewFor] = useState<string | null>(null);

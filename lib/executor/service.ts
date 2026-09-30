@@ -728,7 +728,7 @@ export class ExecutorService {
       ac?.abort();
       await this.store.event(id, "canceled", before?.status === "awaiting_approval"
         ? "Envio descartado por você antes da confirmação. Nada foi executado."
-        : ac ? "Execução cancelada pelo usuário: o processo do cliente oficial foi encerrado. O uso já consumido até esse ponto pode contar na assinatura." : "Execução cancelada pelo usuário antes de começar.");
+        : ac ? "Execução cancelada pelo usuário: os processos iniciados por ela (cliente oficial, ambiente isolado, aplicação em teste) foram encerrados. Se o cliente já tinha sido chamado, o uso consumido até esse ponto pode contar na assinatura." : "Execução cancelada pelo usuário antes de começar.");
     }
     const run: RunRecord | null = await this.store.get(id);
     if (!run) return err(404, "not_found", "Execução não encontrada.");
