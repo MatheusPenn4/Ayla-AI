@@ -6,11 +6,13 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { OperationRequest } from "@/lib/engine/qa-tooled-schema";
-import type { QAEvidence, QAToolingStatus } from "@/lib/engine/types";
+import type { ConfiguredTopology, QAEvidence, QAToolingStatus } from "@/lib/engine/types";
 import { relPathProblem } from "./apply";
 import { findBrowser, loadPlaywright, runScenario, type AppFixture, type BrowserStep } from "./qa-browser";
-import { parseCommandLine, withTestFiles } from "./project-config";
-import { projectChecks, resolvePackageManager, runEnvCommand, startApp, writeArtifact, type EnvDeps, type ExecPlan, type PackageManager, type QAEnv, type RunningApp } from "./qa-env";
+import { DEFAULT_CONTROL_PORTS } from "./net-guard";
+import { mainServiceOf, parseCommandLine, servicesOf, withTestFiles } from "./project-config";
+import { projectChecks, resolvePackageManager, runEnvCommand, writeArtifact, type EnvDeps, type ExecPlan, type PackageManager, type QAEnv } from "./qa-env";
+import { startStack, type RunningStack } from "./qa-stack";
 import { canonicalDir } from "./projects";
 
 export type OpsContext = {
@@ -25,7 +27,7 @@ export type OpsContext = {
   versionLabel: string;
   nextId: () => string;
   /** Started once, on the first browser operation; stopped by the caller. */
-  app: { current: RunningApp | null; error: string | null };
+  app: { current: RunningStack | null; error: string | null };
 };
 
 const TEXT_EXT = /\.(tsx?|jsx?|mjs|cjs|json|md|css|scss|html|ya?ml|txt|toml|sql|sh|ps1|env\.example)$/i;
@@ -36,7 +38,17 @@ export async function detectQATooling(deps: EnvDeps, plan: ExecPlan | null, repr
   const pm = resolvePackageManager(deps, plan);
   const browser = findBrowser(deps.git.env as NodeJS.ProcessEnv);
   const pw = await loadPlaywright();
-  const hasDev = !!plan?.config.commands.dev.trim();
+  const services = plan ? servicesOf(plan.config) : [];
+  const hasDev = services.length > 0;
+  const main = plan ? mainServiceOf(plan.config) : null;
+  const topology: ConfiguredTopology | undefined = plan ? {
+    main: main?.id ?? null,
+    services: services.map(x => ({ id: x.id, label: x.label, dir: x.dir, command: x.command, install: x.install, port: x.port, host: x.host, main: x.id === main?.id, browser: x.id === main?.id || x.browser })),
+    extraOrigins: plan.config.extraOrigins ?? [], links: plan.config.links ?? [], controlPorts: deps.controlPorts?.length ? deps.controlPorts : DEFAULT_CONTROL_PORTS,
+  } : undefined;
+  const stackText = services.length > 1
+    ? `${services.length} processos (${services.map(x => `${x.label}${x.id === main?.id ? " — principal" : ""}: ${x.command}, ${x.port ? `porta ${x.port}` : "porta dinâmica"}`).join("; ")}), iniciados em ordem, cada um pronto antes do próximo, com as portas resolvidas antes e congeladas na execução`
+    : services.length ? `${services[0].command}, pronta quando ${services[0].readyPath} responde${services[0].readyText ? ` com “${services[0].readyText}”` : ""}` : "";
   const checks = projectChecks(plan);
   const browserOk = !!browser && !!pw;
   const why = !reproducible ? "a versão entregue não pôde ser identificada/reproduzida (ex.: diff cortado ou redigido)" : "";
@@ -51,8 +63,9 @@ export async function detectQATooling(deps: EnvDeps, plan: ExecPlan | null, repr
       { id: "read", label: "Ler arquivos da versão testada", available: reproducible && gitOk, how: reproducible && gitOk ? "Leitura pelo executor, só dos arquivos versionados da versão testada (caminho real conferido)." : why || "git indisponível" },
       { id: "search", label: "Buscar texto nos arquivos", available: reproducible && gitOk, how: reproducible && gitOk ? "Busca literal pelo executor nos arquivos versionados." : why || "git indisponível" },
       { id: "commands", label: "Rodar verificações do projeto", available: reproducible && gitOk && pm.ok && checks.configured.length > 0, how: !reproducible ? why : !pm.ok ? pm.detail : !checks.configured.length ? noChecks : `Comandos configurados do projeto pelo ${pm.name}, no ambiente isolado, com log, duração e código de saída: ${checks.configured.map(c => `${c.label} (${c.command})`).join("; ")}.${checks.notConfigured.length ? ` Não configurado: ${checks.notConfigured.join(", ")}.` : ""}` },
-      { id: "browser", label: "Navegador automatizado", available: reproducible && gitOk && pm.ok && browserOk && hasDev, how: !reproducible ? why : !pm.ok ? pm.detail : !browserOk ? (!pw ? "playwright-core não disponível" : "nenhum Edge/Chrome instalado") : !hasDev ? "o projeto não tem servidor de desenvolvimento configurado" : `Aplicação em teste subida no ambiente isolado (${plan!.config.commands.dev}, pronta quando ${plan!.config.app.readyPath} responde${plan!.config.app.readyText ? ` com “${plan!.config.app.readyText}”` : ""}) e usada num ${browser!.name} headless com perfil temporário, só na origem da aplicação, ${data}.` },
+      { id: "browser", label: "Navegador automatizado", available: reproducible && gitOk && pm.ok && browserOk && hasDev, how: !reproducible ? why : !pm.ok ? pm.detail : !browserOk ? (!pw ? "playwright-core não disponível" : "nenhum Edge/Chrome instalado") : !hasDev ? "o projeto não tem servidor de desenvolvimento configurado" : `Aplicação em teste subida no ambiente isolado (${stackText}) e usada num ${browser!.name} headless com perfil temporário, ${services.length > 1 || plan!.config.extraOrigins?.length ? `só nas origens autorizadas (a principal${services.some(x => x !== main && x.browser) ? ", os processos liberados ao navegador" : ""}${plan!.config.extraOrigins?.length ? ` e ${plan!.config.extraOrigins.length} origem(ns) adicional(is) da configuração` : ""}; o resto é bloqueado por um guarda de rede, que limita o NAVEGADOR e não isola a rede dos comandos do projeto)` : "só na origem da aplicação"}, ${data}.` },
     ],
+    ...(topology ? { topology } : {}),
   };
 }
 
@@ -77,6 +90,14 @@ function readConfined(ctx: OpsContext, rel: string): { text: string } | { error:
 /** Automatic orientation evidence (executor-authored, checks no criterion): what each control of the first screen opens. Null when the browser is unavailable. */
 const fixtureFor = (ctx: OpsContext) => (ctx.plan?.config.browserData === "setor_ia_fixture" ? ctx.fixture : null);
 
+/** Which application (and API) this evidence was made against: the resolved addresses of the run. */
+export function stackLine(stack: RunningStack) {
+  const r = stack.report();
+  return r.services.length > 1
+    ? `aplicação principal em ${r.main}; processos: ${r.services.map(x => `${x.label} ${x.origin}${x.main ? " (principal)" : ""}${x.browser ? "" : " (fora do navegador)"}`).join(", ")}; navegador autorizado a: ${r.allowedOrigins.map(a => a.origin).join(", ")}`
+    : `aplicação em teste em ${r.main}`;
+}
+
 /** How the page talked to its server, for the evidence text. */
 export function apiLine(api: { blocked: number; servedFromFixture: number; notFound: number; externalBlocked: number; passedToApp: number }) {
   return api.passedToApp || (!api.servedFromFixture && !api.blocked && !api.notFound)
@@ -88,12 +109,13 @@ export async function runOrientation(ctx: OpsContext): Promise<QAEvidence | null
   if (!available(ctx, "browser")?.available || !ctx.pm.ok || !ctx.plan || !ctx.tooling.browser.executable || (ctx.plan.config.browserData === "setor_ia_fixture" && !ctx.fixture)) return null;
   const b = { id: ctx.nextId(), method: "browser" as const, criteria: [], purpose: "Orientação da interface: o que cada clicável da tela inicial abre (não verifica nenhum critério; serve para montar os caminhos dos cenários)", requestedBy: "executor" as const, round: 0, version: ctx.versionLabel, author: "executor" as const, origin: "Produzida automaticamente pelo executor antes da primeira chamada ao QA (orientação, não verificação)." };
   if (!ctx.app.current && !ctx.app.error) {
-    try { ctx.app.current = await startApp(ctx.env, ctx.plan, ctx.deps); }
+    try { ctx.app.current = await startStack(ctx.env, ctx.plan, ctx.deps, { controlPorts: ctx.deps.controlPorts }); }
     catch (e) { ctx.app.error = (e as Error).message; }
   }
   if (!ctx.app.current) return { ...b, steps: [], command: null, ok: false, artifacts: [], observed: `A aplicação em teste não subiu: ${ctx.app.error}` };
-  const res = await runScenario({ appUrl: ctx.app.current.url, name: "orientacao", steps: [], explore: { maxClicks: 24 }, fixture: fixtureFor(ctx), artifactsDir: ctx.env.artifactsDir, executable: ctx.tooling.browser.executable, signal: ctx.deps.signal, evidenceId: b.id });
-  return { ...b, steps: ["abrir / e, para cada clicável da tela inicial, recarregar, clicar e registrar o que abriu"], command: null, ok: res.ok, artifacts: res.artifacts, observed: `Navegador ${ctx.tooling.browser.detail.split(",")[0]} ${res.browserVersion}, perfil temporário, aplicação em ${ctx.app.current.url}.\n${res.steps[0]?.observed ?? res.observed}\n${apiLine(res.api)}` };
+  const res = await runScenario({ appUrl: ctx.app.current.url, policy: ctx.app.current.policy, name: "orientacao", steps: [], explore: { maxClicks: 24 }, fixture: fixtureFor(ctx), artifactsDir: ctx.env.artifactsDir, executable: ctx.tooling.browser.executable, signal: ctx.deps.signal, evidenceId: b.id });
+  ctx.app.current.addCors(res.cors);
+  return { ...b, steps: ["abrir / e, para cada clicável da tela inicial, recarregar, clicar e registrar o que abriu"], command: null, ok: res.ok, artifacts: res.artifacts, observed: `Navegador ${ctx.tooling.browser.detail.split(",")[0]} ${res.browserVersion}, perfil temporário, ${stackLine(ctx.app.current)}.\n${res.steps[0]?.observed ?? res.observed}\n${apiLine(res.api)}` };
 }
 
 export async function runOperation(ctx: OpsContext, op: OperationRequest, round: number): Promise<QAEvidence> {
@@ -154,14 +176,15 @@ export async function runOperation(ctx: OpsContext, op: OperationRequest, round:
   const b = base(ctx, op, round, "browser");
   if (ctx.plan.config.browserData === "setor_ia_fixture" && !ctx.fixture) return { ...b, steps: [], command: null, ok: false, artifacts: [], observed: "Sem dados simulados para a aplicação em teste: o navegador não foi aberto (nada seria mostrado sem chamar o executor real)." };
   if (!ctx.app.current && !ctx.app.error) {
-    try { ctx.app.current = await startApp(ctx.env, ctx.plan, ctx.deps); }
+    try { ctx.app.current = await startStack(ctx.env, ctx.plan, ctx.deps, { controlPorts: ctx.deps.controlPorts }); }
     catch (e) { ctx.app.error = (e as Error).message; }
   }
   if (!ctx.app.current) return { ...b, steps: [], command: null, ok: false, artifacts: [], observed: `A aplicação em teste não subiu: ${ctx.app.error}` };
   const steps = op.steps as BrowserStep[];
-  const res = await runScenario({ appUrl: ctx.app.current.url, name: op.scenario_name || op.id || "cenario", steps, fixture: fixtureFor(ctx), artifactsDir: ctx.env.artifactsDir, executable: ctx.tooling.browser.executable, signal: ctx.deps.signal, evidenceId: b.id });
+  const res = await runScenario({ appUrl: ctx.app.current.url, policy: ctx.app.current.policy, name: op.scenario_name || op.id || "cenario", steps, fixture: fixtureFor(ctx), artifactsDir: ctx.env.artifactsDir, executable: ctx.tooling.browser.executable, signal: ctx.deps.signal, evidenceId: b.id });
+  ctx.app.current.addCors(res.cors);
   return {
     ...b, steps: res.steps.map(s => `${s.index}. ${s.action} ${s.args}`.trim()), command: null, ok: res.ok, artifacts: res.artifacts,
-    observed: `Navegador ${ctx.tooling.browser.detail.split(",")[0]} ${res.browserVersion}, perfil temporário, aplicação em ${ctx.app.current.url}.\n${res.observed}\n${apiLine(res.api)}${res.consoleErrors.length ? `\nErros de console: ${res.consoleErrors.slice(0, 6).join(" | ")}` : ""}`,
+    observed: `Navegador ${ctx.tooling.browser.detail.split(",")[0]} ${res.browserVersion}, perfil temporário, ${stackLine(ctx.app.current)}.\n${res.observed}\n${apiLine(res.api)}${res.consoleErrors.length ? `\nErros de console: ${res.consoleErrors.slice(0, 6).join(" | ")}` : ""}${res.cors.length ? `\nDiagnóstico de CORS: ${res.cors.join(" | ")}` : ""}`,
   };
 }

@@ -694,3 +694,11 @@ button.link { background: none; border: 0; padding: 0; color: var(--sky); text-d
 .local-review .brief { max-height: 320px; overflow: auto; margin-top: 6px; }
 .local-review .ctx-table { display: block; overflow-x: auto; }
 .inline-confirm .local-review ~ button:first-of-type { margin-left: auto; }
+
+/* Configurar execução → processos da aplicação (frontend + API) */
+.stack-editor { gap: 8px; }
+.svc-card { margin: 0; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: #0b0e24; display: grid; gap: 8px; min-width: 0; }
+.svc-card legend { padding: 0 6px; font-size: 12px; color: var(--dim); }
+.svc-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.link-row { flex-wrap: wrap; align-items: center; }
+.link-row input[aria-label="Nome da variável de ligação"] { min-width: 180px; }

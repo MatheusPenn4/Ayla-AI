@@ -23,7 +23,7 @@ import { dependencyBlocker, dependencyEvidence, evidenceLabel } from "@/lib/engi
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ApplicationRecord, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type PlanTask, type QASnapshot, type ReviewerSnapshot, type RunDetail, type RunRecord, type RunStatus, type TaskCompletion } from "@/lib/engine/types";
 import { QA_TOOL_EVAL_SCHEMA } from "@/lib/engine/qa-tooled-schema";
 import { ApplyDialog } from "./apply-dialog";
-import { AuditNotes, EvidenceCard, versionText } from "./qa-tooling";
+import { AuditNotes, EvidenceCard, StackReportView, versionText } from "./qa-tooling";
 import { LocalContextTable } from "./local-source";
 import { directorPlanToMarkdown, planMarkdownFilename, type PlanMarkdownStep, type PlanMarkdownTask } from "@/lib/engine/plan-markdown";
 import { downloadTextFile } from "@/lib/utils";
@@ -834,6 +834,7 @@ function QABody({ run, active, agents, onCancel, onOpenRun, onReview }: BodyProp
               <li>Requisições da aplicação em teste: {q.environment.apiRequests.servedFromFixture} atendidas por dados simulados, {q.environment.apiRequests.blocked} bloqueadas (escrita/execução de agentes), {q.environment.apiRequests.notFound} sem dado simulado.</li>
               <li>Limpeza: {q.environment.cleanup || "—"}</li>
             </ul></section>}
+            {q?.environment?.stack && <StackReportView r={q.environment.stack} />}
             {q?.evidence?.map(e => <EvidenceCard key={e.id} e={e} runId={run.id} anchor />)}
           </Tabs.Content>
           <Tabs.Content value="tools" className="run-pane">

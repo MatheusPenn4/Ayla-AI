@@ -82,6 +82,8 @@ const service = new ExecutorService(
       statusCacheMs: 20_000,
     },
     // Read-only access to local clones must be granted explicitly, one absolute folder per entry (";"-separated).
+    // The executor's own port and the web UI's (AYLA_UI_PORTS, comma-separated; default 5173): never reachable by the app under test or its browser.
+    controlPorts: [...new Set([port, ...(vars.AYLA_UI_PORTS ?? "5173").split(",").map(x => Number(x.trim())).filter(n => Number.isInteger(n) && n >= 1 && n <= 65535)])],
     localRepos: (vars.AYLA_LOCAL_REPOS ?? "").split(";").map(x => x.trim()).filter(x => path.isAbsolute(x)),
     secretKeyB64,
     github: {

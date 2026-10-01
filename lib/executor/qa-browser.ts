@@ -1,7 +1,10 @@
 // Controlled browser for the tool-equipped QA: the installed Edge/Chrome driven by playwright-core (no browser
 // download), always headless, always a fresh temporary profile (never the user's own profile, cookies or
 // sessions), and limited to the application under test:
-// - every request to another origin is aborted;
+// - only EXACT authorized origins (the main app, the processes flagged for the browser, the extra origins of the
+//   settings) are reachable; every other request is refused with a reason in the logs. When a stack policy is given,
+//   the browser also runs behind the network guard (net-guard.ts), which sees what page-level interception does not:
+//   redirects followed by the browser, event streams and WebSocket tunnels. WebSocket handshakes are checked here too;
 // - the application under test is the copy running in the isolated environment, with the project's TEST
 //   variables only; with a fixture (Setor IA itself, whose API would reach the real executor) its /api/* never
 //   reaches a server: GETs are answered from read-only records frozen by the executor and every other method
@@ -15,6 +18,7 @@ import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ArtifactRef } from "@/lib/engine/types";
+import { whyBlocked, type GuardOrigin } from "./net-guard";
 import { writeArtifact } from "./qa-env";
 
 export type BrowserStep = {
@@ -25,8 +29,12 @@ export const BROWSER_ACTIONS: BrowserStep["action"][] = ["open", "click", "wait_
 
 export type AppFixture = { localStorage: Record<string, string>; api: Record<string, unknown>; note: string };
 export type StepLog = { index: number; action: string; args: string; ok: boolean; observed: string; ms: number };
+/** Where the browser may go (exact origins) and the guard proxy it runs behind. Absent = only the app's own origin, no proxy. */
+export type BrowserPolicy = { main: string; allowed: GuardOrigin[]; controlPorts: number[]; guardPort: number };
 export type ScenarioResult = {
   ok: boolean; steps: StepLog[]; artifacts: ArtifactRef[]; consoleErrors: string[];
+  /** CORS failures seen by the page, each with what to do in the test environment. */
+  cors: string[];
   api: { blocked: number; servedFromFixture: number; notFound: number; externalBlocked: number; passedToApp: number };
   browserVersion: string; observed: string;
 };
@@ -82,10 +90,14 @@ export async function runScenario(o: {
   signal?: AbortSignal; evidenceId: string;
   /** Orientation map instead of (before) steps: what each control of the first screen opens. */
   explore?: { maxClicks: number };
+  policy?: BrowserPolicy;
 }): Promise<ScenarioResult> {
   const pw = await loadPlaywright();
   if (!pw) throw new Error("playwright-core não está disponível para o executor.");
   const origin = new URL(o.appUrl).origin;
+  const allowed: GuardOrigin[] = o.policy?.allowed ?? [{ origin, label: "aplicação em teste" }];
+  const control = o.policy?.controlPorts ?? [];
+  const cors = new Set<string>();
   const artifacts: ArtifactRef[] = [];
   const steps: StepLog[] = [];
   const consoleErrors: string[] = [];
@@ -94,7 +106,10 @@ export async function runScenario(o: {
   const saved = new Map<string, { text: string; source: string }>();
   const prefix = `${o.evidenceId}-${o.name}`.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 60);
 
-  const browser = await pw.chromium.launch({ executablePath: o.executable, headless: true, args: ["--no-first-run", "--no-default-browser-check", "--disable-sync", "--disable-extensions"] });
+  const quiet = ["--no-first-run", "--no-default-browser-check", "--disable-sync", "--disable-extensions", "--disable-background-networking", "--disable-component-update", "--disable-domain-reliability", "--disable-client-side-phishing-detection", "--metrics-recording-only"];
+  // Behind the guard, loopback is NOT exempt from the proxy (<-loopback>): every hop to every port goes through it.
+  const guardArgs = o.policy ? [`--proxy-server=http://127.0.0.1:${o.policy.guardPort}`, "--proxy-bypass-list=<-loopback>"] : [];
+  const browser = await pw.chromium.launch({ executablePath: o.executable, headless: true, args: [...quiet, ...guardArgs] });
   const onAbort = () => { void browser.close().catch(() => {}); };
   o.signal?.addEventListener("abort", onAbort, { once: true });
   try {
@@ -103,10 +118,13 @@ export async function runScenario(o: {
       const req = route.request();
       let u: URL;
       try { u = new URL(req.url()); } catch { api.externalBlocked++; return route.abort("blockedbyclient"); }
-      if (u.origin !== origin) { api.externalBlocked++; apiLog.push(`BLOQUEADO (outra origem) ${req.method()} ${u.origin}${u.pathname}`); return route.abort("blockedbyclient"); }
+      const why = whyBlocked(u.origin, allowed, control);
+      if (why) { api.externalBlocked++; apiLog.push(`BLOQUEADO (origem não autorizada) ${req.method()} ${u.origin}${u.pathname} — ${why}`); return route.abort("blockedbyclient"); }
       // The orientation map only LOOKS: it clicks every control of the first screen, so no write may reach the app
       // (a click on "Excluir" or "Zerar" would change the very state the QA scenarios then test).
       if (o.explore && req.method() !== "GET" && req.method() !== "HEAD") { api.blocked++; apiLog.push(`BLOQUEADO (orientação somente leitura) ${req.method()} ${u.pathname}`); return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ error: { code: "qa_orientation_read_only", message: "Orientação da interface: somente leitura." } }) }); }
+      // Another authorized origin (e.g. the API of a separate frontend): it is the test application's own process.
+      if (u.origin !== origin) { api.passedToApp++; apiLog.push(`APLICAÇÃO EM TESTE (${allowed.find(a => a.origin === u.origin)?.label ?? u.origin}) ${req.method()} ${u.origin}${u.pathname}`); return route.continue(); }
       if (!u.pathname.startsWith("/api/")) return route.continue();
       if (!o.fixture) { api.passedToApp++; apiLog.push(`APLICAÇÃO EM TESTE ${req.method()} ${u.pathname}`); return route.continue(); }
       if (req.method() !== "GET") {
@@ -118,10 +136,33 @@ export async function runScenario(o: {
       api.notFound++; apiLog.push(`SEM FIXTURE ${key}${u.search}`);
       return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "qa_fixture_missing", message: "Ambiente de QA: sem dado simulado para esta leitura." } }) });
     });
+    // WebSockets (HMR, live updates): the handshake is checked against the exact authorized origins too (ws → http, wss → https).
+    await ctx.routeWebSocket(/.*/, ws => {
+      let u: URL;
+      try { u = new URL(ws.url()); } catch { api.externalBlocked++; void ws.close({ code: 1008, reason: "endereço inválido" }); return; }
+      const asHttp = `${u.protocol === "wss:" ? "https:" : "http:"}//${u.host}`;
+      const why = whyBlocked(new URL(asHttp).origin, allowed, control);
+      if (why) { api.externalBlocked++; apiLog.push(`BLOQUEADO (WebSocket) ${u.origin}${u.pathname} — ${why}`); void ws.close({ code: 1008, reason: "origem não autorizada" }); return; }
+      apiLog.push(`WEBSOCKET AUTORIZADO ${u.origin}${u.pathname}`);
+      ws.connectToServer();
+    });
     // Seeds the fixture only when absent, so a reload keeps whatever the page itself saved meanwhile.
     if (o.fixture) await ctx.addInitScript({ content: `(function () { if (location.origin !== ${JSON.stringify(origin)}) return; var d = ${JSON.stringify(o.fixture?.localStorage ?? {})}; for (var k in d) { if (localStorage.getItem(k) === null) localStorage.setItem(k, d[k]); } })();` });
     const page = await ctx.newPage();
-    page.on("console", m => { if (m.type() === "error") consoleErrors.push(clip(m.text(), 300)); });
+    page.on("console", m => {
+      if (m.type() !== "error") return;
+      consoleErrors.push(clip(m.text(), 300));
+      // Chrome: "Access to fetch at 'URL' (redirected from 'URL2') from origin 'ORIGIN' has been blocked by CORS policy: ...".
+      const c = /Access to \w+ at '([^']+)'(?: \(redirected from '([^']+)'\))? from origin '([^']+)'/i.exec(m.text());
+      if (c && /CORS|Access-Control/i.test(m.text())) {
+        const [, target, via, from] = c;
+        let tgt = target;
+        try { tgt = new URL(target).origin; } catch { /* keep the text */ }
+        // A destination the guard refuses is not a CORS problem of the application: it is in the guard's log with the reason.
+        if (!allowed.some(x => x.origin === tgt)) return;
+        cors.add(`A página (${from}) não conseguiu chamar ${tgt}${via ? ` (redirecionado de ${via})` : ""}: a API não aceitou essa origem (CORS). O Setor IA NÃO altera o CORS do projeto. No ambiente de teste, configure a API para aceitar ${from} — por exemplo com uma ligação entre processos (Configurar execução → Ligações: o nome da variável que a sua API lê, a origem do processo do frontend, enviada ao processo da API) ou com uma variável de teste.`);
+      }
+    });
     page.on("pageerror", e => consoleErrors.push(clip(`pageerror: ${e.message}`, 300)));
     const cdp = await ctx.newCDPSession(page);
     const { targetInfo } = await cdp.send("Target.getTargetInfo") as { targetInfo: { browserContextId?: string } };
@@ -346,7 +387,7 @@ export async function runScenario(o: {
     const version = browser.version();
     await readerCtx.close();
     await ctx.close();
-    return { ok, steps, artifacts, consoleErrors, api, browserVersion: version, observed: steps.map(s => `${s.index}. ${s.ok ? "" : "[FALHOU] "}${s.action}${s.args ? ` (${s.args})` : ""}: ${s.observed}`).join("\n") + (finalClickables ? `\nTela ao final — clicáveis visíveis: ${finalClickables}` : "") };
+    return { ok, steps, artifacts, consoleErrors, cors: [...cors], api, browserVersion: version, observed: steps.map(s => `${s.index}. ${s.ok ? "" : "[FALHOU] "}${s.action}${s.args ? ` (${s.args})` : ""}: ${s.observed}`).join("\n") + (finalClickables ? `\nTela ao final — clicáveis visíveis: ${finalClickables}` : "") };
   } finally {
     o.signal?.removeEventListener("abort", onAbort);
     await browser.close().catch(() => {});

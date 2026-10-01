@@ -9,6 +9,7 @@ import type { useRuns } from "@/hooks/use-runs";
 import { EngineApiError, engineApi } from "@/lib/engine/client";
 import type { ProjectRunConfig } from "@/lib/engine/types";
 import { ProjectConfigEditor } from "./project-config-editor";
+import { servicesOf } from "@/lib/engine/services";
 
 type RunsApi = ReturnType<typeof useRuns>;
 
@@ -79,5 +80,5 @@ function runSummary(c: ProjectRunConfig | null) {
   if (!c?.acknowledgedAt) return "Execução não configurada: verificação da entrega e QA com ferramentas não rodam comandos nem navegador neste projeto até você confirmar a configuração.";
   const k = ([["typecheck", "tipos"], ["lint", "lint"], ["test", "testes"], ["build", "build"], ["dev", "servidor"]] as const);
   const on = k.filter(([id]) => c.commands[id].trim()).map(([, l]) => l), off = k.filter(([id]) => !c.commands[id].trim()).map(([, l]) => l);
-  return `Execução: ${c.packageManager} em ${c.workDir || "(raiz)"} · configurado: ${on.join(", ") || "nada"}${off.length ? ` · não configurado: ${off.join(", ")}` : ""}${c.env.length ? ` · ${c.env.length} variável(is) de teste` : ""} · navegador: ${c.browserData === "setor_ia_fixture" ? "dados simulados do Setor IA" : "servidor da própria aplicação"}.`;
+  return `Execução: ${c.packageManager} em ${c.workDir || "(raiz)"} · configurado: ${on.join(", ") || "nada"}${off.length ? ` · não configurado: ${off.join(", ")}` : ""}${c.env.length ? ` · ${c.env.length} variável(is) de teste` : ""} · navegador: ${c.browserData === "setor_ia_fixture" ? "dados simulados do Setor IA" : servicesOf(c).length > 1 ? `${servicesOf(c).length} processos (${servicesOf(c).map(s => s.id).join(" + ")})` : "servidor da própria aplicação"}.`;
 }

@@ -13,8 +13,9 @@
 //   not reach real data by default).
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import type { ProjectRunConfig, ProjectRunDetection, SupportedPackageManager } from "@/lib/engine/types";
+import type { ProjectExtraOrigin, ProjectLink, ProjectRunConfig, ProjectRunDetection, ProjectService, SupportedPackageManager } from "@/lib/engine/types";
 import { relPathProblem } from "./apply";
+import { DEFAULT_CONTROL_PORTS, SENSITIVE_PORTS, inspectOrigin } from "./net-guard";
 
 export const SUPPORTED_MANAGERS: SupportedPackageManager[] = ["npm", "pnpm"];
 export const COMMAND_KEYS = ["install", "typecheck", "lint", "test", "build", "dev", "seed"] as const;
@@ -68,6 +69,9 @@ export function withTestFiles(argv: string[], files: string[]): string[] {
   const npmScript = argv[0] === "npm" && (argv[1] === "test" || argv[1] === "t" || argv[1] === "run" || argv[1] === "run-script");
   return npmScript && !argv.includes("--") ? [...argv, "--", ...files] : [...argv, ...files];
 }
+
+// The processes of the application (servicesOf / mainServiceOf) live in lib/engine/services.ts so the editor can use them too.
+export { mainServiceOf, servicesOf } from "@/lib/engine/services";
 
 // ---- detection --------------------------------------------------------------------------------------------
 
@@ -168,7 +172,7 @@ export function externalHosts(value: string): string[] {
 export type EnvChange = { name: string; value?: string; external: boolean; remove?: boolean };
 export type ConfigInput = Omit<ProjectRunConfig, "env" | "acknowledgedAt" | "updatedAt"> & { env: EnvChange[] };
 
-export function validateConfig(raw: unknown, root: string, existingNames: string[], existingValue: (name: string) => string | null): { ok: true; config: Omit<ProjectRunConfig, "acknowledgedAt" | "updatedAt">; setValues: Record<string, string>; removed: string[] } | { ok: false; errors: string[] } {
+export function validateConfig(raw: unknown, root: string, existingNames: string[], existingValue: (name: string) => string | null, opts: { controlPorts?: number[] } = {}): { ok: true; config: Omit<ProjectRunConfig, "acknowledgedAt" | "updatedAt">; setValues: Record<string, string>; removed: string[] } | { ok: false; errors: string[] } {
   const errors: string[] = [];
   const b = (raw ?? {}) as Partial<ConfigInput>;
   const workDir = typeof b.workDir === "string" ? b.workDir.trim().replace(/\\/g, "/").replace(/^\.\/?/, "").replace(/\/+$/, "") : "";
@@ -195,6 +199,9 @@ export function validateConfig(raw: unknown, root: string, existingNames: string
   const host = a.host === "127.0.0.1" ? "127.0.0.1" : "localhost";
   const port = a.port === null || a.port === undefined || (a.port as unknown) === "" ? null : Number(a.port);
   if (port !== null && (!Number.isInteger(port) || port < 1024 || port > 65535)) errors.push("Porta: use um número entre 1024 e 65535, ou deixe vazio para o executor escolher uma porta livre ({port}).");
+  const control = opts.controlPorts?.length ? opts.controlPorts : DEFAULT_CONTROL_PORTS;
+  const portProblem = (p: number) => (control.includes(p) ? `a porta ${p} é do próprio Setor IA (executor ou interface web)` : SENSITIVE_PORTS[p] ? `a porta ${p} é de um serviço local sensível (${SENSITIVE_PORTS[p]})` : null);
+  if (port !== null && Number.isInteger(port) && portProblem(port)) errors.push(`Porta: ${portProblem(port)}.`);
   const readyPath = typeof a.readyPath === "string" && a.readyPath.trim() ? a.readyPath.trim() : "/";
   if (!readyPath.startsWith("/") || readyPath.length > 200 || /\s/.test(readyPath)) errors.push("Caminho de prontidão: comece com / (ex.: / ou /api/health).");
   const readyText = typeof a.readyText === "string" ? a.readyText.slice(0, 200) : "";
@@ -202,6 +209,77 @@ export function validateConfig(raw: unknown, root: string, existingNames: string
   if (!Number.isInteger(timeoutSec) || timeoutSec < 10 || timeoutSec > 600) errors.push("Tempo para o servidor ficar pronto: de 10 a 600 segundos.");
   const browserData = b.browserData === "setor_ia_fixture" ? "setor_ia_fixture" : "app";
   if (browserData === "setor_ia_fixture" && !hasSetorIaFixture(dir)) errors.push("Dados simulados do Setor IA só existem para o próprio Setor IA.");
+  // ---- processes, origins and links (frontend + API...) ----
+  const readyPathOk = (p: string) => p.startsWith("/") && p.length <= 200 && !/\s/.test(p);
+  const legacyMain: ProjectService | null = commands.dev ? { id: "app", label: "Aplicação", dir: workDir, install: "", command: commands.dev, host, port, readyPath, readyText, timeoutSec, browser: true } : null;
+  const wantsMulti = Array.isArray(b.services) || (b.extraOrigins?.length ?? 0) > 0 || (b.links?.length ?? 0) > 0;
+  let services: ProjectService[] | undefined, mainService: string | undefined, extraOrigins: ProjectExtraOrigin[] | undefined, links: ProjectLink[] | undefined;
+  if (wantsMulti) {
+    const input: Partial<ProjectService>[] = Array.isArray(b.services) ? b.services : legacyMain ? [legacyMain] : [];
+    if (input.length > 6) errors.push("Processos: no máximo 6.");
+    services = [];
+    for (const [i, x] of input.slice(0, 6).entries()) {
+      const id = typeof x?.id === "string" ? x.id.trim() : "";
+      const tag = `Processo ${i + 1}${id ? ` (${id})` : ""}`;
+      if (!/^[a-z][a-z0-9-]{0,23}$/.test(id)) { errors.push(`${tag}: identificador inválido (minúsculas, números e hífen; começa com letra; até 24 caracteres).`); continue; }
+      if (services.some(y => y.id === id)) { errors.push(`${tag}: identificador repetido.`); continue; }
+      const label = (typeof x.label === "string" && x.label.trim() ? x.label.trim() : id).slice(0, 60);
+      const dir = typeof x.dir === "string" ? x.dir.trim().replace(/\\/g, "/").replace(/^\.\/?/, "").replace(/\/+$/, "") : "";
+      if (dir) {
+        const bad = relPathProblem(dir);
+        if (bad) errors.push(`${label}: pasta ${bad}.`);
+        else if (!existsSync(path.join(root, ...dir.split("/"))) || !statSync(path.join(root, ...dir.split("/"))).isDirectory()) errors.push(`${label}: a pasta “${dir}” não existe no repositório.`);
+      }
+      const command = typeof x.command === "string" ? x.command.trim() : "";
+      const install = typeof x.install === "string" ? x.install.trim() : "";
+      if (!command) errors.push(`${label}: informe o comando que inicia o processo.`);
+      if (pm === "npm" || pm === "pnpm") {
+        if (command) { const p = parseCommandLine(command, { manager: pm, allowPort: true }); if (!p.ok) errors.push(`${label}: comando — ${p.error}.`); }
+        if (install) {
+          const p = parseCommandLine(install, { manager: pm }); if (!p.ok) errors.push(`${label}: instalação — ${p.error}.`);
+          else if (!lockfilesIn(path.join(root, ...dir.split("/").filter(Boolean))).some(l => l.manager === pm)) errors.push(`${label}: não há lockfile de ${pm} na pasta ${dir || "(raiz)"}; a instalação não seria reproduzível.`);
+        }
+      }
+      const sHost = x.host === "127.0.0.1" ? "127.0.0.1" : "localhost";
+      const sPort = x.port === null || x.port === undefined || (x.port as unknown) === "" ? null : Number(x.port);
+      if (sPort !== null && (!Number.isInteger(sPort) || sPort < 1024 || sPort > 65535)) errors.push(`${label}: porta de 1024 a 65535, ou vazia para uma porta livre escolhida pelo executor.`);
+      else if (sPort !== null && portProblem(sPort)) errors.push(`${label}: ${portProblem(sPort)}.`);
+      else if (sPort !== null && services.some(y => y.port === sPort)) errors.push(`${label}: a porta ${sPort} já é de outro processo.`);
+      const sReady = typeof x.readyPath === "string" && x.readyPath.trim() ? x.readyPath.trim() : "/";
+      if (!readyPathOk(sReady)) errors.push(`${label}: caminho de prontidão — comece com / (ex.: / ou /health).`);
+      const sTimeout = Number(x.timeoutSec ?? 120);
+      if (!Number.isInteger(sTimeout) || sTimeout < 10 || sTimeout > 600) errors.push(`${label}: tempo para ficar pronto de 10 a 600 segundos.`);
+      services.push({ id, label, dir, install, command, host: sHost, port: sPort, readyPath: sReady, readyText: typeof x.readyText === "string" ? x.readyText.slice(0, 200) : "", timeoutSec: sTimeout, browser: x.browser !== false });
+    }
+    mainService = services.find(x => x.id === b.mainService)?.id ?? services[0]?.id;
+    if (b.mainService && services.length && !services.some(x => x.id === b.mainService)) errors.push(`Origem principal: o processo “${String(b.mainService)}” não existe.`);
+    extraOrigins = [];
+    for (const x of Array.isArray(b.extraOrigins) ? b.extraOrigins.slice(0, 10) : []) {
+      const info = inspectOrigin(typeof x?.origin === "string" ? x.origin : "", control);
+      if (!info.ok) { errors.push(`Origem adicional: ${info.error}.`); continue; }
+      if (info.scope === "external" && !x.external) { errors.push(`Origem adicional ${info.origin}: fica fora deste computador. Acesso externo exige autorização explícita (marque “origem externa autorizada”) — por padrão só endereços locais.`); continue; }
+      if (extraOrigins.some(y => y.origin === info.origin)) { errors.push(`Origem adicional ${info.origin} repetida.`); continue; }
+      extraOrigins.push({ origin: info.origin, label: (typeof x.label === "string" && x.label.trim() ? x.label.trim() : info.origin).slice(0, 60), external: info.scope === "external" });
+    }
+    links = [];
+    for (const x of Array.isArray(b.links) ? b.links.slice(0, 20) : []) {
+      const name = typeof x?.name === "string" ? x.name.trim() : "";
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) { errors.push(`Variável de ligação “${name}”: nome inválido.`); continue; }
+      if (RESERVED_ENV.test(name)) { errors.push(`Variável de ligação ${name}: nome reservado ao executor ou ao sistema.`); continue; }
+      if (links.some(y => y.name === name && y.to.some(t => (x.to ?? []).includes(t) || !(x.to?.length) || !y.to.length))) { errors.push(`Variável de ligação ${name} repetida para o mesmo processo.`); continue; }
+      if (!services.some(y => y.id === x.service)) { errors.push(`Variável de ligação ${name}: o processo de origem “${String(x.service)}” não existe.`); continue; }
+      const to = Array.isArray(x.to) ? x.to.filter((t): t is string => typeof t === "string") : [];
+      const missingTo = to.filter(t => !services!.some(y => y.id === t));
+      if (missingTo.length) { errors.push(`Variável de ligação ${name}: processo(s) de destino inexistente(s): ${missingTo.join(", ")}.`); continue; }
+      const as = x.as === "port" || x.as === "host" ? x.as : "origin";
+      const suffix = as === "origin" && typeof x.suffix === "string" ? x.suffix.trim() : "";
+      if (suffix && (!suffix.startsWith("/") || /\s/.test(suffix) || suffix.length > 100)) { errors.push(`Variável de ligação ${name}: o complemento deve começar com / (ex.: /api) e não ter espaços.`); continue; }
+      links.push({ name, service: x.service, as, suffix, to });
+    }
+    // The first process mirrors into the older fields, so every reader that only knows commands.dev + app keeps working.
+    const m = services.find(x => x.id === mainService);
+    commands.dev = m?.command ?? "";
+  }
   const env: ProjectRunConfig["env"] = [];
   const setValues: Record<string, string> = {};
   const removed: string[] = [];
@@ -221,6 +299,9 @@ export function validateConfig(raw: unknown, root: string, existingNames: string
     env.push({ name, set: true, external: !!e.external && ext.length > 0 });
   }
   for (const n of existingNames) if (!env.some(x => x.name === n) && !removed.includes(n)) removed.push(n);
+  for (const l of links ?? []) if (env.some(e => e.name === l.name)) errors.push(`A variável ${l.name} está definida como variável de teste e como ligação entre processos; use só uma.`);
   if (errors.length) return { ok: false, errors };
-  return { ok: true, config: { workDir, packageManager: pm as SupportedPackageManager, commands, app: { host, port, readyPath, readyText, timeoutSec }, browserData, env }, setValues, removed };
+  const main = services?.find(x => x.id === mainService);
+  const appOut = main ? { host: main.host, port: main.port, readyPath: main.readyPath, readyText: main.readyText, timeoutSec: main.timeoutSec } : { host: host as "localhost" | "127.0.0.1", port, readyPath, readyText, timeoutSec };
+  return { ok: true, config: { workDir, packageManager: pm as SupportedPackageManager, commands, app: appOut, browserData, env, ...(services ? { services, mainService, extraOrigins, links } : {}) }, setValues, removed };
 }

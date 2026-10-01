@@ -41,6 +41,8 @@ export type ExecutorConfig = {
   github: { token?: string; apiBase?: string; rawBase?: string; fetch?: typeof fetch };
   /** Local Git clones the user authorized for read-only reading (AYLA_LOCAL_REPOS, absolute paths). */
   localRepos?: string[];
+  /** Ports of this executor and of the Setor IA web UI: the application under test and its browser can never use or reach them. */
+  controlPorts?: number[];
   /**
    * Base64 32-byte key used to encrypt API-connection secrets at rest (see lib/executor/secret-store.ts).
    * Production (executor/main.ts) always persists one in .dev.vars, mode 0600, gitignored, the same pattern
@@ -122,7 +124,7 @@ export class ExecutorService {
   }
 
   private projectDeps(): ProjectDeps { return { store: this.store, git: this.gitDeps(), envDirs: this.cfg.localRepos ?? [], decrypt: box => decryptSecret(this.secretKey, parseBox(box)) }; }
-  private envDeps(signal?: AbortSignal): EnvDeps { return { git: this.gitDeps(), spawnBg: this.deps.spawnBg ?? spawnBackground, nodePath: this.deps.nodePath ?? process.execPath, signal, packageManager: this.deps.packageManager }; }
+  private envDeps(signal?: AbortSignal): EnvDeps { return { git: this.gitDeps(), spawnBg: this.deps.spawnBg ?? spawnBackground, nodePath: this.deps.nodePath ?? process.execPath, signal, packageManager: this.deps.packageManager, controlPorts: this.cfg.controlPorts }; }
   private get artifactsRoot() { return path.join(this.cfg.dataDir, "artifacts"); }
   private applyDeps(): ApplyDeps { return { store: this.store, git: this.gitDeps(), projects: this.projectDeps(), dataDir: this.cfg.dataDir, workRoot: this.cfg.workRoot, afterWrite: this.deps.applyAfterWrite }; }
   /** AYLA_LOCAL_REPOS + the projects registered in the interface (usable ones). */
@@ -618,7 +620,7 @@ export class ExecutorService {
     const b = (body ?? {}) as { config?: unknown; acknowledgeCodeExecution?: unknown };
     if (b.acknowledgeCodeExecution !== true) return err(400, "acknowledgement_required", "Confirme que entende que estes comandos executam código do próprio projeto neste computador (numa cópia isolada, sem as suas credenciais).");
     const saved = await this.store.getProjectConfig(id);
-    const v = validateConfig(b.config, project.dir, saved?.config.env.map(e => e.name) ?? [], name => (saved?.secrets[name] ? decryptSecret(this.secretKey, parseBox(saved.secrets[name])) : null));
+    const v = validateConfig(b.config, project.dir, saved?.config.env.map(e => e.name) ?? [], name => (saved?.secrets[name] ? decryptSecret(this.secretKey, parseBox(saved.secrets[name])) : null), { controlPorts: this.cfg.controlPorts });
     if (!v.ok) return err(400, "invalid_config", "A configuração não foi salva.", v.errors);
     const secrets: Record<string, string> = {};
     for (const e of v.config.env) secrets[e.name] = v.setValues[e.name] !== undefined ? serializeBox(encryptSecret(this.secretKey, v.setValues[e.name])) : saved!.secrets[e.name];

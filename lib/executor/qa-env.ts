@@ -20,12 +20,14 @@ import os from "node:os";
 import path from "node:path";
 import type { ArtifactRef, CommandEvidence, ProjectRunConfig, TestedVersion } from "@/lib/engine/types";
 import { resolveGit, type GitDeps } from "./local-git";
-import { clientEnv, type BackgroundProcess, type BackgroundSpawner, type EnvVars } from "./proc";
-import { parseCommandLine, type CommandKey } from "./project-config";
+import { clientEnv, type BackgroundSpawner, type EnvVars } from "./proc";
+import { parseCommandLine, servicesOf, type CommandKey } from "./project-config";
 import { applyPatchInCopy, changedTrackedFiles, materializeCommit, snapshotCopy, type Materialized } from "./worktree";
 
 export type EnvDeps = {
   git: GitDeps; spawnBg: BackgroundSpawner; nodePath: string; signal?: AbortSignal;
+  /** Ports of the executor itself and of the Setor IA web UI: the application under test and its browser can never use or reach them. */
+  controlPorts?: number[];
   /** Test hook: a controlled stand-in for the package manager named in it (the real one is resolved from PATH otherwise). */
   packageManager?: PackageManager;
 };
@@ -200,9 +202,10 @@ export function commandArgv(plan: ExecPlan, key: CommandKey, port?: number): str
 }
 
 /** Runs one command line (already split, first word = tool) in the project's folder of the environment; records everything. */
-export async function runEnvCommand(env: QAEnv, plan: ExecPlan, label: string, argv: string[], logName: string, timeoutMs: number, deps: EnvDeps): Promise<{ evidence: CommandEvidence; artifact: ArtifactRef }> {
+export async function runEnvCommand(env: QAEnv, plan: ExecPlan, label: string, argv: string[], logName: string, timeoutMs: number, deps: EnvDeps, rootDir?: string): Promise<{ evidence: CommandEvidence; artifact: ArtifactRef }> {
   const started = Date.now();
-  const cwd = execDir(env, plan);
+  // Default: the project's package folder; rootDir (relative to the repository root) is for other packages of the application.
+  const cwd = rootDir === undefined ? execDir(env, plan) : path.join(env.srcDir, ...rootDir.split("/").filter(Boolean));
   const tool = resolveTool(argv[0] as ToolName, deps);
   const shown = argv.join(" ");
   const res = tool.ok
@@ -213,10 +216,10 @@ export async function runEnvCommand(env: QAEnv, plan: ExecPlan, label: string, a
     `$ ${shown}`, `diretório: ${cwd}`, `versão: ${env.version.label} (árvore ${env.version.treeHash ?? "?"})`,
     `variáveis do ambiente de teste: ${Object.keys(plan.vars).join(", ") || "nenhuma"} (valores não registrados)`,
     `início: ${new Date(started).toISOString()}  duração: ${durationMs} ms  código de saída: ${res.code}${res.timedOut ? "  (tempo esgotado)" : ""}${res.aborted ? "  (cancelado)" : ""}${res.spawnError ? `  erro ao iniciar: ${res.spawnError}` : ""}`,
-    "", "--- stdout ---", redact(res.stdout, plan.vars), "", "--- stderr ---", redact(res.stderr, plan.vars),
+    "", "--- stdout ---", redactVars(res.stdout, plan.vars), "", "--- stderr ---", redactVars(res.stderr, plan.vars),
   ].join("\n");
   const artifact = writeArtifact(env.artifactsDir, logName, log, "log", `Log completo: ${label}`);
-  const tail = redact(`${res.stdout}\n${res.stderr}`, plan.vars).replace(/\x1b\[[0-9;]*m/g, "").trim().slice(-3000);
+  const tail = redactVars(`${res.stdout}\n${res.stderr}`, plan.vars).replace(/\x1b\[[0-9;]*m/g, "").trim().slice(-3000);
   return {
     artifact,
     evidence: { label, command: shown, cwd, exitCode: res.code, durationMs, startedAt: new Date(started).toISOString(), timedOut: res.timedOut, canceled: res.aborted, logArtifact: artifact.name, tail },
@@ -224,7 +227,7 @@ export async function runEnvCommand(env: QAEnv, plan: ExecPlan, label: string, a
 }
 
 /** Configured values never reach a log, even if the project prints them. */
-function redact(text: string, vars: Record<string, string>) {
+export function redactVars(text: string, vars: Record<string, string>) {
   let t = text;
   for (const v of Object.values(vars)) if (v.length >= 4) t = t.split(v).join("[valor de variável configurada omitido]");
   return t;
@@ -252,6 +255,24 @@ export async function prepareDependencies(env: QAEnv, plan: ExecPlan, deps: EnvD
     const r = await runEnvCommand(env, plan, "Preparação das dependências (comando configurado)", argv, "deps-install.log", 900_000, deps);
     out = { evidence: r.evidence, artifacts: [r.artifact], network: "Comando de instalação configurado pelo usuário (pode usar a rede nesta etapa)." };
   }
+  // Other packages of the application (an API folder next to the frontend): each one installs in its own folder.
+  if (out.evidence.exitCode === 0) {
+    for (const s of servicesOf(plan.config)) {
+      if (!s.install.trim() || deps.signal?.aborted || out.evidence.exitCode !== 0) continue;
+      const p = parseCommandLine(s.install, { manager: plan.config.packageManager });
+      if (!p.ok) { out = { ...out, evidence: { ...out.evidence, exitCode: 1, tail: `Instalação de “${s.label}” inválida: ${p.error}` } }; break; }
+      const argvS = isDefaultInstall(p.argv) ? [...p.argv, "--offline"] : p.argv;
+      let r = await runEnvCommand(env, plan, `Instalação das dependências de “${s.label}” (${s.dir || "raiz"})`, argvS, `deps-${s.id}.log`, 900_000, deps, s.dir);
+      out.artifacts.push(r.artifact);
+      if (r.evidence.exitCode !== 0 && !r.evidence.canceled && isDefaultInstall(p.argv)) {
+        r = await runEnvCommand(env, plan, `Instalação das dependências de “${s.label}” (${s.dir || "raiz"}, com rede)`, [...p.argv, "--prefer-offline"], `deps-${s.id}-rede.log`, 900_000, deps, s.dir);
+        out.artifacts.push(r.artifact);
+        out.network += ` Em “${s.label}” a instalação sem rede falhou e a rede foi usada só nesta etapa.`;
+      }
+      if (r.evidence.exitCode !== 0) out = { ...out, evidence: { ...r.evidence, label: `Instalação das dependências de “${s.label}”` } };
+      else out.network += ` Dependências de “${s.label}” instaladas pelo lockfile da pasta ${s.dir || "raiz"}.`;
+    }
+  }
   let seed: { evidence: CommandEvidence; artifact: ArtifactRef } | null = null;
   if (out.evidence.exitCode === 0 && plan.config.commands.seed.trim() && !deps.signal?.aborted) seed = await runEnvCommand(env, plan, "Preparação dos dados de teste", commandArgv(plan, "seed"), "dados-de-teste.log", 600_000, deps);
   return { ...out, seed };
@@ -267,56 +288,12 @@ export async function freePort(): Promise<number> {
   });
 }
 
-async function portInUse(port: number) {
+export async function portInUse(port: number) {
   return new Promise<boolean>(resolve => {
     const s = net.createServer();
     s.once("error", () => resolve(true));
     s.listen(port, "127.0.0.1", () => s.close(() => resolve(false)));
   });
-}
-
-export type RunningApp = { url: string; proc: BackgroundProcess; stop: () => Promise<string> };
-
-/** Starts the configured dev server and waits until the configured readiness condition holds. */
-export async function startApp(env: QAEnv, plan: ExecPlan, deps: EnvDeps): Promise<RunningApp> {
-  const a = plan.config.app;
-  if (!plan.config.commands.dev.trim()) throw new Error("O projeto não tem servidor de desenvolvimento configurado.");
-  const port = a.port ?? await freePort();
-  if (a.port && await portInUse(a.port)) throw new Error(`A porta configurada ${a.port} já está em uso neste computador; a aplicação em teste não foi iniciada (feche o que a usa ou deixe a porta vazia para uma porta livre).`);
-  const argv = commandArgv(plan, "dev", port);
-  const tool = resolveTool(argv[0] as ToolName, deps);
-  if (!tool.ok) throw new Error(tool.detail);
-  const proc = deps.spawnBg({ command: tool.command, args: [...tool.prefix, ...argv.slice(1)], cwd: execDir(env, plan), env: { ...sandboxEnv(deps.git.env, env, plan.vars), PORT: String(port) }, signal: deps.signal });
-  const url = `http://${a.host}:${port}`;
-  const started = Date.now();
-  const limit = a.timeoutSec * 1000;
-  let exited = false, last = "sem resposta";
-  void proc.exited.then(() => { exited = true; });
-  while (Date.now() - started < limit) {
-    if (deps.signal?.aborted) { await proc.stop(); throw new Error("Cancelado."); }
-    if (exited) break;
-    try {
-      const r = await fetch(url + a.readyPath, { signal: AbortSignal.timeout(20_000) });
-      const body = a.readyText ? await r.text() : "";
-      last = `HTTP ${r.status}${a.readyText && !body.includes(a.readyText) ? ` sem o texto “${a.readyText}”` : ""}`;
-      if (r.status < 400 && (!a.readyText || body.includes(a.readyText))) break;
-    } catch { /* not up yet */ }
-    await new Promise(r => setTimeout(r, 700));
-  }
-  if (exited || Date.now() - started >= limit) {
-    const out = redact(proc.output(), plan.vars);
-    writeArtifact(env.artifactsDir, "app-server.log", out, "log", "Saída do servidor da aplicação em teste (não ficou pronto)");
-    await proc.stop();
-    throw new Error(`A aplicação em teste não ficou pronta em ${url}${a.readyPath} (${exited ? "o processo terminou" : `tempo esgotado em ${a.timeoutSec} s`}; última resposta: ${last}). Saída: ${out.slice(-600)}`);
-  }
-  return {
-    url, proc,
-    stop: async () => {
-      writeArtifact(env.artifactsDir, "app-server.log", redact(proc.output(), plan.vars), "log", "Saída do servidor da aplicação em teste");
-      await proc.stop();
-      return `servidor da aplicação em teste (porta ${port}) encerrado`;
-    },
-  };
 }
 
 /** Has git in PATH (for the tooling status). */

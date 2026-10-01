@@ -8,6 +8,8 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, Loader2, Save, Wand2 } from "lucide-react";
 import { EngineApiError, engineApi } from "@/lib/engine/client";
 import type { LocalProject, ProjectRunConfig, ProjectRunDetection } from "@/lib/engine/types";
+import { mainServiceOf, servicesOf } from "@/lib/engine/services";
+import { ProjectStackEditor, type StackForm } from "./project-stack-editor";
 
 const KEYS = [
   ["install", "Instalação", "Instala as dependências pelo lockfile (ex.: npm ci). Obrigatório."],
@@ -15,7 +17,6 @@ const KEYS = [
   ["lint", "Lint", "ex.: npm run lint"],
   ["test", "Testes", "ex.: npm test"],
   ["build", "Build", "ex.: npm run build"],
-  ["dev", "Servidor de desenvolvimento", "ex.: npm run dev -- --port {port} — {port} e PORT recebem a porta"],
   ["seed", "Dados de teste (opcional)", "Roda depois da instalação; só com dados locais de teste"],
 ] as const;
 type Key = (typeof KEYS)[number][0];
@@ -27,6 +28,7 @@ export function ProjectConfigEditor({ project, onSaved, onClose }: { project: Lo
   const [detection, setDetection] = useState<ProjectRunDetection | null>(null);
   const [form, setForm] = useState<ProjectRunConfig | null>(null);
   const [env, setEnv] = useState<EnvRow[]>([]);
+  const [stack, setStack] = useState<StackForm | null>(null);
   const [ack, setAck] = useState(false);
   const [busy, setBusy] = useState<"" | "load" | "save">("load");
   const [msg, setMsg] = useState<{ ok: boolean; text: string; details?: string[] } | null>(null);
@@ -39,10 +41,14 @@ export function ProjectConfigEditor({ project, onSaved, onClose }: { project: Lo
       if (!keepForm) {
         const base = r.config ?? r.detection.suggestion ?? { ...EMPTY, workDir: r.detection.chosen };
         setForm(base);
+        // Settings saved before multi-process support show up as ONE process (made of the old dev command + server fields).
+        setStack({ services: servicesOf(base), mainService: mainServiceOf(base)?.id ?? "", extraOrigins: base.extraOrigins ?? [], links: base.links ?? [] });
         setEnv((r.config?.env ?? []).map(e => ({ name: e.name, value: "", set: e.set, external: e.external, remove: false })));
       } else if (r.detection.suggestion) {
         const s = r.detection.suggestion;
         setForm(f => (f ? { ...f, workDir: s.workDir, packageManager: s.packageManager, commands: s.commands, browserData: s.browserData } : s));
+        // A single, untouched "app" process follows the package folder that was just chosen.
+        setStack(st => (st && st.services.length === 1 && st.services[0].id === "app" ? { ...st, services: [{ ...st.services[0], dir: s.workDir, command: s.commands.dev }] } : st));
       }
     } catch (e) { setMsg({ ok: false, text: e instanceof EngineApiError ? e.message : "Não foi possível ler a configuração." }); }
     finally { setBusy(""); }
@@ -51,16 +57,16 @@ export function ProjectConfigEditor({ project, onSaved, onClose }: { project: Lo
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { const t = setTimeout(() => void load(), 0); return () => clearTimeout(t); }, [project.id]);
 
-  if (!form || !detection) return <div className="conn-panel"><p className="muted">{busy ? <><Loader2 size={13} className="spin" /> Lendo o projeto…</> : msg?.text}</p></div>;
+  if (!form || !detection || !stack) return <div className="conn-panel"><p className="muted">{busy ? <><Loader2 size={13} className="spin" /> Lendo o projeto…</> : msg?.text}</p></div>;
   const sug = detection.suggestion;
   const set = (patch: Partial<ProjectRunConfig>) => setForm(f => ({ ...f!, ...patch }));
   const setCmd = (k: Key, v: string) => setForm(f => ({ ...f!, commands: { ...f!.commands, [k]: v } }));
-  const setApp = (patch: Partial<ProjectRunConfig["app"]>) => setForm(f => ({ ...f!, app: { ...f!.app, ...patch } }));
 
   const save = async () => {
     setBusy("save"); setMsg(null);
     try {
-      const config = { ...form, env: env.filter(e => e.name.trim()).map(e => ({ name: e.name.trim(), external: e.external, remove: e.remove, ...(e.value ? { value: e.value } : {}) })) };
+      const main = stack.services.find(x => x.id === stack.mainService) ?? stack.services[0];
+      const config = { ...form, commands: { ...form.commands, dev: main?.command ?? "" }, services: stack.services, mainService: main?.id ?? "", extraOrigins: stack.extraOrigins, links: stack.links, env: env.filter(e => e.name.trim()).map(e => ({ name: e.name.trim(), external: e.external, remove: e.remove, ...(e.value ? { value: e.value } : {}) })) };
       await engineApi.saveProjectConfig(project.id, config, ack);
       setMsg({ ok: true, text: "Configuração salva. As próximas verificações e revisões do QA deste projeto usam estes comandos." });
       setAck(false);
@@ -103,31 +109,14 @@ export function ProjectConfigEditor({ project, onSaved, onClose }: { project: Lo
         </label>
       ))}
 
-      <div className="config-grid">
-        <label className="field"><span>Endereço local</span>
-          <select value={form.app.host} onChange={e => setApp({ host: e.target.value as ProjectRunConfig["app"]["host"] })}><option value="localhost">localhost</option><option value="127.0.0.1">127.0.0.1</option></select>
-        </label>
-        <label className="field"><span>Porta</span>
-          <input value={form.app.port ?? ""} onChange={e => setApp({ port: e.target.value.trim() ? Number(e.target.value) : null })} placeholder="vazia = porta livre escolhida pelo executor" inputMode="numeric" />
-        </label>
-        <label className="field"><span>Pronto quando responder em</span>
-          <input value={form.app.readyPath} onChange={e => setApp({ readyPath: e.target.value })} placeholder="/" />
-        </label>
-        <label className="field"><span>…contendo o texto (opcional)</span>
-          <input value={form.app.readyText} onChange={e => setApp({ readyText: e.target.value })} placeholder="ex.: <title>Minha app" />
-        </label>
-        <label className="field"><span>Tempo máximo (s)</span>
-          <input value={form.app.timeoutSec} onChange={e => setApp({ timeoutSec: Number(e.target.value) || 0 })} inputMode="numeric" />
-        </label>
-      </div>
-      <small className="muted">Pronto = resposta HTTP abaixo de 400 no caminho indicado (e com o texto, se informado).</small>
+      <ProjectStackEditor value={stack} onChange={setStack} detection={detection} />
 
       <label className="field"><span>Dados vistos pelo navegador do QA</span>
         <select value={form.browserData} onChange={e => set({ browserData: e.target.value as ProjectRunConfig["browserData"] })}>
           <option value="app">O próprio servidor da aplicação, na cópia isolada, com as variáveis de teste abaixo</option>
           {detection.fixtureAvailable && <option value="setor_ia_fixture">Dados simulados do Setor IA (somente leitura; nada chega ao executor real)</option>}
         </select>
-        <small>O navegador só acessa a origem da aplicação em teste; outras origens são bloqueadas.</small>
+        <small>O navegador só acessa as origens autorizadas acima (principal, processos liberados e adicionais); as demais são bloqueadas, com o motivo registrado.</small>
       </label>
 
       <div className="field"><span>Variáveis do ambiente de teste</span>

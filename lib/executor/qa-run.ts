@@ -119,12 +119,30 @@ export async function runToolQA(c: ToolQAContext): Promise<Outcome | null> {
 
     const tracked = env ? await trackedFiles({ workDir: env.srcDir, hooksDir: env.hooksDir }, c.envDeps.git) : [];
     const fixture = env && exec?.config.browserData === "setor_ia_fixture" ? await c.fixture(c.planId, env.srcDir) : null;
+    /** The first time the processes are up: which application and API this review is using (resolved addresses, authorized origins). */
+    let stackNoted = false;
+    const noteStack = () => {
+      if (stackNoted || !app.current || !env) return;
+      stackNoted = true;
+      const r = app.current.report();
+      evidence.push({
+        id: nextId(), method: "inspection", criteria: [], purpose: "Aplicação e API usadas nesta revisão (endereços resolvidos e origens autorizadas ao navegador)", requestedBy: "executor", round: 0, version: versionLine(env.version),
+        steps: r.services.map(x => `iniciar ${x.label}`), command: null, ok: true, artifacts: [], author: "executor", origin: "Produzida automaticamente pelo executor ao iniciar os processos (valores congelados para esta execução).",
+        observed: [
+          ...r.services.map(x => `${x.label}${x.main ? " (principal)" : ""}: ${x.origin} — porta ${x.portKind} ${x.port}; pasta ${x.dir || "raiz"}; comando ${x.command}; pronto: ${x.ready}; ${x.browser ? "acessível ao navegador" : "NÃO acessível ao navegador"}`),
+          `Origens autorizadas ao navegador (exatas): ${r.allowedOrigins.map(a => `${a.origin} [${a.why}]`).join("; ")}.`,
+          r.links.length ? `Variáveis de ligação (valores resolvidos): ${r.links.map(l => `${l.name}=${l.value} → ${l.to.join(", ")}`).join("; ")}.` : "Sem variáveis de ligação entre processos.",
+          "Qualquer outra origem (incluindo as portas do executor e da interface do Setor IA) é bloqueada por um guarda de rede que limita o NAVEGADOR; os comandos e scripts do projeto não têm isolamento de rede.",
+        ].join("\n"),
+      });
+    };
     const ctx: OpsContext = { env: env!, pm, plan: exec, deps: c.envDeps, tracked, fixture, tooling, versionLabel: versionLine(env?.version ?? version), nextId, app };
     // 1c. Orientation map of the interface (executor-authored; checks no criterion), so call 1 can plan real paths.
     if (env) {
       await store.event(runId, "qa_orientation", "Registrando a orientação da interface (o que cada clicável da tela inicial abre)…");
       const o = await runOrientation(ctx).catch(e => { if (signal?.aborted) return null; void store.event(runId, "qa_orientation_failed", `A orientação da interface falhou: ${(e as Error).message.slice(0, 300)}. Os cenários pedidos pelo QA seguem normalmente.`); return null; });
       if (o) { evidence.push(o); report.browser = tooling.browser.detail; report.appUrl = app.current?.url ?? null; }
+      noteStack();
     }
     if (signal?.aborted) return null;
     const runOps = async (ops: OperationRequest[], round: number) => {
@@ -133,6 +151,7 @@ export async function runToolQA(c: ToolQAContext): Promise<Outcome | null> {
         await store.event(runId, "qa_operation", `Rodada ${round}: ${op.type}${op.path ? ` ${op.path}` : ""}${op.check ? ` ${op.check}` : ""}${op.scenario_name ? ` “${op.scenario_name}”` : ""} — ${op.purpose.slice(0, 160)}`);
         const e = await runOperation(ctx, op, round);
         evidence.push(e);
+        noteStack();
         if (e.method === "browser") { report.browser = tooling.browser.detail; report.appUrl = app.current?.url ?? null; }
       }
       return true;
@@ -193,7 +212,11 @@ export async function runToolQA(c: ToolQAContext): Promise<Outcome | null> {
     return { status, result, message: status === "review_ready" ? `Revisão de QA com operações do executor concluída: ${approved}/${final!.criteria.length} critério(s) aprovado(s), ${evidence.length} evidência(s) registrada(s).` : `O QA precisa de esclarecimento: ${final!.questions.length} pergunta(s).` };
   } finally {
     const cleanup: string[] = [];
-    if (app.current) { try { cleanup.push(await app.current.stop()); } catch { cleanup.push("falha ao encerrar o servidor da aplicação em teste"); } }
+    if (app.current) {
+      let stopped = "";
+      try { stopped = await app.current.stop(); cleanup.push(stopped); } catch { stopped = "falha ao encerrar os processos da aplicação em teste"; cleanup.push(stopped); }
+      report.stack = { ...app.current.report(), stopped };
+    }
     if (env && !report.modifiedDeliveryFiles.length) { try { report.modifiedDeliveryFiles = await deliveryChanges(env, c.envDeps); } catch { /* best effort */ } }
     cleanup.push(destroyEnv(env));
     report.cleanup = cleanup.join("; ");
