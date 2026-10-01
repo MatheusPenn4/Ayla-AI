@@ -15,7 +15,10 @@ import type { Demand, LocalSource } from "@/lib/office/types";
 const HEAD = "__head__";
 const CUSTOM = "__custom__";
 const fmt = (n: number) => n.toLocaleString("pt-BR");
-const messageOf = (e: unknown, fallback: string) => (e instanceof EngineApiError ? e.message : fallback);
+// "Rota inexistente" from the executor means the process on the port is older than this interface (started before the
+// route existed): say so, with the fix, instead of an opaque error.
+const STALE_EXECUTOR = "O executor em execução é de uma versão anterior a esta interface e não conhece esta função. Reinicie-o (feche o terminal do executor e rode pnpm executor) e tente de novo.";
+const messageOf = (e: unknown, fallback: string) => (e instanceof EngineApiError ? (e.status === 404 && e.code === "not_found" && /Rota inexistente/i.test(e.message) ? STALE_EXECUTOR : e.message) : fallback);
 
 export const toLocalSource = (r: ResolvedSource): LocalSource => ({
   projectId: r.projectId, projectLabel: r.projectLabel, owner: r.owner, repo: r.repo, ref: r.ref, commit: r.commit, subject: r.subject, resolvedAt: new Date().toISOString(),
