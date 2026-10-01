@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type { DeveloperDiffFile, SourceComparison, SourceContext } from "@/lib/engine/types";
-import { ARCHITECT_GITHUB_LIMITS, GithubError, assembleContext, type RequestedFile, type TreeEntry } from "./github";
+import { ARCHITECT_GITHUB_LIMITS, GITHUB_LIMITS, GithubError, assembleContext, type RequestedFile, type TreeEntry } from "./github";
 import { clientEnv, type EnvVars, type Runner } from "./proc";
 import { redactSecrets } from "./redact";
 
@@ -203,6 +203,10 @@ export async function readLocalGitContext(
   opts: {
     dir: string; owner: string; repo: string; commit: string; baseCommit: string | null;
     keywords: string[]; mentions: string[]; requested: RequestedFile[]; limits?: typeof ARCHITECT_GITHUB_LIMITS;
+    /** "architect" (default): paths cited in the task, manifests, keyword matches. "director": docs, manifests, then keyword matches (what the GitHub reader does for the Director). */
+    selection?: "director" | "architect";
+    /** Demand source "Projeto local autorizado": recorded in the context (project, reference, where it pointed, uncommitted entries left out). */
+    source?: { branch: string; projectId: string; projectLabel: string; ref: string; refNow: string | null; subject: string; dirty: { count: number; paths: string[] } | null };
   },
   deps: GitDeps,
 ): Promise<{ context: Extract<SourceContext, { kind: "github" }>; text: string }> {
@@ -239,10 +243,35 @@ export async function readLocalGitContext(
     if (r.code !== 0) return { skip: "git show falhou" };
     return { body: r.stdout };
   };
+  const s = opts.source;
+  const selection = opts.selection ?? "architect";
   return assembleContext({
-    owner: opts.owner, repo: opts.repo, branch: "(cópia local)", commit: opts.commit, description: null, defaultBranch: "main",
-    entries, treeTruncated: false, readFile, limits: opts.limits ?? ARCHITECT_GITHUB_LIMITS, selection: "architect",
+    owner: opts.owner, repo: opts.repo, branch: s?.branch ?? "(cópia local)", commit: opts.commit, description: null, defaultBranch: "main",
+    entries, treeTruncated: false, readFile, limits: opts.limits ?? (selection === "director" ? GITHUB_LIMITS : ARCHITECT_GITHUB_LIMITS), selection,
     keywords: opts.keywords, mentions: opts.mentions, requested: opts.requested, started, via: "local_git",
-    local: { dirName: path.basename(opts.dir), published, descendantOf: opts.baseCommit, isDescendant },
+    local: {
+      dirName: path.basename(opts.dir), published, descendantOf: opts.baseCommit, isDescendant,
+      ...(s ? { projectId: s.projectId, projectLabel: s.projectLabel, ref: s.ref, refNow: s.refNow, subject: s.subject, ...(s.dirty ? { dirty: s.dirty } : {}) } : {}),
+    },
   });
+}
+
+/**
+ * Uncommitted entries of an authorized clone (modified, staged, untracked): NOT part of any context, since only
+ * committed objects are read. Count and the first paths, for the review screen. Null when git cannot say.
+ */
+export async function uncommittedEntries(dir: string, deps: GitDeps, maxPaths = 20): Promise<{ count: number; paths: string[] } | null> {
+  const g = resolveGit(deps);
+  if (!g) return null;
+  const st = await git(deps, g, dir, ["status", "--porcelain=v1", "-z", "--untracked-files=normal"], 8_000_000);
+  if (st.code !== 0) return null;
+  const parts = st.stdout.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const m = /^(..) (.+)$/.exec(parts[i]);
+    if (!m) continue;
+    paths.push(m[2]);
+    if (/[RC]/.test(m[1])) i++; // renames/copies carry the original path as the next entry
+  }
+  return { count: paths.length, paths: paths.slice(0, maxPaths) };
 }

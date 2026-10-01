@@ -13,6 +13,17 @@ const SECRET_PATTERNS: RegExp[] = [
 ];
 // "API_KEY = \"...\"" style assignments: keep the name and quotes, redact only the value.
 const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*\s*[:=]\s*)(['"]?)([^\s'"]{6,})\2/gi;
+/**
+ * Only unmistakable credentials (private keys, cloud and API tokens, bearer tokens) — not the "NAME = value"
+ * assignments above, which would also mangle ordinary source code (`apiKey: string`). Used for the text of
+ * files read from a local project before it is sent to a model.
+ */
+export function redactSecretTokens(text: string): { text: string; count: number } {
+  let count = 0;
+  const out = SECRET_PATTERNS.reduce((t, re) => t.replace(re, () => { count++; return "[REDACTED]"; }), text);
+  return { text: out, count };
+}
+
 export function redactSecrets(text: string): string {
   let out = SECRET_PATTERNS.reduce((t, re) => t.replace(re, "[REDACTED]"), text);
   out = out.replace(ASSIGNMENT_PATTERN, "$1$2[REDACTED]$2");

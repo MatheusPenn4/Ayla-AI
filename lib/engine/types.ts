@@ -82,9 +82,11 @@ export type StartRunRequest = {
     acceptanceCriteria: string[];
     project: string;
     priority: "baixa" | "normal" | "alta";
-    source: "github" | "folder" | "none";
+    source: "github" | "folder" | "none" | "local";
     repo?: { url: string; owner: string; repo: string; branch: string };
     folder?: { name: string; fileCount: number; totalBytes: number; topExtensions: [string, number][]; hasPackageJson: boolean; hasGitDir: boolean };
+    /** source "local": a project authorized in the executor, read at an exact commit (see LocalSourceRef). */
+    local?: LocalSourceRef;
   };
   /** Saved sheets of the whole team (the Director included), taken from the browser at click time. */
   team: TeamMemberInput[];
@@ -92,6 +94,45 @@ export type StartRunRequest = {
   /** Answers to a previous run's questions (re-planning). */
   previousRunId?: string;
   answers?: { question: string; answer: string }[];
+};
+
+/**
+ * "Projeto local autorizado" as the source of a demand. The browser only names the project (by the id the
+ * executor gave it, never a path), the reference the user picked and the commit that reference resolved to
+ * when the user looked at it; the executor re-validates all of it and reads exactly `commit` from the project's
+ * Git objects. The optional fields are filled in by the executor when the run is created.
+ */
+export type LocalSourceRef = {
+  projectId: string;
+  /** Branch, tag or other Git reference picked ("" = the project's current HEAD when it was resolved). */
+  ref: string;
+  /** Full SHA the user saw before planning; the only commit that is read. */
+  commit: string;
+  projectLabel?: string;
+  owner?: string;
+  repo?: string;
+  subject?: string;
+  /** Where `ref` pointed when the plan started, when that is no longer `commit` (the user pinned an older SHA). */
+  refNow?: string | null;
+};
+
+export type RefOption = { name: string; kind: "branch" | "remote" | "tag"; sha: string; subject: string; current: boolean };
+export type ProjectRefs = { projectId: string; projectLabel: string; owner: string; repo: string; head: { sha: string; branch: string | null; subject: string }; refs: RefOption[]; truncated: boolean };
+
+/** What a reference of an authorized project resolves to (shown to the user before planning). */
+export type ResolvedSource = {
+  projectId: string; projectLabel: string; dirName: string; owner: string; repo: string;
+  /** What the user asked for ("" = the project's current HEAD) and what it is. */
+  ref: string; refKind: "head" | "branch" | "remote" | "tag" | "commit" | "expression";
+  commit: string; subject: string; committedAt: string | null;
+  /** The project's current HEAD (the commit that is checked out, which may differ from the one being read). */
+  head: { sha: string; branch: string | null };
+  /** Uncommitted entries of the project: they are NOT read (only committed objects are). */
+  dirty: { count: number; paths: string[] } | null;
+  /** The commit is reachable from a remote-tracking ref of the local clone (nothing is fetched). */
+  published: boolean;
+  /** Where `ref` points today, when the user pinned another SHA. */
+  refNow?: string | null;
 };
 
 export type TeamMemberInput = {
@@ -123,6 +164,8 @@ export type ConsultedFile = {
   blob?: string | null;
   /** SHA-256 of the full file content read (lets two runs be compared without storing the file). */
   sha256?: string;
+  /** Local reads: how many token-like strings were replaced by [REDACTED] in the text sent (the sha256 is of the original). */
+  redactions?: number;
   /** Large file sent as outline + blocks: which lines of the committed file were sent. */
   excerpt?: { ranges: [number, number][]; totalLines: number; symbols: string[] };
 };
@@ -136,7 +179,7 @@ export type SourceContext =
       repo: string;
       branch: string;
       commit: string;
-      visibility: "public";
+      visibility: "public" | "local";
       description: string | null;
       defaultBranch: string;
       treeEntries: number;
@@ -149,7 +192,17 @@ export type SourceContext =
       /** Where the content came from: the public GitHub API (default) or an authorized local Git clone. */
       via?: "github" | "local_git";
       /** Local Git reads only: folder name, whether the commit is published on GitHub (per local origin refs), ancestry. */
-      local?: { dirName: string; published: boolean; descendantOf: string | null; isDescendant: boolean | null };
+      local?: {
+        dirName: string; published: boolean; descendantOf: string | null; isDescendant: boolean | null;
+        /** Demand source "Projeto local autorizado": which authorized project, which reference, and where it pointed. */
+        projectId?: string; projectLabel?: string; ref?: string; refNow?: string | null; subject?: string;
+        /** Uncommitted entries of the project at read time: they are NOT part of the context (only committed objects are read). */
+        dirty?: { count: number; paths: string[] };
+        /** SHA-256 of the exact source text sent to the model (the review screen shows the same hash before planning). */
+        textSha256?: string;
+      };
+      /** Files kept out of the context by the protection rules (personal configuration, keys, environment files): count and a few names. */
+      withheld?: { count: number; examples: string[] };
     };
 
 export type PlanQuestion = { question: string; why_it_blocks: string };
@@ -585,9 +638,42 @@ export type ProjectRunConfig = {
   browserData: "app" | "setor_ia_fixture";
   /** Variables given to the test environment only. Values are kept encrypted in the executor and never returned. */
   env: { name: string; set: boolean; external: boolean }[];
+  /**
+   * Several processes (frontend + API...). Absent in settings saved before this existed: those mean ONE process made
+   * of `commands.dev` + `app` (see servicesOf in project-config.ts); nothing has to be configured again. When present,
+   * `commands.dev` and `app` mirror the main process, so older readers keep working.
+   */
+  services?: ProjectService[];
+  /** Id of the process whose origin is the application's main origin (the QA browser opens it). */
+  mainService?: string;
+  /** Exact origins besides the processes' own that the QA browser may reach (an API sandbox, a CDN...). Local by default. */
+  extraOrigins?: ProjectExtraOrigin[];
+  /** Variables that connect one process to another, resolved after the ports are allocated (e.g. VITE_API_URL = origin of "api"). */
+  links?: ProjectLink[];
   acknowledgedAt: string | null;
   updatedAt: string | null;
 };
+
+/** One process of the application under test, started in the isolated copy (no shell). */
+export type ProjectService = {
+  id: string;
+  label: string;
+  /** Folder it runs in, relative to the repository root ("" = the root). */
+  dir: string;
+  /** Optional install for this folder (e.g. a second package next to the first), run before the processes start; "" = covered by the project's install. */
+  install: string;
+  command: string;
+  host: "localhost" | "127.0.0.1";
+  /** null = dynamic: the executor allocates a free port ({port} in the command and PORT receive it). */
+  port: number | null;
+  readyPath: string;
+  readyText: string;
+  timeoutSec: number;
+  /** The QA browser may talk to this process's origin (the main process's always may). */
+  browser: boolean;
+};
+export type ProjectExtraOrigin = { origin: string; label: string; external: boolean };
+export type ProjectLink = { name: string; service: string; as: "origin" | "host" | "port"; suffix: string; to: string[] };
 
 /** What the executor found in the project (suggestions the user can edit; nothing is saved by detection). */
 export type ProjectRunDetection = {
@@ -664,6 +750,31 @@ export type QAToolingStatus = {
   browser: { ok: boolean; detail: string; engine: string | null; executable: string | null };
   /** Per operation: available or not, and why. */
   operations: { id: "read" | "search" | "commands" | "browser"; label: string; available: boolean; how: string }[];
+  /** The application under test as configured (frozen with the review): processes, ports, and where the browser may go. */
+  topology?: ConfiguredTopology;
+};
+
+/** What the review shows BEFORE the run: dynamic ports are only known when the processes start. */
+export type ConfiguredTopology = {
+  main: string | null;
+  services: { id: string; label: string; dir: string; command: string; install: string; port: number | null; host: string; main: boolean; browser: boolean }[];
+  extraOrigins: ProjectExtraOrigin[];
+  links: ProjectLink[];
+  /** The executor's own ports the browser can never reach. */
+  controlPorts: number[];
+};
+
+/** What really ran: the resolved (frozen) addresses, the origins the browser was allowed, and what the guard refused. */
+export type StackReport = {
+  main: string;
+  services: { id: string; label: string; dir: string; command: string; origin: string; port: number; portKind: "fixa" | "dinâmica"; ready: string; main: boolean; browser: boolean }[];
+  allowedOrigins: { origin: string; label: string; why: string; external: boolean }[];
+  links: { name: string; value: string; to: string[] }[];
+  /** Network-level guard in front of the browser (limits the BROWSER only). */
+  guard: { byOrigin: Record<string, { allowed: number; blocked: number }>; blocked: { at: string; method: string; target: string; reason: string }[]; blockedTotal: number } | null;
+  /** CORS problems seen by the page, with what to do in the TEST environment (the executor never edits the project's CORS). */
+  cors: string[];
+  stopped: string;
 };
 
 export type QAEvidence = {
@@ -692,6 +803,8 @@ export type QAEnvironmentReport = {
   network: string;
   browser: string | null;
   appUrl: string | null;
+  /** Which application and API were used (resolved addresses, authorized origins, what was blocked). Absent in reviews made before multi-process support. */
+  stack?: StackReport;
   /** Tracked files of the tested version changed during the review (must be empty). */
   modifiedDeliveryFiles: string[];
   apiRequests: { blocked: number; servedFromFixture: number; notFound: number };

@@ -6,7 +6,7 @@ import { DEFAULT_AGENTS, DEFAULT_IDS, baseTools, lookFromSeed } from "./defaults
 import { EMPTY_PLAYBOOK, HIRE_TEMPLATES, PRESET_VERSION } from "./presets";
 import { connectionFromLegacyProvider, isApiConnectionRef } from "@/lib/engine/connections";
 import { filterTargets } from "./profile";
-import type { Agent, Appearance, Demand, DemandPriority, FolderSummary, Playbook, PresetRef, RepoRef, ToolKey, WorkZoneId } from "./types";
+import type { Agent, Appearance, Demand, DemandPriority, FolderSummary, LocalSource, Playbook, PresetRef, RepoRef, ToolKey, WorkZoneId } from "./types";
 
 export const STORAGE_V1 = "setor-ia-game-v1";
 export const STORAGE_V2 = "setor-ia-office-v2";
@@ -118,7 +118,12 @@ function parseRepo(url: string): RepoRef | undefined {
 function normalizeDemand(raw: Loose): Demand | null {
   const id = str(raw.id);
   if (!id || !str(raw.title)) return null;
-  const source = (["github", "folder", "none"].includes(str(raw.source)) ? raw.source : "none") as Demand["source"];
+  const local: LocalSource | undefined = isObj(raw.local) && /^[0-9a-f]{40}$/.test(str(raw.local.commit)) && str(raw.local.projectId)
+    ? { projectId: str(raw.local.projectId), projectLabel: str(raw.local.projectLabel), owner: str(raw.local.owner), repo: str(raw.local.repo), ref: str(raw.local.ref), commit: str(raw.local.commit), subject: str(raw.local.subject), resolvedAt: str(raw.local.resolvedAt) }
+    : undefined;
+  const declared = (["github", "folder", "none", "local"].includes(str(raw.source)) ? raw.source : "none") as Demand["source"];
+  // A local source without a valid project/commit is not kept as local (it would only fail at planning time).
+  const source: Demand["source"] = declared === "local" && !local ? "none" : declared;
   const criteria = Array.isArray(raw.acceptanceCriteria) ? raw.acceptanceCriteria.filter((x): x is string => typeof x === "string" && !!x.trim()) : [];
   const repo = isObj(raw.repo) ? { url: str(raw.repo.url), owner: str(raw.repo.owner), repo: str(raw.repo.repo), branch: str(raw.repo.branch) } : source === "github" ? parseRepo(str(raw.sourceLabel)) : undefined;
   const folder: FolderSummary | undefined = isObj(raw.folder)
@@ -137,6 +142,7 @@ function normalizeDemand(raw: Loose): Demand | null {
     fileCount: Number(raw.fileCount) || folder?.fileCount || 0,
     repo,
     folder,
+    ...(source === "local" && local ? { local } : {}),
     status: "prepared",
     createdAt: str(raw.createdAt, new Date().toISOString()),
   };

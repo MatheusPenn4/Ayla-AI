@@ -24,6 +24,7 @@ import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ApplicationRecord, type Archite
 import { QA_TOOL_EVAL_SCHEMA } from "@/lib/engine/qa-tooled-schema";
 import { ApplyDialog } from "./apply-dialog";
 import { AuditNotes, EvidenceCard, versionText } from "./qa-tooling";
+import { LocalContextTable } from "./local-source";
 import { directorPlanToMarkdown, planMarkdownFilename, type PlanMarkdownStep, type PlanMarkdownTask } from "@/lib/engine/plan-markdown";
 import { downloadTextFile } from "@/lib/utils";
 import type { Agent } from "@/lib/office/types";
@@ -128,6 +129,7 @@ export function ContextFiles({ run }: { run: RunDetail }) {
   if (!c) return <p className="muted">O contexto ainda não foi montado.</p>;
   if (c.kind === "none") return <p>{c.note}</p>;
   if (c.kind === "folder") return <div className="notice"><b>Os arquivos da pasta “{c.summary.name}” não foram lidos.</b> Apenas metadados: {c.summary.fileCount} arquivos, {fmt(c.summary.totalBytes)} bytes.</div>;
+  if (c.via === "local_git" && c.local?.projectId) return <LocalContextTable ctx={c} />;
   return (
     <>
       <p>Repositório público <b>{c.owner}/{c.repo}</b>, branch <b>{c.branch}</b>, commit <code>{c.commit.slice(0, 12)}</code> · leitura em {fmt(c.elapsedMs)} ms.</p>

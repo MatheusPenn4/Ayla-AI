@@ -16,6 +16,7 @@ import { HANDOFF_TARGETS, type ArchitectSnapshot, type Clarification, type Conte
 import { ARCHITECT_GITHUB_LIMITS, GithubError, extractFileRefs, extractPathMentions, readGithubContext, shrinkGithubText, type RequestedFile } from "./github";
 import { compareLocalCommits, listLocalRepos, readLocalGitContext, type GitDeps } from "./local-git";
 import { estimateTokens } from "./planner";
+import { getProject } from "./projects";
 import { MemberZ } from "./runs-service";
 import type { NewRun, RunStore } from "./store";
 
@@ -182,7 +183,7 @@ export async function sourceOptions(q: { directorRunId: string; taskId: string }
   const latestDep = deps_.filter(d => d.analysis.commit).sort((a, b) => (b.run.finishedAt ?? "").localeCompare(a.run.finishedAt ?? ""))[0];
   const proposed = latestDep?.analysis.commit
     ? { via: (latestDep.analysis.via ?? "github") as "github" | "local_git", commit: latestDep.analysis.commit, why: `Commit em que foi feita a análise de ${latestDep.task.id} (${latestDep.run.id.slice(0, 8)}), da qual esta tarefa depende.` }
-    : gh ? { via: "github" as const, commit: gh.commit, why: "Commit que o Diretor leu." } : null;
+    : gh ? { via: (gh.via ?? "github") as "github" | "local_git", commit: gh.commit, why: "Commit que o Diretor leu." } : null;
   const suggestedFiles = suggestFiles(deps_.map(d => ({ taskId: d.task.id, analysis: d.analysis })));
   const paths = [...new Set(suggestedFiles.map(f => f.ref.split("#")[0]))];
   const comparisons: SourceComparison[] = [];
@@ -284,7 +285,7 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
   // Source and commit: explicit. Default = what the Director read; any change is a recorded revision.
   const prevCtx = previous?.context?.kind === "github" ? previous.context : null;
   const prevCommit = prevCtx?.commit ?? excerpt.directorCommit;
-  const prevVia = prevCtx ? (prevCtx.via ?? "github") : directorCtx?.kind === "github" ? "github" : null;
+  const prevVia = prevCtx ? (prevCtx.via ?? "github") : directorCtx?.kind === "github" ? (directorCtx.via ?? "github") : null;
   const want = req.source ?? (prevCommit ? { via: (prevVia ?? "github") as "github" | "local_git", commit: prevCommit } : undefined);
   const changedCommit = !!want && !!prevCommit && (want.commit !== prevCommit || want.via !== prevVia);
   if (changedCommit && !req.revisionReason) refuse(400, "revision_reason_required", "Informe o motivo da troca de commit ou de fonte; ela fica registrada na nova revisão.");
@@ -305,9 +306,12 @@ export async function prepareHandoff(req: HandoffRequest, deps: PrepareDeps): Pr
       try {
         if (want.via === "local_git") {
           if (!deps.local?.dirs.length) refuse(403, "local_not_authorized", "Nenhuma cópia local do repositório está autorizada para leitura (AYLA_LOCAL_REPOS).");
-          const repos = await listLocalRepos(deps.local!.dirs, deps.local!.git);
+          // A Director that read an authorized project (demand source "Projeto local autorizado") keeps reading that same project, by id.
+          const pid = directorCtx.local?.projectId;
+          const byId = pid && deps.projects ? await getProject(pid, deps.projects) : null;
+          const repos = byId && !byId.problem ? [{ dir: byId.dir, owner: directorCtx.owner, repo: directorCtx.repo }] : await listLocalRepos(deps.local!.dirs, deps.local!.git);
           const repo = repos.find(r => r.owner.toLowerCase() === directorCtx.owner.toLowerCase() && r.repo.toLowerCase() === directorCtx.repo.toLowerCase());
-          if (!repo) refuse(403, "local_not_authorized", `Nenhuma cópia local autorizada corresponde a ${directorCtx.owner}/${directorCtx.repo}.`);
+          if (!repo) refuse(403, "local_not_authorized", pid ? "O projeto local que o Diretor leu não está mais autorizado no executor." : `Nenhuma cópia local autorizada corresponde a ${directorCtx.owner}/${directorCtx.repo}.`);
           const r = await readLocalGitContext({ dir: repo!.dir, owner: directorCtx.owner, repo: directorCtx.repo, commit: want.commit, baseCommit: excerpt.directorCommit, keywords, mentions: extractPathMentions(taskText), requested }, deps.local!.git);
           if (r.context.local?.isDescendant !== true) refuse(409, "commit_not_descendant", `O commit ${want.commit.slice(0, 12)} não descende do commit ${excerpt.directorCommit?.slice(0, 12)} que o Diretor leu; use um commit da mesma história.`);
           context = r.context; sourceText = r.text;

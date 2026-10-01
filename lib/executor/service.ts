@@ -16,6 +16,7 @@ import { developerPreview } from "./developer-preview";
 import { HandoffRefused, HandoffZ, prepareHandoff, sourceOptions } from "./handoff";
 import { ApplyRefused, applyReviewed, buildApplyReview, type ApplyDeps } from "./apply";
 import { listLocalRepos } from "./local-git";
+import { LocalSourceError, listProjectRefs, readDirectorLocalContext, resolveLocalSource } from "./local-source";
 import { processRun } from "./planner";
 import { spawnBackground, type BackgroundSpawner, type Runner } from "./proc";
 import { ProjectRefused, authorizedDirs, getProject, listProjects, loadExecPlan, registerProject, removeProject, type ProjectDeps } from "./projects";
@@ -317,6 +318,18 @@ export class ExecutorService {
     if ((await store.countCreatedSince(new Date(Date.now() - 3600_000).toISOString())) >= this.cfg.limits.maxRunsPerHour) {
       return err(429, "rate_limited", `Limite local de ${this.cfg.limits.maxRunsPerHour} execuções por hora atingido (proteção do uso da sua assinatura).`);
     }
+    // Demand source "Projeto local autorizado": the executor re-validates the project and the commit the user
+    // reviewed, and fills in what only it may state (project name, repository, where the reference points now).
+    if (req.demand.source === "local") {
+      const l = req.demand.local;
+      if (!l) return err(400, "invalid_request", "A fonte “Projeto local autorizado” precisa do projeto, da referência e do commit.");
+      try {
+        const r = await resolveLocalSource({ projectId: l.projectId, ref: l.ref, commit: l.commit }, this.projectDeps());
+        req.demand.local = { projectId: r.projectId, ref: r.ref, commit: r.commit, projectLabel: r.projectLabel, owner: r.owner, repo: r.repo, subject: r.subject, refNow: r.refNow };
+        // Repository identity (from the project's own origin, nothing is fetched): the later steps (QA, application) look the project up by it.
+        req.demand.repo = { url: `https://github.com/${r.owner}/${r.repo}`, owner: r.owner, repo: r.repo, branch: r.ref || r.head.branch || "" };
+      } catch (e) { if (e instanceof LocalSourceError) return err(e.status, e.code, e.message); throw e; }
+    }
     const { run, created } = await store.create(buildNewRun(req));
     if (created) this.enqueue(run.id);
     return { status: created ? 202 : 200, body: { run, created } };
@@ -560,6 +573,31 @@ export class ExecutorService {
     return { status: 200, body: { removed: await removeProject(id, this.projectDeps()) } };
   }
 
+  // ---- local project as the source of a demand ------------------------------------
+
+  /** Branches, remote-tracking branches and tags of an authorized project (by id), for the demand form. */
+  async projectRefs(id: string): Promise<Reply> {
+    try { return { status: 200, body: await listProjectRefs(id, this.projectDeps()) }; }
+    catch (e) { if (e instanceof LocalSourceError) return err(e.status, e.code, e.message); throw e; }
+  }
+
+  /** What a reference points to (full SHA, subject, uncommitted entries that stay out) — shown BEFORE planning. */
+  async resolveSource(id: string, ref: string | null, commit: string | null): Promise<Reply> {
+    try { return { status: 200, body: { source: await resolveLocalSource({ projectId: id, ref: ref ?? "", commit: commit ?? undefined }, this.projectDeps()) } }; }
+    catch (e) { if (e instanceof LocalSourceError) return err(e.status, e.code, e.message); throw e; }
+  }
+
+  /** The review before planning: exactly the files/excerpts the Director would receive for this commit (no model is called, nothing is recorded). */
+  async contextPreview(id: string, body: unknown): Promise<Reply> {
+    const b = (body ?? {}) as { ref?: unknown; commit?: unknown; title?: unknown; description?: unknown };
+    if (typeof b.commit !== "string" || !/^[0-9a-f]{40}$/.test(b.commit)) return err(400, "invalid_request", "Informe o SHA completo do commit resolvido.");
+    const title = typeof b.title === "string" ? b.title.slice(0, 200) : "", description = typeof b.description === "string" ? b.description.slice(0, 20000) : "";
+    try {
+      const r = await readDirectorLocalContext({ projectId: id, ref: typeof b.ref === "string" ? b.ref : "", commit: b.commit }, { title, description }, this.projectDeps());
+      return { status: 200, body: { source: r.resolved, context: r.context, text: r.text, textSha256: r.context.local?.textSha256 ?? null } };
+    } catch (e) { if (e instanceof LocalSourceError) return err(e.status, e.code, e.message); throw e; }
+  }
+
   /** The saved execution settings (variable names only) and what the executor detects in the project, as editable suggestions. */
   async projectConfig(id: string, workDir?: string | null): Promise<Reply> {
     const project = await getProject(id, this.projectDeps());
@@ -696,6 +734,7 @@ export class ExecutorService {
       limits: { callTimeoutMs: this.cfg.limits.callTimeoutMs, leaseMs: this.cfg.limits.leaseMs },
       github: { ...this.cfg.github, permitted: (snap as DirectorSnapshot).director?.tools.github !== false },
       local: dirs.length ? { dirs, git: this.gitDeps() } : undefined,
+      projects: this.projectDeps(), localReadPermitted: (snap as DirectorSnapshot).director?.tools?.read !== false,
       workRoot: this.cfg.workRoot,
       signal: ac.signal,
       qa: { envDeps: this.envDeps(ac.signal), projects: this.projectDeps(), artifactsRoot: this.artifactsRoot, fixture: (planId, srcDir) => buildSetorIaFixture(this.store, planId, srcDir) },

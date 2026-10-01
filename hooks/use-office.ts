@@ -93,6 +93,8 @@ export function useOffice() {
 
   const addDemand = useCallback((d: Demand) => setDemands(list => [d, ...list]), []);
   const removeDemand = useCallback((id: string) => setDemands(list => list.filter(d => d.id !== id)), []);
+  /** Replaces a queued demand (same id): the edit form and "use the current SHA". */
+  const updateDemand = useCallback((d: Demand) => setDemands(list => list.map(x => (x.id === d.id ? d : x))), []);
 
-  return { agents, demands, hydrated, migratedFrom, saveAgent, addAgent, removeAgent, dismissPreset, addDemand, removeDemand };
+  return { agents, demands, hydrated, migratedFrom, saveAgent, addAgent, removeAgent, dismissPreset, addDemand, removeDemand, updateDemand };
 }

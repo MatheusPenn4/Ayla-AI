@@ -99,7 +99,7 @@ export type Agent = {
 };
 
 export type DemandPriority = "baixa" | "normal" | "alta";
-export type DemandSource = "github" | "folder" | "none";
+export type DemandSource = "github" | "folder" | "none" | "local";
 
 export type FolderSummary = {
   name: string;
@@ -112,6 +112,12 @@ export type FolderSummary = {
 };
 
 export type RepoRef = { url: string; owner: string; repo: string; branch: string };
+
+/**
+ * "Projeto local autorizado": a project the executor knows by id, a reference (branch/tag/commit) and the full SHA
+ * it resolved to when the user looked at it. Only the id and the SHA authorize anything; the rest is for display.
+ */
+export type LocalSource = { projectId: string; projectLabel: string; owner: string; repo: string; ref: string; commit: string; subject: string; resolvedAt: string };
 
 export type Demand = {
   id: string;
@@ -127,6 +133,7 @@ export type Demand = {
   fileCount: number;
   repo?: RepoRef;
   folder?: FolderSummary;
+  local?: LocalSource;
   /** Always "prepared" in this phase: nothing executes demands yet. */
   status: "prepared";
   createdAt: string;

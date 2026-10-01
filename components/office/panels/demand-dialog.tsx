@@ -1,26 +1,30 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { ArrowRight, FolderOpen, GitBranch, Plus, Send, X } from "lucide-react";
+import { ArrowRight, FolderGit2, FolderOpen, GitBranch, Plus, Save, Send, X } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Avatar } from "../avatar";
 import { Field } from "./field";
+import { LocalSourcePicker } from "./local-source";
 import { formatBytes, parseGithubUrl, summarizeFolder } from "@/lib/integration/contracts";
 import { newId } from "@/lib/office/defaults";
-import type { Agent, Demand, DemandPriority, DemandSource, FolderSummary } from "@/lib/office/types";
+import type { Agent, Demand, DemandPriority, DemandSource, FolderSummary, LocalSource } from "@/lib/office/types";
 
-type Form = { title: string; project: string; description: string; priority: DemandPriority; criteria: string[]; criterion: string; source: DemandSource; url: string; branch: string; folder: FolderSummary | null };
-const empty = (): Form => ({ title: "", project: "", description: "", priority: "normal", criteria: [], criterion: "", source: "github", url: "", branch: "", folder: null });
+type Form = { title: string; project: string; description: string; priority: DemandPriority; criteria: string[]; criterion: string; source: DemandSource; url: string; branch: string; folder: FolderSummary | null; local: LocalSource | null };
+const empty = (): Form => ({ title: "", project: "", description: "", priority: "normal", criteria: [], criterion: "", source: "github", url: "", branch: "", folder: null, local: null });
+const fromDemand = (d: Demand): Form => ({ title: d.title, project: d.project, description: d.description, priority: d.priority, criteria: [...d.acceptanceCriteria], criterion: "", source: d.source, url: d.source === "github" ? d.repo?.url ?? d.sourceLabel : "", branch: d.source === "github" ? d.repo?.branch ?? "" : "", folder: d.folder ?? null, local: d.local ?? null });
 
-function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: {
+function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit, editing }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   agents: Agent[];
   recipient: string;
   onRecipient: (id: string) => void;
   onSubmit: (d: Demand) => void;
+  /** Editing an existing demand of the queue (same id and date; planning runs already made keep their own frozen copy). */
+  editing?: Demand | null;
 }) {
-  const [f, setF] = useState<Form>(empty);
+  const [f, setF] = useState<Form>(() => (editing ? fromDemand(editing) : empty()));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [reading, setReading] = useState(false);
   const folderRef = useRef<HTMLInputElement>(null);
@@ -42,17 +46,19 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
     if (!criteria.length) e.criteria = "Inclua pelo menos um critério de aceite.";
     if (f.source === "github" && !repo) e.url = f.url.trim() ? "Use um link https://github.com/dono/repositorio." : "Informe o link do repositório ou escolha outra fonte.";
     if (f.source === "folder" && !f.folder) e.folder = "Selecione uma pasta ou escolha outra fonte.";
+    if (f.source === "local" && !f.local) e.local = "Escolha o projeto e uma referência que exista; o SHA resolvido aparece antes de salvar.";
     setErrors(e);
     if (Object.keys(e).length) return;
     const branch = f.branch.trim() || repo?.branch || "";
     onSubmit({
-      id: newId(), title: f.title.trim(), description: f.description.trim(), acceptanceCriteria: criteria, project: f.project.trim(),
+      id: editing?.id ?? newId(), title: f.title.trim(), description: f.description.trim(), acceptanceCriteria: criteria, project: f.project.trim(),
       priority: f.priority, recipient: who.id, source: f.source,
-      sourceLabel: f.source === "github" ? f.url.trim() : f.source === "folder" ? f.folder!.name : "",
+      sourceLabel: f.source === "github" ? f.url.trim() : f.source === "folder" ? f.folder!.name : f.source === "local" ? `${f.local!.projectLabel} · ${f.local!.ref || "HEAD"} · ${f.local!.commit.slice(0, 12)}` : "",
       fileCount: f.folder?.fileCount ?? 0,
       repo: f.source === "github" && repo ? { url: f.url.trim(), owner: repo.owner, repo: repo.repo, branch } : undefined,
       folder: f.source === "folder" ? f.folder! : undefined,
-      status: "prepared", createdAt: new Date().toISOString(),
+      local: f.source === "local" ? f.local! : undefined,
+      status: "prepared", createdAt: editing?.createdAt ?? new Date().toISOString(),
     });
   };
 
@@ -60,11 +66,11 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
     <>
         <DialogHeader>
           <span className="eyebrow">NOVA MISSÃO / FILA LOCAL</span>
-          <DialogTitle>Preparar demanda</DialogTitle>
-          <DialogDescription id="demand-desc">Descreva o trabalho e associe o projeto. Ela entra na fila como <b>preparada</b>.</DialogDescription>
+          <DialogTitle>{editing ? "Editar demanda" : "Preparar demanda"}</DialogTitle>
+          <DialogDescription id="demand-desc">{editing ? <>Altere o texto, os critérios ou a fonte. Execuções já feitas guardam a cópia que usaram e não mudam.</> : <>Descreva o trabalho e associe o projeto. Ela entra na fila como <b>preparada</b>.</>}</DialogDescription>
         </DialogHeader>
         <div className="dialog-scroll">
-          <div className="notice">A demanda fica salva neste navegador. Na fila, “Planejar com o Diretor” gera um plano real pelo executor local. Nesta fase não há clone do repositório, envio de arquivos da pasta nem delegação automática aos especialistas.</div>
+          <div className="notice">A demanda fica salva neste navegador. Na fila, “Planejar com o Diretor” gera um plano real pelo executor local. Com a fonte “Projeto local autorizado”, o executor lê arquivos commitados do projeto escolhido; com “Pasta local” (seletor do navegador) os arquivos não são enviados. Não há delegação automática aos especialistas.</div>
           <div className="recipient">
             <Avatar look={who.look} color={who.color} size={44} />
             <Field label="Responsável" className="grow">
@@ -106,6 +112,7 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
             <span>Fonte do projeto</span>
             <div className="segmented" role="radiogroup" aria-label="Fonte do projeto">
               <button type="button" role="radio" aria-checked={f.source === "github"} className="seg" onClick={() => set({ source: "github" })}><GitBranch size={16} /> GitHub</button>
+              <button type="button" role="radio" aria-checked={f.source === "local"} className="seg" onClick={() => set({ source: "local" })}><FolderGit2 size={16} /> Projeto local autorizado</button>
               <button type="button" role="radio" aria-checked={f.source === "folder"} className="seg" onClick={() => set({ source: "folder" })}><FolderOpen size={16} /> Pasta local</button>
               <button type="button" role="radio" aria-checked={f.source === "none"} className="seg" onClick={() => set({ source: "none" })}>Sem fonte</button>
             </div>
@@ -120,6 +127,7 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
               {errors.url && <p className="form-error" role="alert">{errors.url}</p>}
             </div>
           )}
+          {f.source === "local" && <LocalSourcePicker value={f.local} onChange={v => setF(s => (s.local?.commit === v?.commit && s.local?.projectId === v?.projectId && s.local?.ref === v?.ref ? s : { ...s, local: v }))} error={errors.local} />}
           {f.source === "folder" && (
             <div className="source-box">
               <input
@@ -154,7 +162,7 @@ function DemandForm({ onOpenChange, agents, recipient, onRecipient, onSubmit }: 
         </div>
         <div className="dialog-actions">
           <button className="btn-secondary" onClick={() => onOpenChange(false)}>Cancelar</button>
-          <button className="btn-primary" onClick={submit}><Send size={15} /> Adicionar à fila</button>
+          <button className="btn-primary" onClick={submit}>{editing ? <><Save size={15} /> Salvar alterações</> : <><Send size={15} /> Adicionar à fila</>}</button>
         </div>
     </>
   );
@@ -165,7 +173,7 @@ export function DemandDialog(props: React.ComponentProps<typeof DemandForm>) {
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
       <DialogContent className="game-dialog demand-dialog" aria-describedby="demand-desc">
-        <DemandForm {...props} />
+        <DemandForm key={props.editing?.id ?? "new"} {...props} />
       </DialogContent>
     </Dialog>
   );

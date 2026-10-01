@@ -60,7 +60,11 @@ export function buildUserMessage(input: {
     lines.push(context.note);
     lines.push(`Metadados da pasta: nome "${s.name}", ${s.fileCount} arquivos, ${s.totalBytes} bytes, extensões principais: ${s.topExtensions.map(([e, n]) => `.${e} (${n})`).join(", ") || "—"}, package.json: ${s.hasPackageJson ? "sim" : "não"}, .git: ${s.hasGitDir ? "sim" : "não"}.`);
   }
-  if (context.kind === "github") {
+  if (context.kind === "github" && context.via === "local_git") {
+    const l = context.local;
+    lines.push(`Projeto local autorizado ${context.owner}/${context.repo}${l?.projectLabel ? ` (“${l.projectLabel}”)` : ""}, referência ${l?.ref || "HEAD"} no commit ${context.commit.slice(0, 12)}. Foram lidos somente arquivos já commitados desse commit${l?.dirty?.count ? `; ${l.dirty.count} alteração(ões) local(is) não commitada(s) NÃO fazem parte do contexto` : ""}.`);
+    lines.push(`Leitura limitada: ${context.files.length} arquivo(s) lido(s) de ${context.treeEntries} entradas. Arquivos não listados abaixo NÃO foram lidos${context.withheld ? `; ${context.withheld.count} arquivo(s) de configuração pessoal ou credenciais foram deliberadamente omitidos` : ""}.`);
+  } else if (context.kind === "github") {
     lines.push(`Repositório público ${context.owner}/${context.repo}, branch ${context.branch} (commit ${context.commit.slice(0, 12)}).`);
     lines.push(`Leitura limitada: ${context.files.length} arquivo(s) lido(s) de ${context.treeEntries} entradas${context.treeTruncated ? " (árvore truncada pelo GitHub)" : ""}. Arquivos não listados abaixo NÃO foram lidos.`);
   }

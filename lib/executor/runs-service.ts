@@ -33,9 +33,11 @@ const StartZ = z.object({
   team: z.array(MemberZ).min(1).max(16),
   demand: z.object({
     id, title: s(200).min(1), description: s(20000), acceptanceCriteria: z.array(s(2000)).max(30), project: s(120),
-    priority: z.enum(["baixa", "normal", "alta"]), source: z.enum(["github", "folder", "none"]),
+    priority: z.enum(["baixa", "normal", "alta"]), source: z.enum(["github", "folder", "none", "local"]),
     repo: z.object({ url: s(300), owner: s(60), repo: s(120), branch: s(200) }).optional(),
     folder: z.object({ name: s(200), fileCount: z.number().int().min(0), totalBytes: z.number().min(0), topExtensions: z.array(z.tuple([s(40), z.number()])).max(10), hasPackageJson: z.boolean(), hasGitDir: z.boolean() }).optional(),
+    // Only these three fields are accepted from the browser (anything else is dropped): the executor fills in the rest.
+    local: z.object({ projectId: z.string().regex(/^[A-Za-z0-9-]{4,64}$/), ref: s(200), commit: z.string().regex(/^[0-9a-f]{40}$/) }).optional(),
   }),
 });
 
@@ -45,6 +47,8 @@ export function parseStartRequest(body: unknown): Validated {
   const r = StartZ.safeParse(body);
   if (!r.success) return { ok: false, errors: r.error.issues.slice(0, 10).map(i => `${i.path.join(".")}: ${i.message}`) };
   const v = r.data as StartRunRequest;
+  if (v.demand.source === "local" && !v.demand.local) return { ok: false, errors: ["A fonte “Projeto local autorizado” precisa do projeto, da referência e do commit resolvido."] };
+  if (v.demand.source !== "local" && v.demand.local) return { ok: false, errors: ["Dados de projeto local só valem para a fonte “Projeto local autorizado”."] };
   if (!v.team.some(m => m.id === v.directorId)) return { ok: false, errors: ["O Diretor não está na equipe enviada."] };
   if (!v.demand.title.trim()) return { ok: false, errors: ["A demanda precisa de um título."] };
   const director = v.team.find(m => m.id === v.directorId)!;

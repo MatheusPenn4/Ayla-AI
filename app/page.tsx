@@ -68,6 +68,7 @@ export default function Home() {
   const [compareOnOpen, setCompareOnOpen] = useState(false);
   const [hire, setHire] = useState<{ open: boolean; zone: WorkZoneId; station?: string }>({ open: false, zone: "dev" });
   const [demandOpen, setDemandOpen] = useState(false);
+  const [editingDemand, setEditingDemand] = useState<Demand | null>(null);
   const [recipient, setRecipient] = useState("director");
   const [meeting, setMeeting] = useState(false);
   const [quality, setQuality] = useState<QualityPref>("auto");
@@ -148,7 +149,8 @@ export default function Home() {
   const nav = (s: Screen) => { setScreen(s); setRailOpen(false); };
   const select = (id: string) => { setSelectedId(id); setScreen("office"); setRailOpen(false); };
   const openSheet = (id: string, tab = "profile", compare = false) => { setSelectedId(id); setSheetTab(tab); setCompareOnOpen(compare); setSheetOpen(true); setRailOpen(false); };
-  const openDemand = (id = "director") => { setRecipient(agents.some(a => a.id === id) ? id : "director"); setDemandOpen(true); setSheetOpen(false); setRailOpen(false); };
+  const openDemand = (id = "director") => { setEditingDemand(null); setRecipient(agents.some(a => a.id === id) ? id : "director"); setDemandOpen(true); setSheetOpen(false); setRailOpen(false); };
+  const editDemand = (d: Demand) => { setEditingDemand(d); setRecipient(agents.some(a => a.id === d.recipient) ? d.recipient : "director"); setDemandOpen(true); setSheetOpen(false); setRailOpen(false); };
   const openHire = (zone: WorkZoneId = "dev", station?: string) => {
     if (agents.length >= CAPACITY) { toast.error(`O escritório comporta ${CAPACITY} funcionários. Dispense alguém para liberar uma estação.`); return; }
     setHire({ open: true, zone, station });
@@ -257,7 +259,7 @@ export default function Home() {
             )}
           </div>
           {screen === "team" && <TeamScreen agents={agents} status={runs.status ?? undefined} onOpen={(a: Agent) => openSheet(a.id)} onReview={(a: Agent) => openSheet(a.id, "instructions", true)} onHire={() => openHire()} />}
-          {screen === "demands" && <DemandQueue demands={demands} agents={agents} runs={runs} onNew={() => openDemand("director")} onRemove={id => { office.removeDemand(id); toast.success("Demanda removida da fila local."); }} onOpenAgent={id => openSheet(id)} onPlan={d => void plan(d)} onOpenRun={setRunId} />}
+          {screen === "demands" && <DemandQueue demands={demands} agents={agents} runs={runs} onNew={() => openDemand("director")} onRemove={id => { office.removeDemand(id); toast.success("Demanda removida da fila local."); }} onEdit={editDemand} onUpdate={d => office.updateDemand(d)} onOpenAgent={id => openSheet(id)} onPlan={d => void plan(d)} onOpenRun={setRunId} />}
           {screen === "settings" && <ConnectionsScreen agents={agents} runs={runs} />}
         </main>
 
@@ -306,7 +308,11 @@ export default function Home() {
         agents={agents}
         recipient={recipient}
         onRecipient={setRecipient}
-        onSubmit={d => { office.addDemand(d); setDemandOpen(false); toast.success("Demanda adicionada à fila como preparada. Use “Planejar com o Diretor” na fila para executá-la."); }}
+        editing={editingDemand}
+        onSubmit={d => {
+          if (editingDemand) { office.updateDemand(d); setEditingDemand(null); setDemandOpen(false); toast.success("Demanda atualizada. Os próximos planejamentos usam a nova versão."); return; }
+          office.addDemand(d); setDemandOpen(false); toast.success("Demanda adicionada à fila como preparada. Use “Planejar com o Diretor” na fila para executá-la.");
+        }}
       />
       <RunDialog
         runId={runId} agents={agents} runs={runs} onClose={() => setRunId(null)} onOpenRun={setRunId}

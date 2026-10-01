@@ -3,7 +3,7 @@
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
 import type { DeveloperPreview } from "./developer-preview";
-import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, ProjectRunConfig, ProjectRunDetection, RunDetail, RunRecord, SourceComparison, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
+import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, ProjectRefs, ProjectRunConfig, ProjectRunDetection, ResolvedSource, RunDetail, RunRecord, SourceComparison, SourceContext, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -62,6 +62,8 @@ export function buildStartRequest(demand: Demand, agents: Agent[], directorId: s
       priority: demand.priority, source: demand.source,
       ...(demand.source === "github" && demand.repo ? { repo: demand.repo } : {}),
       ...(demand.source === "folder" && demand.folder ? { folder: demand.folder } : {}),
+      // Only the project id, the reference and the SHA the user reviewed are sent; the executor validates them by id.
+      ...(demand.source === "local" && demand.local ? { local: { projectId: demand.local.projectId, ref: demand.local.ref, commit: demand.local.commit } } : {}),
     },
     ...(followUp ? { previousRunId: followUp.previousRunId, answers: followUp.answers } : {}),
   };
@@ -111,6 +113,13 @@ export const engineApi = {
   /** The only request that carries a folder path; the executor validates it and answers with an id. */
   registerProject: (dir: string, label: string) => call<{ project: LocalProject; created: boolean }>("/api/projects", { method: "POST", body: JSON.stringify({ dir, label }) }),
   removeProject: (id: string) => call<{ removed: boolean }>(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** Branches and tags of an authorized project, for the "Projeto local autorizado" source of a demand. */
+  projectRefs: (id: string) => call<ProjectRefs>(`/api/projects/${encodeURIComponent(id)}/refs`),
+  /** The commit a reference points to (or a pinned SHA is checked against) — shown before planning. */
+  resolveSource: (id: string, ref: string, commit?: string) => call<{ source: ResolvedSource }>(`/api/projects/${encodeURIComponent(id)}/resolve?ref=${encodeURIComponent(ref)}${commit ? `&commit=${commit}` : ""}`),
+  /** The files and excerpts the Director would receive for that commit (no model call). */
+  localContextPreview: (id: string, req: { ref: string; commit: string; title: string; description: string }) =>
+    call<{ source: ResolvedSource; context: Extract<SourceContext, { kind: "github" }>; text: string; textSha256: string | null }>(`/api/projects/${encodeURIComponent(id)}/context-preview`, { method: "POST", body: JSON.stringify(req) }),
   /** Execution settings (names of variables only) + editable suggestions detected by the executor. */
   projectConfig: (id: string, workDir?: string) => call<{ project: LocalProject; config: ProjectRunConfig | null; detection: ProjectRunDetection; supportedManagers: string[] }>(`/api/projects/${encodeURIComponent(id)}/config${workDir !== undefined ? `?workDir=${encodeURIComponent(workDir)}` : ""}`),
   saveProjectConfig: (id: string, config: unknown, acknowledgeCodeExecution: boolean) => call<{ project: LocalProject; config: ProjectRunConfig }>(`/api/projects/${encodeURIComponent(id)}/config`, { method: "PUT", body: JSON.stringify({ config, acknowledgeCodeExecution }) }),

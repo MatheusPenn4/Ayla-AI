@@ -106,6 +106,12 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "POST" && p === "/v1/projects") return await service.registerProject(await readJson(req));
     r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})$/.exec(p);
     if (m === "DELETE" && r) return await service.removeProject(r[1]);
+    r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})\/refs$/.exec(p);
+    if (m === "GET" && r) return await service.projectRefs(r[1]);
+    r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})\/resolve$/.exec(p);
+    if (m === "GET" && r) return await service.resolveSource(r[1], url.searchParams.get("ref"), url.searchParams.get("commit"));
+    r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})\/context-preview$/.exec(p);
+    if (m === "POST" && r) return await service.contextPreview(r[1], await readJson(req));
     r = /^\/v1\/projects\/([A-Za-z0-9-]{4,64})\/config$/.exec(p);
     if (m === "GET" && r) return await service.projectConfig(r[1], url.searchParams.get("workDir"));
     if (m === "PUT" && r) return await service.saveProjectConfig(r[1], await readJson(req));

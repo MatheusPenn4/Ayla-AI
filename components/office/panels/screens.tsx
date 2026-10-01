@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { AlertTriangle, ArrowRight, BriefcaseBusiness, CheckCircle2, ClipboardList, Code2, FolderOpen, GitBranch, Loader2, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowRight, BriefcaseBusiness, CheckCircle2, ClipboardList, Code2, FolderGit2, FolderOpen, GitBranch, Loader2, Pencil, Plus, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Avatar } from "../avatar";
 import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
@@ -11,12 +11,13 @@ import { CONNECTION_STATE_LABEL, connectionLabel, connectionStatusFor } from "@/
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type EngineStatus } from "@/lib/engine/types";
 import type { useRuns } from "@/hooks/use-runs";
 import { StatusBadge } from "./run-dialog";
+import { LocalContextReview } from "./local-source";
 import { isHandoffTarget, taskState } from "@/lib/engine/handoff-state";
 
 type RunsApi = ReturnType<typeof useRuns>;
 import { presetUpdate } from "@/lib/office/profile";
 import { PHASE_LABEL } from "@/lib/office/phase";
-import type { Agent, Demand } from "@/lib/office/types";
+import type { Agent, Demand, LocalSource } from "@/lib/office/types";
 
 const when = (iso: string) => {
   const d = new Date(iso);
@@ -112,12 +113,15 @@ function EngineBanner({ runs, director, onOpenDirector }: { runs: RunsApi; direc
   );
 }
 
-export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgent, onPlan, onOpenRun }: {
+export function DemandQueue({ demands, agents, runs, onNew, onRemove, onEdit, onUpdate, onOpenAgent, onPlan, onOpenRun }: {
   demands: Demand[];
   agents: Agent[];
   runs: RunsApi;
   onNew: () => void;
   onRemove: (id: string) => void;
+  onEdit: (d: Demand) => void;
+  /** Replaces a demand (e.g. "use the current SHA" of a local source). */
+  onUpdate: (d: Demand) => void;
   onOpenAgent: (id: string) => void;
   onPlan: (d: Demand) => void;
   onOpenRun: (runId: string) => void;
@@ -126,6 +130,8 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
   const [payloadFor, setPayloadFor] = useState<Demand | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
   const [planConfirm, setPlanConfirm] = useState<string | null>(null);
+  /** Local-source demands: whether the review of the context is ready (the plan button waits for it). */
+  const [reviewReady, setReviewReady] = useState(false);
   const list = useMemo(() => (filter === "all" ? demands : demands.filter(d => d.recipient === filter)), [demands, filter]);
   const recipients = [...new Set(demands.map(d => d.recipient))];
   const director = agents.find(a => a.id === "director");
@@ -169,13 +175,15 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
                 {d.source === "github" && d.repo && <a href={d.repo.url} target="_blank" rel="noopener noreferrer"><GitBranch size={14} />{d.repo.owner}/{d.repo.repo}{d.repo.branch ? ` · ${d.repo.branch}` : ""}</a>}
                 {d.source === "github" && !d.repo && d.sourceLabel && <span><GitBranch size={14} />{d.sourceLabel}</span>}
                 {d.source === "folder" && <span title="O Diretor recebe só os metadados; os arquivos não são lidos nesta fase"><FolderOpen size={14} />{d.folder?.name ?? d.sourceLabel} · {(d.folder?.fileCount ?? d.fileCount).toLocaleString("pt-BR")} arquivos{d.folder?.totalBytes ? ` · ${formatBytes(d.folder.totalBytes)}` : ""} · arquivos não serão lidos</span>}
+                {d.source === "local" && d.local && <span title="O Diretor lê arquivos commitados deste projeto, no SHA exato mostrado, sem consultar o GitHub"><FolderGit2 size={14} />{d.local.projectLabel} · {d.local.ref || "HEAD"} · <code className="sha">{d.local.commit.slice(0, 12)}</code></span>}
                 {d.source === "none" && <span>Sem fonte</span>}
                 <span className="grow" />
+                <button className="btn-ghost" onClick={() => onEdit(d)} aria-label={`Editar ${d.title}`}><Pencil size={14} /> Editar</button>
                 <button className="btn-ghost" onClick={() => setPayloadFor(d)}><Code2 size={14} /> Payload</button>
                 <button className="btn-ghost danger" onClick={() => setConfirm(d.id)} aria-label={`Remover ${d.title}`}><Trash2 size={14} /></button>
               </div>
               <div className="run-row">
-                <button className="btn-primary small" disabled={active || sending || !runs.status?.executionEnabled} onClick={() => setPlanConfirm(d.id)} title={!runs.status?.executionEnabled ? runs.status?.disabledReason ?? "Executor local indisponível" : undefined}>
+                <button className="btn-primary small" disabled={active || sending || !runs.status?.executionEnabled} onClick={() => { setReviewReady(false); setPlanConfirm(d.id); }} title={!runs.status?.executionEnabled ? runs.status?.disabledReason ?? "Executor local indisponível" : undefined}>
                   {sending ? <><Loader2 size={14} className="spin" /> Enviando…</> : active ? <><Loader2 size={14} className="spin" /> {latest?.status === "queued" ? "Na fila do executor…" : "Diretor planejando…"}</> : <><Sparkles size={14} /> {latest ? "Planejar novamente" : "Planejar com o Diretor"}</>}
                 </button>
                 {latest && <button className="btn-secondary small" onClick={() => onOpenRun(latest.id)}>Ver execução</button>}
@@ -218,8 +226,9 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onOpenAgen
                   {latest
                     ? <>Replanejar “{d.title}”? Isso chama de verdade o {connectionLabel(director?.connection ?? "none")} do Diretor e consome uso real da sua assinatura; o plano atual fica no histórico.</>
                     : <>Iniciar o planejamento de “{d.title}” com o Diretor? Isso chama de verdade o {connectionLabel(director?.connection ?? "none")} e consome uso real da sua assinatura.</>}
+                  {d.source === "local" && <LocalContextReview key={`${d.local?.projectId}:${d.local?.commit}`} demand={d} onState={s => setReviewReady(s.ready)} onUpdateDemand={(l: LocalSource) => onUpdate({ ...d, local: l, sourceLabel: `${l.projectLabel} · ${l.ref || "HEAD"} · ${l.commit.slice(0, 12)}` })} />}
                   <button className="btn-secondary" onClick={() => setPlanConfirm(null)}>Cancelar</button>
-                  <button className="btn-primary" disabled={sending} onClick={() => { setPlanConfirm(null); onPlan(d); }}>{latest ? "Replanejar" : "Planejar"}</button>
+                  <button className="btn-primary" disabled={sending || (d.source === "local" && !reviewReady)} onClick={() => { setPlanConfirm(null); onPlan(d); }}>{latest ? "Replanejar" : "Planejar"}</button>
                 </div>
               )}
             </article>

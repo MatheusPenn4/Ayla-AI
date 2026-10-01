@@ -4,6 +4,7 @@
 // Everything read here is untrusted data (see lib/engine/prompt.ts).
 import { createHash } from "node:crypto";
 import type { ConsultedFile, SourceContext } from "@/lib/engine/types";
+import { redactSecretTokens } from "./redact";
 
 export const GITHUB_LIMITS = { maxFiles: 8, maxFileBytes: 24_000, maxTotalChars: 48_000, timeoutMs: 15_000, perRequestMs: 7_000, maxTreeSample: 160 };
 /** Architect: more files, smaller each, fixed commit, selection driven by the task. */
@@ -125,6 +126,23 @@ const DOC_PRIORITY: [RegExp, string][] = [
   [/^(tsconfig\.json|next\.config\.[a-z]+|vite\.config\.[a-z]+|dockerfile)$/i, "configuração"],
 ];
 const SKIP_DIRS = /(^|\/)(node_modules|dist|build|\.next|vendor|coverage|\.git)(\/|$)/;
+/**
+ * Personal configuration, credentials and keys: never part of a context sent to a model, even when the
+ * repository happens to have them committed. (.env.example-style templates are fine; real .env files are not.)
+ */
+export const SENSITIVE_PATH = new RegExp([
+  String.raw`(^|/)\.env(\.(?!(example|sample|template|dist|defaults?)$)[^/]*)?$`,
+  String.raw`(^|/)\.dev\.vars(\.[^/]*)?$`,
+  String.raw`(^|/)\.(npmrc|yarnrc|yarnrc\.yml|pypirc|netrc|git-credentials|gitconfig|dockercfg|htpasswd|pgpass)$`,
+  String.raw`(^|/)\.(ssh|aws|gnupg|azure|kube|docker|config/gcloud)(/|$)`,
+  String.raw`(^|/)\.claude/settings\.local\.json$`,
+  String.raw`\.(pem|key|p12|pfx|jks|keystore|ppk|kdbx)$`,
+  String.raw`(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$`,
+  String.raw`(^|/)(credentials?|secrets?)(\.(json|ya?ml|toml|ini|txt|xml|env|properties))?$`,
+  String.raw`(^|/)service[-_]?account[^/]*\.json$`,
+  String.raw`(^|/)terraform\.tfstate(\.backup)?$`,
+  String.raw`\.tfvars(\.json)?$`,
+].join("|"), "i");
 const TEXT_EXT = /\.(md|mdx|txt|json|ya?ml|toml|ts|tsx|js|jsx|mjs|cjs|py|go|rs|rb|php|java|kt|cs|css|scss|html|sql|sh|env\.example)$/i;
 
 type Fetcher = typeof fetch;
@@ -299,7 +317,10 @@ export async function assembleContext(a: {
 }): Promise<{ context: Extract<SourceContext, { kind: "github" }>; text: string }> {
   const LIM = a.limits;
   const architect = a.selection === "architect";
-  const entries = a.entries;
+  // Protection rules (local projects only; a public repository's files are public anyway): personal
+  // configuration and credentials are not listed, selected or sent — only counted, so the review can say so.
+  const protectedPaths = a.via === "local_git" ? a.entries.filter(e => e.type === "blob" && SENSITIVE_PATH.test(e.path)).map(e => e.path) : [];
+  const entries = protectedPaths.length ? a.entries.filter(e => !SENSITIVE_PATH.test(e.path)) : a.entries;
   const blobs = entries.filter(e => e.type === "blob" && !SKIP_DIRS.test(e.path));
   const textBlobs = blobs.filter(b => TEXT_EXT.test(b.path));
 
@@ -373,8 +394,11 @@ export async function assembleContext(a: {
     const g = got[i];
     if ("skip" in g) { skipped.push({ path: c.path, reason: g.skip }); continue; }
     if (total >= LIM.maxTotalChars) { skipped.push({ path: c.path, reason: "limite de texto enviado ao modelo" }); continue; }
-    const body = g.body;
-    const bytes = new TextEncoder().encode(body).length;
+    const original = g.body;
+    // Local reads: unmistakable credentials in the file text never reach the model (the hash stays that of the original).
+    const scrub = a.via === "local_git" ? redactSecretTokens(original) : { text: original, count: 0 };
+    const body = scrub.text;
+    const bytes = new TextEncoder().encode(original).length;
     const room = Math.min(LIM.maxFileBytes, LIM.maxTotalChars - total);
     let sent: string, header: string, excerpt: ConsultedFile["excerpt"];
     if (architect && body.length > EXCERPT_THRESHOLD) {
@@ -387,15 +411,16 @@ export async function assembleContext(a: {
       header = `--- arquivo: ${c.path}${sent.length < body.length ? ` (truncado: ${sent.length} de ${body.length} caracteres)` : ""} ---`;
     }
     total += sent.length;
-    files.push({ path: c.path, bytes, sentChars: sent.length, truncated: !!excerpt || sent.length < body.length, reason: c.reason, blob: c.blob, sha256: await sha256hex(body), ...(excerpt ? { excerpt } : {}) });
+    files.push({ path: c.path, bytes, sentChars: sent.length, truncated: !!excerpt || sent.length < body.length, reason: c.reason, blob: c.blob, sha256: await sha256hex(original), ...(excerpt ? { excerpt } : {}), ...(scrub.count ? { redactions: scrub.count } : {}) });
     parts.push(`${header}\n${sent}`);
   }
 
   const context: Extract<SourceContext, { kind: "github" }> = {
-    kind: "github", owner: a.owner, repo: a.repo, branch: a.branch, commit: a.commit, visibility: "public", description: a.description, defaultBranch: a.defaultBranch,
+    kind: "github", owner: a.owner, repo: a.repo, branch: a.branch, commit: a.commit, visibility: a.via === "local_git" ? "local" : "public", description: a.description, defaultBranch: a.defaultBranch,
     treeEntries: entries.length, treeTruncated: a.treeTruncated, structureSample, files, skipped,
     limits: { maxFiles: LIM.maxFiles, maxFileBytes: LIM.maxFileBytes, maxTotalChars: LIM.maxTotalChars, timeoutMs: LIM.timeoutMs },
     elapsedMs: Date.now() - a.started, via: a.via, ...(a.local ? { local: a.local } : {}),
+    ...(protectedPaths.length ? { withheld: { count: protectedPaths.length, examples: protectedPaths.slice(0, 6) } } : {}),
   };
   const text = [
     `Descrição do repositório: ${a.description ?? "(sem descrição)"}`,

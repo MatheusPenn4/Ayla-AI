@@ -22,6 +22,7 @@ import { reportedTotal, type ArchitectSnapshot, type CallUsage, type ConnectionI
 import { LOGIN_STEPS } from "./clients";
 import { AgentError, type AgentAdapter, type AgentErrorCode, type AgentProgress } from "./adapters/types";
 import { GithubError, readGithubContext, shrinkGithubText } from "./github";
+import { LocalSourceError, readDirectorLocalContext } from "./local-source";
 import { listLocalRepos, type GitDeps } from "./local-git";
 import { KNOWN_LIMITATIONS } from "./qa";
 import type { AppFixture } from "./qa-browser";
@@ -42,6 +43,9 @@ export type PlannerDeps = {
   github: { fetch?: typeof fetch; token?: string; apiBase?: string; rawBase?: string; permitted: boolean };
   /** Local Git clones authorized for reading — the Developer materializes its isolated copy from here. */
   local?: { dirs: string[]; git: GitDeps };
+  /** Director only, demand source "Projeto local autorizado": the authorized projects, and whether the Director sheet allows reading files. */
+  projects?: ProjectDeps;
+  localReadPermitted?: boolean;
   /** Parent folder for per-call empty working directories. */
   workRoot: string;
   signal?: AbortSignal;
@@ -100,9 +104,14 @@ function directorLimitations(ctx: SourceContext, budget: RunBudget) {
   if (ctx.kind === "none") out.push("Sem fonte do projeto: o plano considera apenas a descrição e os critérios de aceite.");
   if (ctx.kind === "folder") out.push("Os arquivos da pasta local NÃO foram lidos: o Diretor recebeu apenas nome, quantidade, tamanho e extensões. O envio real dos arquivos pertence a uma etapa futura.");
   if (ctx.kind === "github") {
-    out.push(`Leitura parcial do repositório: ${ctx.files.length} arquivo(s) lido(s) (limites: ${ctx.limits.maxFiles} arquivos, ${ctx.limits.maxFileBytes} caracteres por arquivo, ${ctx.limits.maxTotalChars} no total). O restante não foi lido.`);
+    out.push(`Leitura parcial ${ctx.via === "local_git" ? "do projeto local" : "do repositório"}: ${ctx.files.length} arquivo(s) lido(s) (limites: ${ctx.limits.maxFiles} arquivos, ${ctx.limits.maxFileBytes} caracteres por arquivo, ${ctx.limits.maxTotalChars} no total). O restante não foi lido.`);
     if (ctx.files.some(f => f.truncated)) out.push("Alguns arquivos foram lidos apenas em parte (truncados).");
     if (ctx.treeTruncated) out.push("A listagem de arquivos do GitHub veio truncada.");
+    if (ctx.via === "local_git") {
+      out.push(`Só objetos commitados do commit ${ctx.commit.slice(0, 12)} foram lidos (sem GitHub, sem checkout)${ctx.local?.dirty?.count ? `; ${ctx.local.dirty.count} alteração(ões) local(is) não commitada(s) ficaram FORA do contexto` : ""}.`);
+      if (ctx.withheld) out.push(`${ctx.withheld.count} arquivo(s) de configuração pessoal ou credenciais foram omitidos do contexto por proteção (${ctx.withheld.examples.join(", ")}).`);
+      if (ctx.files.some(f => f.redactions)) out.push("Strings com aparência de credencial foram trocadas por [REDACTED] no texto enviado.");
+    }
   }
   return [...out, ...usageNotes(budget)];
 }
@@ -173,6 +182,22 @@ function directorSpec(deps: PlannerDeps, snap: DirectorSnapshot): Spec {
         await store.event(runId, "github_done", `${gh.files.length} arquivo(s) lido(s) do commit ${gh.commit.slice(0, 12)}.`, { files: gh.files.map(f => f.path), skipped: gh.skipped });
       } else if (d.source === "github") {
         fail({ code: "invalid_repo", message: "A demanda tem fonte GitHub, mas sem um repositório válido (dono/repositório).", retryable: false });
+      } else if (d.source === "local") {
+        if (!d.local || !deps.projects) fail({ code: "local_not_authorized", message: "A demanda tem fonte “Projeto local autorizado”, mas este executor não tem os projetos locais disponíveis.", retryable: false, recovery: ["Reinicie o executor (pnpm executor) e tente de novo."] });
+        if (deps.localReadPermitted === false) fail({ code: "local_not_permitted", message: "Leitura de arquivos não permitida: a permissão “Ler arquivos” está desligada na ficha do Diretor.", retryable: false, recovery: ["Ligue a permissão “Ler arquivos” na ficha do Diretor (aba Permissões) ou troque a fonte da demanda."] });
+        const l = d.local!;
+        await store.event(runId, "local_source", `Lendo o projeto local autorizado “${l.projectLabel ?? l.projectId}” no commit ${l.commit.slice(0, 12)}${l.ref ? ` (referência ${l.ref})` : ""}: somente objetos Git, sem GitHub e sem alterações não commitadas.`);
+        try {
+          const r = await readDirectorLocalContext(l, { title: d.title, description: d.description }, deps.projects!);
+          context = r.context;
+          sourceText = r.text;
+        } catch (err) {
+          if (err instanceof LocalSourceError) fail({ code: err.code, message: err.message, retryable: false, recovery: ["Abra a demanda, escolha o projeto e a referência de novo (o SHA resolvido aparece antes de planejar) e tente outra vez."] });
+          if (err instanceof GithubError) fail({ code: err.code, message: err.message, retryable: false });
+          throw err;
+        }
+        const lc = context as Extract<SourceContext, { kind: "github" }>;
+        await store.event(runId, "local_done", `${lc.files.length} arquivo(s) lido(s) do commit ${lc.commit.slice(0, 12)} do projeto local.${lc.local?.dirty?.count ? ` ${lc.local.dirty.count} alteração(ões) não commitada(s) ficaram fora do contexto.` : ""}`, { files: lc.files.map(f => f.path), skipped: lc.skipped, withheld: lc.withheld ?? null, dirty: lc.local?.dirty ?? null, textSha256: lc.local?.textSha256 ?? null });
       } else if (d.source === "folder" && d.folder) {
         context = { kind: "folder", summary: d.folder, note: "Pasta local: apenas metadados disponíveis. O conteúdo dos arquivos não foi enviado nem lido." };
         await store.event(runId, "folder", "Pasta local: o Diretor usará apenas os metadados; os arquivos não foram lidos.");
@@ -185,6 +210,8 @@ function directorSpec(deps: PlannerDeps, snap: DirectorSnapshot): Spec {
       for (let i = 0; i < 3 && context.kind === "github" && budget.sheetTokens > 0 && estimate > budget.sheetTokens * 0.6; i++) {
         const shrunk = shrinkGithubText(context as Extract<SourceContext, { kind: "github" }>, sourceText, Math.floor(sourceText.length * 0.55));
         context = shrunk.ctx; sourceText = shrunk.text;
+        // The hash recorded for a local read must be that of the text actually sent.
+        if (context.kind === "github" && context.local?.textSha256) context = { ...context, local: { ...context.local, textSha256: createHash("sha256").update(sourceText).digest("hex") } };
         user = buildUserMessage({ demand: d, team: snap.team, director: snap.director, allowed, context, sourceText, answers: snap.answers });
         estimate = estimateTokens(system + user + schemaText);
         await store.event(runId, "context_trim", "Contexto do repositório reduzido para caber no orçamento da ficha.", { estimatedInputTokens: estimate });
