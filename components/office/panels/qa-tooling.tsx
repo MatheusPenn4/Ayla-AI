@@ -33,7 +33,7 @@ export function TopologyView({ t }: { t: ConfiguredTopology }) {
 
 /** What really ran: the resolved addresses, the origins the browser was allowed, what the guard refused, CORS diagnoses. */
 export function StackReportView({ r }: { r: StackReport }) {
-  const noise = (t: string) => !r.allowedOrigins.some(a => t.startsWith(a.origin));
+  const notAllowed = (t: string) => !r.allowedOrigins.some(a => t.startsWith(a.origin));
   const blockedByOrigin = Object.entries(r.guard?.byOrigin ?? {}).filter(([, c]) => c.blocked > 0);
   return (
     <section className="run-sec" data-testid="stack-report">
@@ -42,12 +42,12 @@ export function StackReportView({ r }: { r: StackReport }) {
         {r.services.map(s => <li key={s.id}><b>{s.label}</b>{s.main ? " (principal)" : ""}: <code>{s.origin}</code> · porta {s.portKind} {s.port} · pasta {s.dir || "raiz"} · pronto: {s.ready || "—"} · {s.browser ? "acessível ao navegador" : "fora do alcance do navegador"}</li>)}
         {r.links.map(l => <li key={l.name}>Ligação resolvida: <code>{l.name}={l.value}</code> → {l.to.join(", ")}</li>)}
         <li>Origens autorizadas ao navegador: {r.allowedOrigins.map(a => <span key={a.origin}><code>{a.origin}</code> ({a.why}) </span>)}</li>
-        {r.guard && <li>Guarda de rede do navegador: {Object.entries(r.guard.byOrigin).filter(([o]) => r.allowedOrigins.some(a => a.origin === o)).map(([o, c]) => `${o}: ${c.allowed} permitida(s)`).join("; ") || "nenhuma requisição às origens autorizadas"}; {r.guard.blockedTotal} bloqueio(s){blockedByOrigin.length ? ` em ${blockedByOrigin.map(([o, c]) => `${o} (${c.blocked})`).join(", ")}` : ""}.</li>}
-        {r.guard?.blocked.filter(b => noise(b.target) && !/\.(microsoft|bing|office)\.com/.test(b.target)).slice(0, 8).map((b, i) => <li key={i} className="bad">Bloqueado: {b.method} {b.target} — {b.reason}</li>)}
+        {r.guard && <li>Guarda de rede do navegador: {Object.entries(r.guard.byOrigin).filter(([o]) => r.allowedOrigins.some(a => a.origin === o)).map(([o, c]) => `${o}: ${c.allowed} permitida(s)`).join("; ") || "nenhuma requisição às origens autorizadas"}; {r.guard.blockedTotal} bloqueio(s) de requisições da aplicação{blockedByOrigin.length ? ` em ${blockedByOrigin.map(([o, c]) => `${o} (${c.blocked})`).join(", ")}` : ""}{r.guard.browserBackground ? `; mais ${r.guard.browserBackground} do tráfego de fundo do próprio navegador (atualizações, serviços do fornecedor), também recusado` : ""}.</li>}
+        {r.guard?.blocked.filter(b => notAllowed(b.target)).slice(0, 8).map((b, i) => <li key={i} className="bad">Bloqueado: {b.method} {b.target} — {b.reason}</li>)}
         {r.cors.map((c, i) => <li key={i} className="bad">CORS: {c}</li>)}
         <li>Encerramento: {r.stopped || "—"}</li>
       </ul>
-      <small className="muted">Os bloqueios de tráfego do próprio navegador (atualizações, serviços da Microsoft) não são listados aqui; estão no log “guarda-de-rede”. O guarda limita o navegador, não a rede dos comandos do projeto.</small>
+      <small className="muted">O log “guarda-de-rede” (artefato) lista tudo, inclusive o tráfego de fundo do navegador. O guarda limita o navegador, não a rede dos comandos do projeto.</small>
     </section>
   );
 }

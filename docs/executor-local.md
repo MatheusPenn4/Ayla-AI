@@ -101,6 +101,28 @@ O leitor público só vê o que está no GitHub. Se a tarefa fala de código que
 - só objetos commitados são lidos (`git ls-tree`, `git show`, `git merge-base`, `git branch -r --contains`, `git diff-tree --name-only`), com argumentos estruturados e sem shell; sem checkout, sem `status`, sem `fetch`, sem escrita, e **alterações não commitadas nunca entram**;
 - o registro guarda o nome da pasta (não o caminho completo), se o commit está publicado no GitHub (segundo as referências locais `origin/*`) e a relação com o commit do Diretor.
 
+### Projeto local autorizado como fonte da demanda (repositórios privados)
+
+Na demanda, a fonte **Projeto local autorizado** usa um projeto cadastrado em Configurações → Conexões de IA → Projetos locais (o repositório precisa ter o remoto `origin` do GitHub, mesmo privado: nada é consultado lá). Você escolhe o projeto e um branch, tag ou SHA; o executor resolve e mostra o **SHA completo** antes de salvar, e é exatamente esse SHA que o Diretor lê.
+
+- tudo é resolvido pelo **identificador do projeto**; um caminho vindo do navegador nunca autoriza leitura (a pasta só é aceita uma vez, no cadastro);
+- é o mesmo leitor do Arquiteto (`readLocalGitContext`, seleção “diretor”): só objetos commitados do SHA (`ls-tree`/`show`), sem GitHub, sem checkout, sem credenciais do Git; as **alterações não commitadas ficam fora** e são listadas como tal;
+- arquivos pessoais e credenciais (`.env`, `.npmrc`, `.ssh/`, chaves, `credentials.json`…) não são listados nem enviados (só contados); tokens inequívocos dentro de arquivos viram `[REDACTED]` no texto enviado;
+- antes de planejar, a confirmação mostra o SHA, os arquivos e trechos que entram no contexto, o que ficou de fora, o hash do texto e o texto exato; a execução grava projeto, referência, SHA e onde a referência está hoje no snapshot (a referência andar depois não muda o plano);
+- os encaminhamentos mantêm o mesmo projeto e o mesmo commit; trocar de commit continua exigindo motivo, registrado na revisão;
+- demandas antigas (GitHub, pasta, sem fonte) não mudam.
+
+### Frontend e API em portas diferentes (QA com navegador)
+
+Configurar execução aceita **vários processos** (comando, pasta, instalação própria, porta fixa ou dinâmica, prontidão), a origem principal, **origens adicionais exatas** (protocolo, host e porta; locais por padrão, externas só com autorização explícita) e **variáveis de ligação** (ex.: `VITE_API_URL` = origem da API → frontend; `CORS_ORIGIN` = origem do frontend → API).
+
+- todas as portas são escolhidas (ou conferidas, se fixas) antes de iniciar qualquer processo; os endereços resolvidos e as ligações ficam congelados na execução e registrados nas evidências;
+- os processos sobem na ordem, cada um só depois de responder; cancelar ou terminar encerra todos;
+- o navegador roda atrás de um **guarda de rede** (proxy local sem exceção de loopback): só as origens exatas passam; redirecionamentos, event streams e WebSockets são conferidos; o resto leva 403 com o motivo e entra no log. Nunca são aceitos: as portas do executor e da interface (`AYLA_EXECUTOR_PORT` e `AYLA_UI_PORTS`, padrão 5173), serviços locais sensíveis (bancos, Docker, SSH…) e endereços de metadados;
+- o executor **não altera o CORS** do projeto: se a API exigir, o QA mostra o diagnóstico e você configura no ambiente de teste (uma ligação ou variável);
+- esses controles limitam o **navegador**; não isolam a rede dos comandos e scripts do projeto (o isolamento do sistema operacional continua parcial);
+- configurações antigas (um servidor) continuam valendo sem reconfigurar; mudar a configuração depois de preparar uma revisão do QA não altera a revisão (é preciso preparar outra).
+
 ### Caso real da task-1 (26/09/2026)
 
 - **Execução 87768df8** (revisão 1): commit público `0f6cdf6`, que o Diretor tinha lido. O Arquiteto fez 5 perguntas: onde fica a janela de execução do Diretor, qual o tipo do plano, onde o plano fica em memória, o que `tests/profiles.test.ts` cobre, se há utilitário de download. **As cinco eram técnicas**, mas não podiam ser resolvidas em `0f6cdf6`: a janela (`run-dialog.tsx`, `DirectorPlan`, `use-runs.ts`) só existe nos commits locais `ae8e896`/`c878f7b`, **não publicados** (o GitHub continua em `0f6cdf6`).

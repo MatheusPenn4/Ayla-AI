@@ -265,6 +265,9 @@ describe("vários processos de verdade", { timeout: 180_000 }, () => {
     const thirdHost = third.url.replace("http://", "");
     const hops = g.blocked.filter(b => b.target.includes(thirdHost));
     expect(hops).toHaveLength(1);
+    // The browser's own background traffic is refused too, but counted apart: it is not what the page did.
+    expect(typeof g.browserBackground).toBe("number");
+    expect(g.blocked.some(b => /bing|microsoft|office/i.test(b.target))).toBe(false);
     expect(hops[0]).toMatchObject({ method: "GET", target: `${third.url}/dados` });
     expect(hops[0].reason).toContain("não é uma das origens autorizadas");
     expect(g.byOrigin[api.origin].allowed).toBeGreaterThan(3);

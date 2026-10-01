@@ -771,7 +771,7 @@ export type StackReport = {
   allowedOrigins: { origin: string; label: string; why: string; external: boolean }[];
   links: { name: string; value: string; to: string[] }[];
   /** Network-level guard in front of the browser (limits the BROWSER only). */
-  guard: { byOrigin: Record<string, { allowed: number; blocked: number }>; blocked: { at: string; method: string; target: string; reason: string }[]; blockedTotal: number } | null;
+  guard: { byOrigin: Record<string, { allowed: number; blocked: number }>; blocked: { at: string; method: string; target: string; reason: string }[]; blockedTotal: number; /** Refusals of the browser's own background traffic (vendor update/telemetry hosts), counted apart. */ browserBackground?: number } | null;
   /** CORS problems seen by the page, with what to do in the TEST environment (the executor never edits the project's CORS). */
   cors: string[];
   stopped: string;

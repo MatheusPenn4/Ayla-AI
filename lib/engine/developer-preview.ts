@@ -1,13 +1,13 @@
 // Preview of a FUTURE hand-off to the Developer. It is only a view built from
 // the executor's records: it creates no run, calls no model and grants no
-// write access. The Developer does not execute in this phase.
+// write access. The Developer only runs after its own reviewed and approved hand-off.
 import type { TaskStateKey } from "./handoff-state";
 import type { DependencyAnalysis, PlanTask } from "./types";
 
 export const DEVELOPER_PREVIEW_NOTICE = [
   "Esta é apenas uma visualização do futuro envio ao Desenvolvedor.",
   "Ela não cria execução, não chama nenhum modelo e não concede acesso de escrita a nenhum arquivo.",
-  "O Desenvolvedor ainda não executa no Setor IA: nada será editado, commitado, publicado ou enviado a partir dela.",
+  "Nada é editado, commitado, publicado ou enviado a partir desta prévia: o Desenvolvedor só trabalha depois que você revisa e confirma o envio, numa cópia isolada.",
 ];
 
 export type PreviewTaskRow = {

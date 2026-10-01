@@ -27,6 +27,9 @@ export type RunningStack = {
   stop: () => Promise<string>;
 };
 
+/** The browser's own background traffic (update, sync, search suggestions): refused like everything else, but not what the page did. */
+const VENDOR_HOST = /(^|\.)(microsoft\.com|bing\.com|office\.com|office365\.com|msn\.com|live\.com|windows\.net|msftconnecttest\.com|google\.com|googleapis\.com|gstatic\.com|gvt1\.com)$/i;
+const hostOfTarget = (t: string) => { try { return new URL(/^[a-z]+:/i.test(t) ? t : `https://${t}`).hostname; } catch { return t.split(":")[0]; } };
 const origin = (host: string, port: number) => `http://${host}:${port}`;
 const reserved = (port: number, control: number[]) => control.includes(port) || !!SENSITIVE_PORTS[port];
 
@@ -148,7 +151,13 @@ export async function startStack(env: QAEnv, plan: ExecPlan, deps: EnvDeps, o: {
   return {
     url: allowed[0].origin,
     policy: { main: allowed[0].origin, allowed, controlPorts: control, guardPort: guard.port },
-    report: () => ({ ...frozen, guard: guard.stats(), cors: [...cors], stopped }),
+    report: () => {
+      const g = guard.stats();
+      const vendor = (o: string) => VENDOR_HOST.test(hostOfTarget(o));
+      const byOrigin = Object.fromEntries(Object.entries(g.byOrigin).filter(([o]) => !vendor(o)));
+      const background = Object.entries(g.byOrigin).filter(([o]) => vendor(o)).reduce((n, [, c]) => n + c.blocked, 0);
+      return { ...frozen, guard: { byOrigin, blocked: g.blocked.filter(b => !vendor(b.target)), blockedTotal: g.blockedTotal - background, browserBackground: background }, cors: [...cors], stopped };
+    },
     addCors: lines => { for (const l of lines) cors.add(l); },
     stop: async () => {
       const g = guard.stats();
