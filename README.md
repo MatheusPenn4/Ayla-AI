@@ -37,6 +37,8 @@ Pré-requisitos:
 pnpm install
 ```
 
+**Atalho no Windows:** dê duplo clique em `Iniciar Setor IA.cmd`. Ele faz os dois passos abaixo, cada um na sua janela, e abre o navegador quando a interface responde. Se for a primeira vez, instala as dependências antes. `Parar Setor IA.cmd` encerra tudo; ele só mexe em processos do Setor IA. A lógica está em `scripts/iniciar-setor-ia.ps1`.
+
 Em um terminal, o executor local (na primeira vez ele cria `.dev.vars` com o token e a chave da máquina):
 
 ```bash
