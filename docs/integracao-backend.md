@@ -1,6 +1,8 @@
 # Pontos de integração para o backend
 
-> **Atualização (fase 1 do motor):** o Diretor já planeja de verdade pelo executor local, usando Claude Code (assinatura Claude) ou Codex CLI (conta ChatGPT), com leitura limitada de repositórios públicos do GitHub. Veja [executor-local.md](executor-local.md). O restante deste documento descreve o contrato completo da equipe (`DemandPayload`), que continua sem execução: os especialistas não executam e nada é delegado automaticamente.
+> **Atualização (19/10/2026, piloto local):** os cinco colaboradores já executam pelo executor local, sempre com revisão e confirmação sua a cada envio. Nada é delegado automaticamente. O diff do Desenvolvedor pode ser aplicado e verificado num projeto local. O funcionamento real está em [executor-local.md](executor-local.md).
+>
+> Este documento é o registro da fase só de interface: dados locais, fichas e o contrato `DemandPayload`. O `orchestrator` de `lib/integration/contracts.ts` continua `not_connected`; a execução real passa por `lib/engine/client.ts` e pelas rotas `app/api/**`. A lista “O que falta implementar no backend” descreve o plano original. Itens como GitHub, delegação e estados de execução foram resolvidos de outra forma no executor local.
 
 Nesta fase o Setor IA não executa demandas dos especialistas, não envia arquivos da pasta local e não delega tarefas. Este documento lista onde a próxima etapa se encaixa.
 

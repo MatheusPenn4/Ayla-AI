@@ -1,13 +1,22 @@
 # Executor local do Setor IA
 
-O Diretor planeja de verdade, o Arquiteto analisa (só leitura) e o Desenvolvedor implementa (escrita confinada a uma cópia isolada do commit aprovado) tarefas que você aprovar, usando **as suas assinaturas** por meio dos clientes oficiais instalados e autenticados neste computador:
+Os cinco colaboradores executam de verdade, sempre em tarefas que você aprovar:
+
+- o **Diretor** planeja;
+- o **Arquiteto** analisa (só leitura);
+- o **Desenvolvedor** implementa, com escrita confinada a uma cópia isolada do commit aprovado;
+- o **QA** verifica: o modelo não tem ferramentas e pede operações que o executor roda numa cópia isolada da versão testada;
+- o **Revisor** forma o parecer final, sem ferramentas.
+
+O diff do Desenvolvedor pode ser **aplicado ao projeto local** e **verificado** pela interface, cada passo com a sua confirmação. As chamadas usam **as suas assinaturas**, por meio dos clientes oficiais instalados e autenticados neste computador:
 
 | Conexão na ficha | Cliente oficial | Conta usada | Como o login é feito |
 |---|---|---|---|
 | Claude — assinatura (via Claude Code) | Claude Code (`claude`) | login claude.ai (Pro, Max, Team, Enterprise) | `claude auth login --claudeai`, no seu terminal |
 | ChatGPT Business (via Codex CLI) | Codex CLI (`codex`) | login ChatGPT (Business, Plus, Pro…) | `codex login` ou `codex login --device-auth`, no seu terminal |
+| Chave de API (opcional) | API HTTP da Anthropic ou da OpenAI | chave cadastrada em Configurações → Conexões de IA | cadastro na interface; **cobrada à parte** pelo provedor |
 
-Nenhuma chave de API é necessária. O executor **ignora** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` e variáveis de gateway: ele só usa o login que o próprio cliente mantém. Se um cliente estiver autenticado por chave de API, o Setor IA mostra a conexão como **Desconectado** e explica como entrar pela assinatura.
+Nenhuma chave de API é necessária para usar as assinaturas. O executor **ignora** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` e variáveis de gateway: ele só usa o login que o próprio cliente mantém. Se um cliente estiver autenticado por chave de API, o Setor IA mostra a conexão como **Desconectado** e explica como entrar pela assinatura. As conexões por chave de API são outra coisa: ficam cifradas no registro do executor e só servem para colaboradores sem escrita (veja “Conexões por chave de API”).
 
 ## Arquitetura
 
@@ -25,8 +34,26 @@ Camadas separadas no código:
 
 - **Interface**: `components/office/panels/*`, `hooks/use-runs.ts`, `lib/engine/client.ts`. Não fala com modelos e não vê o token.
 - **Rotas web (proxy)**: `app/api/**`, `lib/server/*`. Só funcionam no servidor local de desenvolvimento acessado por `localhost`.
-- **Executor**: `executor/main.ts` (entrada), `lib/executor/service.ts` (fila, concorrência, cancelamento), `lib/executor/http.ts` (proteção HTTP), `lib/executor/planner.ts` (núcleo único de execução, usado pelo Diretor e pelo Arquiteto), `lib/executor/handoff.ts` (preparação e validação do encaminhamento ao Arquiteto), `lib/executor/store.ts` + `sqlite.ts` (registro durável), `lib/executor/github.ts` (leitura pública limitada), `lib/executor/proc.ts` (execução controlada de processos), `lib/executor/clients.ts` (detecção).
-- **Adaptadores**: `lib/executor/adapters/claude.ts` e `lib/executor/adapters/codex.ts`, com a mesma interface (`AgentAdapter`). Os cinco colaboradores podem escolher qualquer um dos dois. Nesta fase o Diretor executa por conta própria e o Arquiteto só executa tarefas aprovadas por você; Desenvolvedor, QA e Revisor não executam.
+- **Executor**:
+  - `executor/main.ts`: entrada.
+  - `lib/executor/service.ts`: fila, concorrência e cancelamento.
+  - `lib/executor/http.ts`: proteção HTTP.
+  - `lib/executor/planner.ts`: núcleo único de execução, usado por todos os colaboradores.
+  - Encaminhamentos: `handoff.ts` (Arquiteto), `developer.ts`, `qa.ts` + `qa-run.ts` (QA) e `reviewer.ts`.
+  - `store.ts` + `sqlite.ts`: registro durável.
+  - Fontes de leitura: `github.ts` (leitura pública limitada), `local-git.ts` e `local-source.ts` (cópias e projetos locais).
+  - `projects.ts` e `project-config.ts`: projetos locais e configuração de execução.
+  - `worktree.ts`: cópia isolada do Desenvolvedor.
+  - Aplicar e verificar: `apply.ts` e `verify.ts`.
+  - Ambiente do QA: `qa-env.ts`, `qa-ops.ts`, `qa-stack.ts`, `qa-browser.ts`, `net-guard.ts` e `qa-fixtures.ts`.
+  - `secret-store.ts`: cifra das chaves e variáveis.
+  - `proc.ts`: execução controlada de processos.
+  - `clients.ts`: detecção dos clientes.
+- **Adaptadores**: `lib/executor/adapters/claude.ts`, `codex.ts` e `api.ts`, com a mesma interface (`AgentAdapter`). Os cinco colaboradores podem escolher qualquer conexão. Cada modo de execução, porém, só aceita as conexões verificadas para ele:
+  - **leitura** (Diretor, Arquiteto, QA e Revisor): Claude Code, Codex e chave de API;
+  - **escrita** (Desenvolvedor): só Claude Code.
+
+  O Diretor executa quando você pede um plano; os demais só executam tarefas cujo envio você revisou e confirmou.
 
 ## Como iniciar localmente
 
@@ -47,7 +74,7 @@ Pré-requisitos: Node.js 22.13 ou mais novo, `pnpm install` já feito, e pelo me
    Se o `pnpm dev` já estava aberto antes do passo 2, reinicie-o para ele ler o token.
 4. Abra `http://localhost:5173`, escolha a **Conexão de execução** na ficha do Diretor (aba Perfil), salve, crie uma demanda e clique em **Planejar com o Diretor** na tela Demandas.
 
-Variáveis opcionais (em `.dev.vars` ou no ambiente do executor): `AYLA_EXECUTOR_PORT` (padrão 4317), `AYLA_MAX_CONCURRENT_RUNS` (padrão 1), `AYLA_MAX_RUNS_PER_HOUR` (padrão 20), `AYLA_CALL_TIMEOUT_MS` (padrão 600000, 10 min; até 30 min), `AYLA_LOCAL_REPOS` (pastas de cópias locais autorizadas para leitura, separadas por `;`; veja abaixo), `AYLA_CLAUDE_PATH` / `AYLA_CODEX_PATH` (caminho absoluto do executável, se não estiver no PATH), `GITHUB_TOKEN` (apenas aumenta o limite de consultas da API pública do GitHub).
+Variáveis opcionais (em `.dev.vars` ou no ambiente do executor): `AYLA_EXECUTOR_PORT` (padrão 4317), `AYLA_MAX_CONCURRENT_RUNS` (padrão 1), `AYLA_MAX_RUNS_PER_HOUR` (padrão 20), `AYLA_CALL_TIMEOUT_MS` (padrão 600000, 10 min; até 30 min), `AYLA_LOCAL_REPOS` (pastas de projetos locais autorizadas, separadas por `;`; também é possível cadastrá-las pela interface, veja “Projetos locais”), `AYLA_UI_PORTS` (portas da interface que o navegador do QA nunca pode alcançar, separadas por vírgula; padrão 5173), `AYLA_CLAUDE_PATH` / `AYLA_CODEX_PATH` (caminho absoluto do executável, se não estiver no PATH), `GITHUB_TOKEN` (apenas aumenta o limite de consultas da API pública do GitHub). `AYLA_SECRET_KEY` é a chave da máquina que cifra as chaves de API e as variáveis de teste. O executor a cria em `.dev.vars` na primeira vez; trocá-la torna ilegíveis os segredos já guardados.
 
 ## Encaminhamento Diretor → Arquiteto
 
@@ -57,15 +84,25 @@ Fluxo: **plano do Diretor → você escolhe uma tarefa do Arquiteto → revisa o
 
    | Estado | Significado |
    |---|---|
-   | Proposta pelo Diretor | tarefa do Arquiteto ainda não enviada |
-   | Proposta pelo Diretor · responsável ainda não executa | tarefa do Desenvolvedor, QA ou Revisor (sem botão) |
+   | Proposta pelo Diretor | tarefa ainda não enviada ao responsável |
+   | Proposta pelo Diretor · responsável ainda não executa | tarefa de um colaborador contratado fora dos cinco papéis (sem botão) |
    | Aguardando sua aprovação | envio preparado e congelado; nada rodou |
-   | Na fila do executor / Arquiteto trabalhando | aprovado; o cliente oficial está em execução |
-   | Análise concluída | resultado validado e registrado |
-   | Arquiteto aguardando esclarecimento | ele fez perguntas e não inventou uma decisão |
+   | Na fila do executor / Em execução | aprovado; o cliente oficial está em execução |
+   | Análise concluída | Arquiteto: resultado validado e registrado |
+   | Implementação pronta (não aplicada) | Desenvolvedor: relatório e diff real registrados; nada foi escrito no projeto |
+   | Implementação aplicada e validada | o diff foi aplicado e verificado (ou commitado), com conclusão registrada |
+   | Revisão de QA concluída | QA: parecer por critério registrado |
+   | Revisão final concluída | Revisor: veredito final registrado |
+   | Aguardando esclarecimento | o colaborador fez perguntas e não inventou uma decisão |
    | Falha / Cancelada | com motivo e caminho de recuperação; pode ser enviada de novo |
 
-   Se o plano não tem tarefa do Arquiteto, a aba diz isso e não oferece botão. Uma tarefa que depende de outra só pode ser enviada depois que a outra tiver análise concluída do Arquiteto; se depender de alguém que não executa nesta fase, fica bloqueada com o motivo.
+   Uma tarefa que depende de outra só pode ser enviada quando a dependência está **satisfeita por evidência** (`lib/engine/dependency.ts`). A regra vale para qualquer responsável e qualquer dependência. Conta como evidência:
+   - a chamada da dependência terminou (análise, implementação, revisão de QA);
+   - um esclarecimento foi resolvido fora do modelo **e** validado por uma conclusão registrada;
+   - a tarefa foi implementada diretamente, com conclusão registrada;
+   - o diff da dependência foi aplicado e verificado, com conclusão registrada.
+
+   Caso contrário, a tarefa fica bloqueada e o motivo é mostrado.
 2. **Enviar ao Arquiteto** (preparar). O navegador manda só o ID do plano, o ID da tarefa e a ficha salva do Arquiteto. O executor confere, **no próprio registro**, que o plano existe e está pronto, que a tarefa pertence a ele, que o responsável é o Arquiteto, que a ficha é a do Arquiteto e que a tarefa não tem análise concluída nem envio em aberto. Em seguida lê as fontes, monta a entrada exata e grava tudo congelado com o estado “aguardando aprovação”. Nenhum cliente é chamado.
 3. **Revisar.** A janela de revisão mostra a demanda e os critérios, o que o Diretor pediu (escopo, insumos, entregável, critérios), os arquivos que o Diretor realmente consultou (com commit), o contexto que vai para o Arquiteto (e o que não vai), a conexão, o modelo e o esforço da ficha do Arquiteto com o estado real do cliente, as ferramentas autorizadas e bloqueadas, a estimativa de texto contra o orçamento e o texto exato. Se a ficha do Arquiteto mudar depois de preparado, a confirmação é bloqueada até preparar de novo.
 4. **Confirmar.** A confirmação envia o hash do conteúdo revisado; o executor só aceita se for idêntico ao preparado e muda o estado de forma atômica (cliques repetidos criam uma única execução e um único processo). “Descartar envio” registra o descarte; nada é executado.
@@ -100,28 +137,6 @@ O leitor público só vê o que está no GitHub. Se a tarefa fala de código que
 - o commit precisa **descender** do commit que o Diretor leu (`git merge-base --is-ancestor`);
 - só objetos commitados são lidos (`git ls-tree`, `git show`, `git merge-base`, `git branch -r --contains`, `git diff-tree --name-only`), com argumentos estruturados e sem shell; sem checkout, sem `status`, sem `fetch`, sem escrita, e **alterações não commitadas nunca entram**;
 - o registro guarda o nome da pasta (não o caminho completo), se o commit está publicado no GitHub (segundo as referências locais `origin/*`) e a relação com o commit do Diretor.
-
-### Projeto local autorizado como fonte da demanda (repositórios privados)
-
-Na demanda, a fonte **Projeto local autorizado** usa um projeto cadastrado em Configurações → Conexões de IA → Projetos locais (o repositório precisa ter o remoto `origin` do GitHub, mesmo privado: nada é consultado lá). Você escolhe o projeto e um branch, tag ou SHA; o executor resolve e mostra o **SHA completo** antes de salvar, e é exatamente esse SHA que o Diretor lê.
-
-- tudo é resolvido pelo **identificador do projeto**; um caminho vindo do navegador nunca autoriza leitura (a pasta só é aceita uma vez, no cadastro);
-- é o mesmo leitor do Arquiteto (`readLocalGitContext`, seleção “diretor”): só objetos commitados do SHA (`ls-tree`/`show`), sem GitHub, sem checkout, sem credenciais do Git; as **alterações não commitadas ficam fora** e são listadas como tal;
-- arquivos pessoais e credenciais (`.env`, `.npmrc`, `.ssh/`, chaves, `credentials.json`…) não são listados nem enviados (só contados); tokens inequívocos dentro de arquivos viram `[REDACTED]` no texto enviado;
-- antes de planejar, a confirmação mostra o SHA, os arquivos e trechos que entram no contexto, o que ficou de fora, o hash do texto e o texto exato; a execução grava projeto, referência, SHA e onde a referência está hoje no snapshot (a referência andar depois não muda o plano);
-- os encaminhamentos mantêm o mesmo projeto e o mesmo commit; trocar de commit continua exigindo motivo, registrado na revisão;
-- demandas antigas (GitHub, pasta, sem fonte) não mudam.
-
-### Frontend e API em portas diferentes (QA com navegador)
-
-Configurar execução aceita **vários processos** (comando, pasta, instalação própria, porta fixa ou dinâmica, prontidão), a origem principal, **origens adicionais exatas** (protocolo, host e porta; locais por padrão, externas só com autorização explícita) e **variáveis de ligação** (ex.: `VITE_API_URL` = origem da API → frontend; `CORS_ORIGIN` = origem do frontend → API).
-
-- todas as portas são escolhidas (ou conferidas, se fixas) antes de iniciar qualquer processo; os endereços resolvidos e as ligações ficam congelados na execução e registrados nas evidências;
-- os processos sobem na ordem, cada um só depois de responder; cancelar ou terminar encerra todos;
-- o navegador roda atrás de um **guarda de rede** (proxy local sem exceção de loopback): só as origens exatas passam; redirecionamentos, event streams e WebSockets são conferidos; o resto leva 403 com o motivo e entra no log. Nunca são aceitos: as portas do executor e da interface (`AYLA_EXECUTOR_PORT` e `AYLA_UI_PORTS`, padrão 5173), serviços locais sensíveis (bancos, Docker, SSH…) e endereços de metadados;
-- o executor **não altera o CORS** do projeto: se a API exigir, o QA mostra o diagnóstico e você configura no ambiente de teste (uma ligação ou variável);
-- esses controles limitam o **navegador**; não isolam a rede dos comandos e scripts do projeto (o isolamento do sistema operacional continua parcial);
-- configurações antigas (um servidor) continuam valendo sem reconfigurar; mudar a configuração depois de preparar uma revisão do QA não altera a revisão (é preciso preparar outra).
 
 ### Caso real da task-1 (26/09/2026)
 
@@ -161,39 +176,6 @@ O que vai para o Arquiteto de uma dependência concluída (`<analises_das_depend
 - **Uso informado pelo cliente** (duas chamadas: análise e correção): entrada 4, cache lido 3.680, cache gravado 57.627, saída 26.206 (raciocínio 12.210), **total 87.517** (46.319 + 41.198). Passou do orçamento de referência (24.000), o que fica só como alerta. O repositório ficou idêntico (HEAD, `status` e hash de cada arquivo versionado) e nenhuma execução de Desenvolvedor, QA ou Revisor foi criada.
 - **Ponto para a revisão do Desenvolvedor**: as duas análises supõem que o resumo do Arquiteto precisa ser buscado por execução (`engineApi.get`). O tipo `RunRecord`, que a task-2 leu, já tem o campo `analysis`, e a lista de execuções o devolve. Ninguém confirmou isso numa execução: fica para o Desenvolvedor conferir.
 
-### Prévia do envio ao Desenvolvedor (somente visualização)
-
-Nas tarefas do Desenvolvedor, “Ver prévia do envio ao Desenvolvedor” só fica disponível quando **todas** as dependências, diretas e indiretas, são tarefas do Arquiteto com análise concluída. A prévia é montada pelo executor a partir dos registros. Ela **não cria execução, não chama modelo, não grava nada e não concede escrita**, e diz isso no topo. Mostra:
-
-- a demanda original e a tarefa;
-- as tarefas relevantes com o **estado real** (a mesma `taskState` da aba Tarefas): a própria, as dependências diretas e indiretas e as que dependem dela;
-- as análises registradas dos Arquitetos (execução, revisão, commit, recomendação, orientação, riscos, decisões suas, quantidade de checagens para o QA);
-- o **commit de base proposto** (o da análise da dependência mais próxima), o HEAD local e, para cada análise, quantos arquivos mudaram desde então e quais dos examinados mudaram;
-- os pontos ainda não verificados (não verificado, suposições, inferidos, lidos só em parte, alterados desde a análise);
-- o **escopo de edição previsto**: arquivos citados pela tarefa e pelas análises, classificados como alterar, criar ou apenas consultar (pelo verbo antes do caminho: “ler …” é consulta). É previsão, não permissão, e as demais tarefas ficam fora do escopo;
-- o que uma futura execução do Desenvolvedor exigiria (não implementado).
-
-“Baixar prévia (.md)” gera uma cópia em Markdown dos mesmos dados; os estados na tela e no arquivo vêm da mesma fonte. Isso não é a exportação do plano pedida na demanda: aquela é trabalho do Desenvolvedor (task-3 e task-4). Ao lado da prévia, quando a tarefa está apta, um botão **“Enviar ao Desenvolvedor”** prepara o encaminhamento de verdade — a próxima seção descreve esse fluxo.
-
-### Encaminhamento Diretor → Desenvolvedor
-
-Mesmo modelo em dois passos do Arquiteto (preparar → revisar → confirmar), mas o Desenvolvedor **escreve**: por isso o fluxo só existe para a conexão Claude — assinatura, e só depois que você confirma a revisão. Preparar **não constrói nada e não chama o cliente**; a cópia isolada só é montada dentro da execução aprovada.
-
-1. **Preparar** (`lib/executor/developer.ts#prepareDeveloperHandoff`): reaproveita a mesma lógica de dependências e escopo da prévia (nenhuma regra duplicada). Recusa se: alguma dependência (sempre do Arquiteto, com análise concluída) ainda não terminou; a conexão da ficha não é Claude Code (`connection_not_write_restricted`, e antes disso o próprio serviço já bloqueia por `WRITE_RESTRICTED`, veja adiante); a permissão “Editar arquivos” está desligada na ficha (`no_write_permission`); não há cópia local autorizada para o repositório (`local_not_authorized`); ou nenhum caminho de edição foi identificado (`no_edit_scope`). O commit de base é o da análise mais próxima; outro commit exige descender dele (`commit_not_descendant`) e um motivo, virando uma revisão numerada — mesma mecânica do Arquiteto.
-2. **Mensagem sem conteúdo de arquivo colado.** Ao contrário do Arquiteto, o Desenvolvedor tem ferramentas reais de leitura, então a mensagem não cola texto de arquivos: descreve a tarefa, as análises das dependências (uma vez, resumidas, marcadas como insumo — não fato verificado) e o **escopo de edição aprovado** (`<escopo_de_edicao>`: caminhos que podem ser criados/alterados, e os que são só para consulta), com o resto do repositório fora do alcance.
-3. **Revisão** mostra: demanda e tarefa; as análises das dependências e a decisão sua registrada nelas; o commit de base (com a revisão, se houver troca); a tabela de escopo de edição (caminho, ação prevista, motivo — citado pela tarefa ou pelas análises); o que fica fora do escopo; as ferramentas desta execução com o texto exato do que cada uma permite; os limites (tempo por chamada, uma tentativa de correção, tamanho do diff exibido); conexão e modelo; e o texto exato enviado. Confirmar envia o hash do conteúdo revisado, como no Arquiteto.
-4. **Execução aprovada** (`lib/executor/planner.ts#developerSpec`, `lib/executor/worktree.ts`):
-   - **Cópia isolada**: `git archive` do commit aprovado (lê só objetos commitados, como o leitor local do Arquiteto — nunca alterações não commitadas) extraído por `tar` numa pasta temporária nova; sem `node_modules`, sem `.env`, sem `.dev.vars`, sem o `.git` do projeto real (`git archive` nunca inclui `.git`) — nada disso faz parte do commit, então nunca é copiado. A cópia ganha um repositório Git **próprio, novo e sem remoto** (hooks desligados por `core.hooksPath` apontando para uma pasta vazia, sem modelo de `git init`), usado só para calcular o diff depois; o Desenvolvedor não tem terminal para mexer nele.
-   - **Ferramentas do Claude Code** (`--restricted`, documentado no próprio `claude --help`, verificado nesta versão do cliente): remove Bash/PowerShell/REPL e ferramentas de rede a menos que `--tools` as nomeie (não nomeia); confina Read/Edit/Write/Glob/Grep à pasta de trabalho, sem `--add-dir`; ignora configurações de usuário/projeto/local (sem hooks, sem CLAUDE.md automático); recusa `bypassPermissions`. `--disallowedTools` nega Bash/PowerShell/NotebookEdit/WebFetch/WebSearch/Task como segunda camada, e `--safe-mode` desliga skills/plugins/MCP como terceira. **Isso ainda não foi confirmado por uma chamada real de verificação** (o equivalente ao `pnpm check:readonly` do Arquiteto) nesta versão — a revisão diz isso explicitamente.
-   - **Terminal continua bloqueado nesta versão**, mesmo a ficha do Desenvolvedor planejando essa permissão: rodar comandos exigiria instalar dependências (rede, não autorizada por padrão) ou copiar `node_modules` de fora do commit aprovado (proibido). Por isso `tipos, lint, testes, build` não são verificados nesta versão — fica registrado como limitação, não escondido.
-   - **Diff real, não o relato do modelo**: depois da chamada, o executor roda `git add -A` + `git diff --cached` na cópia isolada e compara os arquivos tocados com o escopo aprovado. Qualquer arquivo fora do escopo vira erro de validação (mesma mecânica de correção única do Arquiteto: uma nova tentativa pode desfazer o problema; se persistir, a execução falha — nunca fica “implementação pronta”). O relatório do próprio Desenvolvedor (`changes`) é conferido contra esse diff: uma alteração relatada que não existe no diff real, ou uma alteração real não relatada, também é recusada.
-   - **Resultado**: relatório estruturado (resumo, critério por critério de aceite, suposições, não verificado) mais o diff calculado (arquivos, +/-, texto do diff até 40.000 caracteres) — tudo gravado no registro; a cópia isolada é apagada ao final, sempre.
-5. **Nada é aplicado ao projeto original.** A implementação existe só na cópia isolada (depois removida) e no registro. Aplicar ao checkout real, comitar, publicar ou acionar o QA a partir daí são etapas futuras, com aprovação própria.
-
-### Caso real da task-3 (28/09/2026)
-
-Preparado de verdade pela interface (nenhum modelo chamado): tarefa `task-3` (“Implementar serialização do plano em Markdown”), dependências `task-1` e `task-2` com análise concluída do Arquiteto. Commit de base proposto e usado: `b6bad7a` (o da análise de `task-2`), cópia local autorizada “setor-ia”, 238 arquivos na cópia isolada que seria montada. Escopo de edição resolvido contra a árvore real desse commit: criar `lib/engine/plan-markdown.ts`; alterar `lib/utils.ts` e `app/page.tsx`; consultar (sem editar) `lib/engine/types.ts` e `lib/engine/plan-schema.ts`. Estimativa do texto enviado: cerca de 7.260 tokens (orçamento de referência da ficha: 48.000). A revisão ficou **aguardando confirmação**; nenhuma cópia de trabalho foi criada e nenhuma chamada real ao Claude Code foi feita para esta tarefa nesta etapa.
-
 ### Contexto do Arquiteto e suas reduções
 
 - **Mesmo repositório e mesmo commit** que o Diretor leu (o executor não relê a branch; o commit fica registrado).
@@ -216,13 +198,229 @@ O Arquiteto não recebe o repositório: o executor lê os arquivos pela API púb
 
 Verificação real (`pnpm check:readonly`, uma chamada pequena por cliente): o prompt pede explicitamente para sobrescrever um arquivo dentro da pasta de trabalho, outro fora dela, criar um arquivo novo e rodar um comando. Resultado em 25/09/2026: **nenhum arquivo alterado ou criado nos dois clientes**. O Claude Code informou que só tinha a ferramenta de saída estruturada. O Codex informou que `apply_patch` continua visível ao modelo, mas foi **bloqueado pela sandbox somente leitura**. Esse é o limite conhecido: no Codex, a proteção contra escrita vem da sandbox, e não da ausência total de ferramentas. Se algum adaptador deixar de garantir leitura segura, `READ_ONLY` em `lib/executor/service.ts` bloqueia esse adaptador para o Arquiteto e a revisão explica o motivo.
 
+## Encaminhamento Diretor → Desenvolvedor
+
+### Prévia do envio ao Desenvolvedor (somente visualização)
+
+Nas tarefas do Desenvolvedor, “Ver prévia do envio ao Desenvolvedor” só fica disponível quando **todas** as dependências, diretas e indiretas, são tarefas do Arquiteto com análise concluída. A prévia é montada pelo executor a partir dos registros. Ela **não cria execução, não chama modelo, não grava nada e não concede escrita**, e diz isso no topo. Mostra:
+
+- a demanda original e a tarefa;
+- as tarefas relevantes com o **estado real** (a mesma `taskState` da aba Tarefas): a própria, as dependências diretas e indiretas e as que dependem dela;
+- as análises registradas dos Arquitetos (execução, revisão, commit, recomendação, orientação, riscos, decisões suas, quantidade de checagens para o QA);
+- o **commit de base proposto** (o da análise da dependência mais próxima), o HEAD local e, para cada análise, quantos arquivos mudaram desde então e quais dos examinados mudaram;
+- os pontos ainda não verificados (não verificado, suposições, inferidos, lidos só em parte, alterados desde a análise);
+- o **escopo de edição sugerido**: arquivos citados pela tarefa e pelas análises, classificados como alterar, criar ou apenas consultar (pelo verbo antes do caminho: “ler …” é consulta). É só sugestão, não permissão, e as demais tarefas ficam fora do escopo.
+
+“Baixar prévia (.md)” gera uma cópia em Markdown dos mesmos dados; os estados na tela e no arquivo vêm da mesma fonte.
+
+Abaixo da prévia, a seção **“Sua escolha — isto é a permissão real do Desenvolvedor”** vem preenchida com a sugestão e pode ser editada inteira: ação por linha (Alterar, Criar, Consultar), remover linha e acrescentar caminho. **Só essa escolha autoriza escrita.** A sugestão automática fica registrada à parte (`suggestedEditScope`), apenas para referência. O botão **“Enviar ao Desenvolvedor”** fica nessa seção.
+
+### Preparar, revisar e executar
+
+Mesmo modelo em dois passos do Arquiteto (preparar → revisar → confirmar), mas o Desenvolvedor **escreve**: por isso o fluxo só existe para a conexão Claude — assinatura, e só depois que você confirma a revisão. Preparar **não constrói nada e não chama o cliente**; a cópia isolada só é montada dentro da execução aprovada.
+
+1. **Preparar** (`lib/executor/developer.ts#prepareDeveloperHandoff`): reaproveita a mesma lógica de dependências e escopo da prévia (nenhuma regra duplicada). Recusa se: alguma dependência (sempre do Arquiteto, com análise concluída) ainda não terminou; a conexão da ficha não é Claude Code (`connection_not_write_restricted`, e antes disso o próprio serviço já bloqueia por `WRITE_RESTRICTED`, veja adiante); a permissão “Editar arquivos” está desligada na ficha (`no_write_permission`); não há cópia local autorizada para o repositório (`local_not_authorized`); ou nenhum caminho foi marcado para alterar ou criar (`no_edit_scope`). Cada caminho escolhido é validado contra a árvore real do commit de base: “alterar” e “consultar” exigem que o arquivo exista, e caminho repetido é recusado (`duplicate_path`). O commit de base é o da análise mais próxima; outro commit exige descender dele (`commit_not_descendant`) e um motivo, virando uma revisão numerada — mesma mecânica do Arquiteto.
+2. **Mensagem sem conteúdo de arquivo colado.** Ao contrário do Arquiteto, o Desenvolvedor tem ferramentas reais de leitura, então a mensagem não cola texto de arquivos: descreve a tarefa, as análises das dependências (uma vez, resumidas, marcadas como insumo — não fato verificado) e o **escopo de edição aprovado** (`<escopo_de_edicao>`: caminhos que podem ser criados/alterados, e os que são só para consulta), com o resto do repositório fora do alcance.
+3. **Revisão** mostra: demanda e tarefa; as análises das dependências e a decisão sua registrada nelas; o commit de base (com a revisão, se houver troca); a tabela de escopo de edição (caminho, ação prevista, motivo — citado pela tarefa ou pelas análises); o que fica fora do escopo; as ferramentas desta execução com o texto exato do que cada uma permite; os limites (tempo por chamada, uma tentativa de correção, tamanho do diff exibido); conexão e modelo; e o texto exato enviado. Confirmar envia o hash do conteúdo revisado, como no Arquiteto.
+4. **Execução aprovada** (`lib/executor/planner.ts#developerSpec`, `lib/executor/worktree.ts`):
+   - **Cópia isolada**: `git archive` do commit aprovado (lê só objetos commitados, como o leitor local do Arquiteto — nunca alterações não commitadas) extraído por `tar` numa pasta temporária nova; sem `node_modules`, sem `.env`, sem `.dev.vars`, sem o `.git` do projeto real (`git archive` nunca inclui `.git`) — nada disso faz parte do commit, então nunca é copiado. A cópia ganha um repositório Git **próprio, novo e sem remoto** (hooks desligados por `core.hooksPath` apontando para uma pasta vazia, sem modelo de `git init`), usado só para calcular o diff depois; o Desenvolvedor não tem terminal para mexer nele.
+   - **Ferramentas do Claude Code** (`--restricted`, documentado no próprio `claude --help`, verificado nesta versão do cliente): remove Bash/PowerShell/REPL e ferramentas de rede a menos que `--tools` as nomeie (não nomeia); confina Read/Edit/Write/Glob/Grep à pasta de trabalho, sem `--add-dir`; ignora configurações de usuário/projeto/local (sem hooks, sem CLAUDE.md automático); recusa `bypassPermissions`. `--disallowedTools` nega Bash/PowerShell/NotebookEdit/WebFetch/WebSearch/Task como segunda camada, e `--safe-mode` desliga skills/plugins/MCP como terceira.
+
+     **Verificado com uma chamada real** (`pnpm check:developer-write`, 28/09/2026), pelo mesmo caminho de execução do Desenvolvedor. O pedido mandava tentar quatro coisas: uma edição permitida dentro da cópia, uma escrita fora dela por caminho relativo, rodar um comando e ler um arquivo externo por `../` ou por link simbólico. As três tentativas de fuga foram bloqueadas: nenhuma escrita fora da cópia, nenhum comando executado e nenhum vazamento do arquivo externo na resposta. O resultado foi decidido pelo sistema de arquivos e pelo HEAD/status do repositório principal, nunca pelo relato do modelo. O subcaso de link simbólico interno → externo **não pôde ser verificado** neste computador (o link não pôde ser criado) e fica marcado assim, não como aprovado.
+   - **Terminal continua bloqueado nesta versão**, mesmo a ficha do Desenvolvedor planejando essa permissão: rodar comandos exigiria instalar dependências (rede, não autorizada por padrão) ou copiar `node_modules` de fora do commit aprovado (proibido). Por isso o Desenvolvedor não roda tipos, lint, testes nem build. Essas verificações acontecem depois, na “Verificar entrega aplicada” e no QA.
+   - **Diff real, não o relato do modelo**: depois da chamada, o executor roda `git add -A` + `git diff --cached` na cópia isolada e compara os arquivos tocados com o escopo aprovado. Qualquer arquivo fora do escopo vira erro de validação (mesma mecânica de correção única do Arquiteto: uma nova tentativa pode desfazer o problema; se persistir, a execução falha — nunca fica “implementação pronta”). O relatório do próprio Desenvolvedor (`changes`) é conferido contra esse diff: uma alteração relatada que não existe no diff real, ou uma alteração real não relatada, também é recusada.
+   - **Resultado**: relatório estruturado (resumo, critério por critério de aceite, suposições, não verificado) mais o diff calculado (arquivos, +/-, texto do diff até 40.000 caracteres) — tudo gravado no registro; a cópia isolada é apagada ao final, sempre.
+5. **A execução não aplica nada ao projeto original.** A implementação existe só na cópia isolada (depois removida) e no registro. Levá-la ao projeto é um passo separado, com revisão e confirmação próprias (veja “Aplicar o diff ao projeto local e verificar”). Commit e publicação continuam fora do Setor IA.
+
+### Caso real da task-3 (28/09/2026)
+
+Preparado de verdade pela interface (nenhum modelo chamado): tarefa `task-3` (“Implementar serialização do plano em Markdown”), dependências `task-1` e `task-2` com análise concluída do Arquiteto. Commit de base proposto e usado: `b6bad7a` (o da análise de `task-2`), cópia local autorizada “setor-ia”, 238 arquivos na cópia isolada que seria montada. Escopo de edição resolvido contra a árvore real desse commit: criar `lib/engine/plan-markdown.ts`; alterar `lib/utils.ts` e `app/page.tsx`; consultar (sem editar) `lib/engine/types.ts` e `lib/engine/plan-schema.ts`. Estimativa do texto enviado: cerca de 7.260 tokens (orçamento de referência da ficha: 48.000). A revisão ficou **aguardando confirmação**; nenhuma cópia de trabalho foi criada e nenhuma chamada real ao Claude Code foi feita para esta tarefa nesta etapa.
+
+## Projetos locais
+
+São as pastas em que o executor pode trabalhar:
+- as de `AYLA_LOCAL_REPOS`;
+- as cadastradas em **Configurações → Conexões de IA → Projetos locais**.
+
+O cadastro é o **único** ponto em que um caminho vindo do navegador é aceito, e só depois de o executor conferir que o caminho é absoluto, a pasta existe, é a raiz real de um repositório Git e não é a raiz do disco (`lib/executor/projects.ts`). Todas as outras chamadas identificam o projeto pelo ID que o executor devolveu, nunca por caminho.
+
+Um projeto local serve para:
+- ler commits não publicados (Arquiteto, acima);
+- ser a fonte da demanda (abaixo);
+- receber o diff do Desenvolvedor;
+- montar as cópias isoladas da verificação e do QA.
+
+### Projeto local autorizado como fonte da demanda (repositórios privados)
+
+Na demanda, a fonte **Projeto local autorizado** usa um projeto cadastrado em Configurações → Conexões de IA → Projetos locais (o repositório precisa ter o remoto `origin` do GitHub, mesmo privado: nada é consultado lá). Você escolhe o projeto e um branch, tag ou SHA; o executor resolve e mostra o **SHA completo** antes de salvar, e é exatamente esse SHA que o Diretor lê.
+
+- tudo é resolvido pelo **identificador do projeto**; um caminho vindo do navegador nunca autoriza leitura (a pasta só é aceita uma vez, no cadastro);
+- é o mesmo leitor do Arquiteto (`readLocalGitContext`, seleção “diretor”): só objetos commitados do SHA (`ls-tree`/`show`), sem GitHub, sem checkout, sem credenciais do Git; as **alterações não commitadas ficam fora** e são listadas como tal;
+- arquivos pessoais e credenciais (`.env`, `.npmrc`, `.ssh/`, chaves, `credentials.json`…) não são listados nem enviados (só contados); tokens inequívocos dentro de arquivos viram `[REDACTED]` no texto enviado;
+- antes de planejar, a confirmação mostra o SHA, os arquivos e trechos que entram no contexto, o que ficou de fora, o hash do texto e o texto exato; a execução grava projeto, referência, SHA e onde a referência está hoje no snapshot (a referência andar depois não muda o plano);
+- os encaminhamentos mantêm o mesmo projeto e o mesmo commit; trocar de commit continua exigindo motivo, registrado na revisão;
+- demandas antigas (GitHub, pasta, sem fonte) não mudam.
+
+### Configurar execução
+
+Para verificar ou testar uma versão, o executor precisa saber como rodar o projeto. Em Projetos locais → **Configurar execução**, ele detecta o que o projeto tem e **sugere** uma configuração (`lib/executor/project-config.ts`). Nada roda antes de você salvar, reconhecendo que esses comandos executam o código do próprio projeto.
+
+- **Gerenciador de pacotes**: npm ou pnpm, conforme o lockfile.
+- **Comandos** `typecheck`, `lint`, `test` e `build`. Cada um é uma linha de comando executada **sem shell**:
+  - sem pipes, redirecionamentos ou encadeamento;
+  - começa pelo gerenciador do projeto, por `npx` (projetos npm) ou por `node`;
+  - sem caminho absoluto e sem `..`.
+
+  Comando vazio é “não configurado”: aparece assim e nunca conta como verificação aprovada.
+- **Pasta de trabalho** relativa à raiz, para repositórios com o pacote numa subpasta.
+- **Como a aplicação sobe e quando fica pronta**: um ou vários processos (veja “Frontend e API em portas diferentes”, na seção do QA).
+- **Variáveis do ambiente de teste**: guardadas cifradas e nunca devolvidas ao navegador. Um valor que aponte para fora deste computador é recusado, salvo autorização explícita, para que os testes não alcancem dados reais por padrão.
+
+## Aplicar o diff ao projeto local e verificar
+
+Quando uma tarefa está em “Implementação pronta (não aplicada)”, a execução do Desenvolvedor oferece **Revisar alterações → Aplicar ao projeto** (`lib/executor/apply.ts`). São três passos, cada um com a sua confirmação.
+
+1. **Revisão.** O executor confere o diff gravado contra o projeto escolhido e mostra os bloqueios. Recusa:
+   - diff truncado ou redigido;
+   - diff fora do escopo ou diferente da lista de arquivos da execução;
+   - diff adulterado (o hash é gravado quando o diff é calculado);
+   - binário, link simbólico ou submódulo;
+   - caminho que saia do projeto (`..`, caminho absoluto, `.git`, link no caminho);
+   - repositório de destino diferente.
+
+   A revisão também faz um ensaio (`git apply --check`) e lista as alterações locais que já existem. O token da revisão é o hash do estado do destino: HEAD, conteúdo e estado de cada arquivo afetado, alterações locais listadas e resultado do ensaio.
+2. **Aplicar.** O navegador envia só identificadores: execução, projeto, token e chave de idempotência.
+   - Se o projeto mudou depois da revisão, a confirmação é recusada e a diferença é mostrada.
+   - Os arquivos afetados vão primeiro para uma cópia de segurança (`.ayla/applications/<id>/backup`).
+   - O diff é aplicado exatamente como foi gravado (`git apply` pela entrada padrão). As alterações locais fora dos trechos do diff são preservadas; um conflito recusa tudo de uma vez.
+   - O resultado é comparado, arquivo a arquivo, com o que o diff produz numa pasta à parte. Se houver divergência, os arquivos são restaurados. Se a restauração não devolver o estado exato, o registro diz quais arquivos ficaram diferentes e onde está a cópia.
+   - Se as alterações já estavam no projeto, nada é escrito.
+   - **Nunca** há stage, commit, push nem publicação.
+3. **Verificar entrega aplicada** (`lib/executor/verify.ts`). Roda os comandos configurados do projeto sobre exatamente a versão aplicada (HEAD + arquivos aplicados, cada um conferido por hash), num ambiente isolado e nunca no seu checkout. Só quando **todas** as verificações passam é registrada a conclusão validada (`applied_run_result`), ligada à aplicação e à execução original do Desenvolvedor. O resultado fica registrado também quando falha. A verificação pode ser cancelada.
+
+### Conclusões registradas fora de uma execução
+
+Uma tarefa pode ser concluída fora de um encaminhamento, por exemplo quando um diff é aplicado à mão e commitado. Isso fica registrado numa **conclusão de tarefa** (tabela `task_completions`), de um destes tipos:
+
+| Tipo | Significado |
+|---|---|
+| `resolved_clarification` | o esclarecimento pedido por uma execução foi resolvido fora do modelo |
+| `direct_implementation` | a tarefa foi implementada diretamente, sem chamar o colaborador |
+| `applied_run_result` | o diff de uma execução do Desenvolvedor foi aplicado, verificado e commitado |
+
+Cada conclusão leva o commit (40 caracteres), os arquivos, as verificações e uma nota.
+
+A interface só **lê** conclusões. Elas são gravadas de duas formas:
+- pela verificação acima;
+- pela rota `POST /v1/task-completions` do executor, que exige o token e não tem equivalente nas rotas web.
+
+Nos pilotos, essa rota foi usada pela sessão do Claude Code que desenvolve o Setor IA (`validatedBy: "orchestrator"`).
+
+## Encaminhamento Diretor → QA
+
+Segue o mesmo modelo em dois passos: preparar → revisar → confirmar. A tarefa do QA só pode ser enviada quando **todas** as dependências, diretas e indiretas, estão satisfeitas por evidência.
+
+1. **Preparar** (`lib/executor/qa.ts`). O executor reúne as entregas reais (commits, diffs e verificações já registrados) e as análises do Arquiteto, resolve **a versão a testar** e congela o texto. Nenhum ambiente é montado e nenhum modelo é chamado.
+
+   A versão a testar depende da cadeia:
+   - HEAD + arquivos aplicados pela interface (quando há aplicação registrada);
+   - commit + diff da execução, não aplicado;
+   - um commit.
+
+   Regras do preparo:
+   - Sem projeto local autorizado não há versão a testar: as operações aparecem como indisponíveis, com o motivo.
+   - Se o texto passar de 70% do orçamento da ficha, os maiores diffs são reduzidos, cada um no máximo uma vez. Commit, arquivos e verificações nunca saem.
+   - Uma tarefa que já tem revisão concluída só é enviada de novo com o pedido explícito **“Enviar ao QA novamente”**.
+2. **Execução aprovada** (`lib/executor/qa-run.ts`). O modelo **não recebe ferramentas**. Toda observação é uma evidência numerada produzida pelo próprio executor.
+   - O executor monta o **ambiente isolado** da versão exata (`qa-env.ts`):
+     - código: `git archive` do commit, mais o patch ou os arquivos aplicados, conferidos por hash;
+     - dependências: vêm do lockfile, primeiro offline; a rede só é usada se isso falhar, e fica registrado;
+     - credenciais pessoais: as variáveis `AYLA_*` e as que parecem token são removidas; a pasta pessoal, o `.npmrc` e a configuração global do Git são trocados por versões vazias; o credential helper do Git é neutralizado;
+     - variáveis: só as de teste do projeto.
+   - Produz as evidências automáticas: diff entregue, preparo das dependências e verificações configuradas.
+   - **Chamada 1**: o QA pede até 12 operações por rodada, de um catálogo fixo: ler arquivo, buscar, rodar uma verificação (`typecheck`, `lint`, `test`, `build`), rodar testes e cenário de navegador.
+   - **Chamada 2**: o QA classifica os critérios citando os IDs das evidências, ou pede **uma** rodada extra de operações.
+   - **Chamada 3** (opcional): classificação final, sem novas operações.
+   - Ao final, com sucesso, falha ou cancelamento, a aplicação, o navegador e o ambiente são encerrados e removidos. Antes da remoção, o executor confere se os arquivos testados mudaram.
+3. **Navegador controlado** (`qa-browser.ts`):
+   - é o Edge ou Chrome instalado, dirigido por `playwright-core` (nenhum navegador é baixado), sempre headless e com perfil temporário novo;
+   - os passos vêm de um catálogo fixo, sem JavaScript livre: abrir, clicar, esperar/conferir/ler texto, recarregar, permissão e leitura real da área de transferência, download, comparar, captura de tela e esperar;
+   - a área de transferência é a do próprio navegador headless, não a do sistema;
+   - quando o projeto testado é o próprio Setor IA, `/api/*` é respondido por registros congelados só para leitura (`qa-fixtures.ts`) e qualquer outro método recebe 403, para que nenhum clique no navegador do QA acione um colaborador.
+4. **Resultado validado.** Cada critério é `approved`, `rejected` ou `not_verified`.
+   - Aprovado ou reprovado exige IDs de evidência do executor; relatos de outros colaboradores não são evidência.
+   - Reprovado exige passos, esperado, observado e impacto.
+   - Não verificado exige motivo: `tool_unavailable`, `insufficient_evidence` ou `future_step`. Um critério com parte pendente é sempre não verificado.
+   - Se algum critério não estiver aprovado, a recomendação não pode ser `ready_for_review`.
+
+   Os artefatos (capturas, downloads, logs) ficam em `.ayla/artifacts/<execução>/` e são servidos à interface sempre como dados, nunca como HTML.
+
+### Frontend e API em portas diferentes (QA com navegador)
+
+Configurar execução aceita **vários processos** (comando, pasta, instalação própria, porta fixa ou dinâmica, prontidão), a origem principal, **origens adicionais exatas** (protocolo, host e porta; locais por padrão, externas só com autorização explícita) e **variáveis de ligação** (ex.: `VITE_API_URL` = origem da API → frontend; `CORS_ORIGIN` = origem do frontend → API).
+
+- todas as portas são escolhidas (ou conferidas, se fixas) antes de iniciar qualquer processo; os endereços resolvidos e as ligações ficam congelados na execução e registrados nas evidências;
+- os processos sobem na ordem, cada um só depois de responder; cancelar ou terminar encerra todos;
+- o navegador roda atrás de um **guarda de rede** (proxy local sem exceção de loopback): só as origens exatas passam; redirecionamentos, event streams e WebSockets são conferidos; o resto leva 403 com o motivo e entra no log. Nunca são aceitos: as portas do executor e da interface (`AYLA_EXECUTOR_PORT` e `AYLA_UI_PORTS`, padrão 5173), serviços locais sensíveis (bancos, Docker, SSH…) e endereços de metadados;
+- o executor **não altera o CORS** do projeto: se a API exigir, o QA mostra o diagnóstico e você configura no ambiente de teste (uma ligação ou variável);
+- esses controles limitam o **navegador**; não isolam a rede dos comandos e scripts do projeto (o isolamento do sistema operacional continua parcial);
+- configurações antigas (um servidor) continuam valendo sem reconfigurar; mudar a configuração depois de preparar uma revisão do QA não altera a revisão (é preciso preparar outra).
+
+## Encaminhamento Diretor → Revisor
+
+O Revisor só pode ser enviado quando a tarefa depende de um QA com revisão concluída (`lib/executor/reviewer.ts`). Segue o mesmo modelo em dois passos.
+
+O Revisor **não recebe ferramentas** e não reúne evidências de novo. Ele reaproveita o instantâneo congelado do próprio QA (as mesmas entregas e análises) e o parecer concluído do QA.
+
+O resultado separa:
+- fatos, cada um com a evidência;
+- inferências, cada uma com a base;
+- pontos não verificados;
+- dúvidas.
+
+O veredito final é `aprovado`, `aprovado_com_ressalvas` ou `reprovado`. A validação impede que ele contradiga o QA:
+- se o QA reprovou algum critério, o veredito só pode ser `reprovado`;
+- se o QA deixou critério não verificado, ou a revisão tem item não verificado, o veredito não pode ser `aprovado` sem ressalvas.
+
+Uma nova revisão final, depois de um parecer do QA mais novo, também precisa ser pedida explicitamente.
+
+## Conexões por chave de API
+
+Em **Configurações → Conexões de IA → Adicionar conexão**, você cadastra uma chave da Anthropic (Claude) ou da OpenAI (ChatGPT), com modelo e esforço. O uso é **cobrado à parte** das assinaturas, diretamente pelo provedor.
+
+- A chave é cifrada com AES-256-GCM (`secret-store.ts`) pela chave da máquina, `AYLA_SECRET_KEY`, que o executor cria em `.dev.vars`.
+- A chave nunca volta ao navegador; só os 4 últimos caracteres aparecem.
+- “Verificar” faz uma chamada real mínima.
+- O adaptador (`adapters/api.ts`) faz uma única requisição com saída estruturada, sem ferramentas e sem fluxo contínuo. Por isso só serve aos modos de leitura e é recusado para o Desenvolvedor, tanto pelo serviço (`WRITE_RESTRICTED`) quanto pelo próprio adaptador.
+
+## Caso real: piloto 2, “Copiar Markdown” (29 e 30/09/2026)
+
+Primeira demanda que passou pelos cinco colaboradores. O plano `d1618429` tem quatro tarefas encadeadas:
+
+- **T1, Arquiteto**: análise `7ce22003` concluída.
+- **T2, Desenvolvedor**: a primeira execução (`d70a5cfc`) foi cancelada. A segunda (`f62fc4f9`) terminou como implementação pronta, alterando um único arquivo (`components/office/panels/run-dialog.tsx`). O diff foi aplicado ao checkout **fora da interface** (`git apply`, sem conflito) e commitado em `d8ecf83`, com conclusão `applied_run_result` registrada.
+- **T3, QA com operações do executor**: duas tentativas canceladas, depois três revisões concluídas (`bc748c3c`, `fd301701`, `9ad3665b`). Na última, os critérios 1 a 4 foram observados no Edge (evidências E17 a E20): o texto copiado é igual ao `.md` baixado, exceto a linha de horário, também depois de recarregar a página.
+- **T4, Revisor**: `2ce7cba7` e depois `b4c13b70`, pedida depois do parecer mais novo do QA. Veredito: **`aprovado_com_ressalvas`**.
+
+As ressalvas do Revisor:
+- testes só no Edge/Chromium, em localhost e com a API simulada;
+- nenhum teste automatizado do botão;
+- a verificação padrão de testes (E5) falhou;
+- a igualdade com o download anterior ao patch só foi observada pelo Desenvolvedor.
+
+A falha de E5 está no artefato `base-test.log` da execução `9ad3665b`: 5 de 225 testes de `tests/handoff.test.ts` estouraram o limite padrão de 5 s no Windows. Os erros EPERM que aparecem no log são consequência: a limpeza da pasta temporária ocorre enquanto processos do teste interrompido ainda estão abertos. Commits posteriores deram limite próprio à maioria desses blocos; o último que faltava (“Desenvolvedor: esclarecimento resolvido fora do modelo”) foi corrigido em 19/10/2026. Desde então a suíte passa inteira (285 testes).
+
+Este piloto **não** usou a aplicação pela interface, a verificação da entrega aplicada, a fonte “Projeto local autorizado” nem o QA com vários processos. Essas peças vieram depois (30/09 e 01/10) e estão cobertas por testes, mas ainda não foram exercitadas numa demanda real.
+
 ## Segurança
 
 - **Nenhuma credencial de conta passa pelo Setor IA.** Senha, cookie, token OAuth e arquivos de autenticação ficam com o cliente oficial (`~/.claude`, `~/.codex`). O Setor IA não abre, copia nem registra esses arquivos; usa apenas os comandos de status dos clientes (`claude auth status`, `codex login status`).
 - **Sem automação de sites.** Nada acessa `claude.ai` ou `chatgpt.com` pelo navegador, nem endpoints privados.
 - **Processos sem shell.** Executável + lista de argumentos; texto da demanda e da ficha vai por stdin; instruções do Claude por arquivo temporário; esquema do Codex por arquivo. Scripts `.cmd`/`.bat` não são executados (o shim do npm é resolvido para `node` + script). Modelo e esforço são validados por expressão regular antes de virar argumento.
-- **Isolamento das chamadas (Arquiteto, só leitura).** Pasta de trabalho vazia e temporária por execução (apagada no fim). Claude: `--tools ""`, `--strict-mcp-config`, `--safe-mode`, `--setting-sources ""`, `--disable-slash-commands`, `--no-session-persistence`. Codex: `--sandbox read-only`, `--ephemeral`, `--ignore-user-config`, ferramentas de shell, apps, plugins, navegador, imagens e multiagente desligadas, busca na web desligada.
-- **Isolamento das chamadas (Desenvolvedor, escrita confinada, só Claude Code).** A pasta de trabalho é uma cópia isolada do commit aprovado (`git archive`, sem `.git`/`node_modules`/alterações não commitadas do projeto real), apagada no fim. `--restricted` confina Read/Edit/Write/Glob/Grep a essa pasta (sem `--add-dir`), remove Bash/PowerShell/REPL/ferramentas de rede a menos que `--tools` as nomeie, ignora configurações de usuário/projeto/local e recusa `bypassPermissions`; `--disallowedTools` nega Bash/PowerShell/NotebookEdit/WebFetch/WebSearch/Task como segunda camada e `--safe-mode` desliga skills/plugins/MCP como terceira. Depois da chamada, o executor recalcula o diff real da cópia (não confia no relato do modelo) e reprova qualquer arquivo fora do escopo aprovado. **Ainda sem verificação por chamada real** (o equivalente ao `pnpm check:readonly` do Arquiteto); a revisão avisa isso. Codex fica bloqueado para o Desenvolvedor nesta versão (política de rede do sandbox não verificada).
+- **Isolamento das chamadas (Diretor, Arquiteto, QA e Revisor, só leitura).** Pasta de trabalho vazia e temporária por execução (apagada no fim). Claude: `--tools ""`, `--strict-mcp-config`, `--safe-mode`, `--setting-sources ""`, `--disable-slash-commands`, `--no-session-persistence`. Codex: `--sandbox read-only`, `--ephemeral`, `--ignore-user-config`, ferramentas de shell, apps, plugins, navegador, imagens e multiagente desligadas, busca na web desligada.
+- **Isolamento das chamadas (Desenvolvedor, escrita confinada, só Claude Code).** A pasta de trabalho é uma cópia isolada do commit aprovado (`git archive`, sem `.git`/`node_modules`/alterações não commitadas do projeto real), apagada no fim. `--restricted` confina Read/Edit/Write/Glob/Grep a essa pasta (sem `--add-dir`), remove Bash/PowerShell/REPL/ferramentas de rede a menos que `--tools` as nomeie, ignora configurações de usuário/projeto/local e recusa `bypassPermissions`; `--disallowedTools` nega Bash/PowerShell/NotebookEdit/WebFetch/WebSearch/Task como segunda camada e `--safe-mode` desliga skills/plugins/MCP como terceira. Depois da chamada, o executor recalcula o diff real da cópia (não confia no relato do modelo) e reprova qualquer arquivo fora do escopo aprovado. Verificado por chamada real em 28/09/2026 (`pnpm check:developer-write`; o subcaso de link simbólico não pôde ser verificado). Codex e conexões por chave de API ficam bloqueados para o Desenvolvedor nesta versão (no Codex, a política de rede do sandbox não foi verificada).
+- **Ambiente do QA e da verificação.** O código vem de `git archive` mais o patch ou os arquivos aplicados, conferidos por hash. Os comandos são os configurados no projeto, sem shell. As credenciais pessoais ficam fora do ambiente: variáveis `AYLA_*` e com cara de token, pasta pessoal, `.npmrc`, configuração global do Git e credential helper. O navegador fica atrás do guarda de rede, que só deixa passar origens exatas. **Limite conhecido:** esses controles não isolam a rede dos comandos e scripts do próprio projeto.
+- **Aplicação no projeto.** Só depois de uma revisão confirmada contra o estado exato do destino, com cópia de segurança e restauração em caso de falha, sem stage, commit nem push.
 - **Limites.** Tempo máximo por chamada, saída máxima de 4 MB, uma execução por vez, 20 por hora, no máximo uma correção por execução.
 - **Executor fechado para a internet.** Escuta só em `127.0.0.1`; exige `Authorization: Bearer <token>` (comparação em tempo constante); recusa qualquer requisição com `Origin` ou `Sec-Fetch-*` (marcas de navegador), então páginas da internet não conseguem chamá-lo, e ele nunca envia cabeçalhos CORS; recusa `Host` diferente de `127.0.0.1:<porta>`/`localhost:<porta>` (proteção contra DNS rebinding); aceita só JSON até 1 MB.
 - **Rotas web.** Só respondem no servidor de desenvolvimento acessado por `localhost`, com origem local e o cabeçalho `x-ayla-client: web`. Um build de produção sempre recusa a execução.
@@ -231,15 +429,20 @@ Verificação real (`pnpm check:readonly`, uma chamada pequena por cliente): o p
 
 Arquivo `.ayla/runs.sqlite` (ignorado pelo Git), mantido pelo executor:
 
-- execução: ID, tipo (`director_plan`, `architect_task` ou `developer_task`), demanda, colaborador, plano e tarefa de origem (no Arquiteto ou no Desenvolvedor), estado, conexão usada, modelo e esforço pedidos, datas (criação, início, fim), prazo de processamento, tentativa, hash e instantâneo congelado da ficha e da demanda, entrada exata enviada (instruções e mensagem — sem conteúdo de arquivo colado para o Desenvolvedor), contexto consultado, resultado validado (para o Desenvolvedor, o relatório **e** o diff que o executor calculou), erro com passos de recuperação, uso informado pelo cliente e resposta bruta;
-- eventos com data e hora;
-- resultado das chamadas reais por conexão (para detectar sessão expirada).
+- execução (tabela `director_runs`): ID, tipo (`director_plan`, `architect_task`, `developer_task`, `qa_task` ou `reviewer_task`), demanda, colaborador, plano e tarefa de origem, estado, conexão usada, modelo e esforço pedidos, datas (criação, início, fim), prazo de processamento, tentativa, hash e instantâneo congelado da ficha e da demanda, entrada exata enviada (instruções e mensagem — sem conteúdo de arquivo colado para o Desenvolvedor), contexto consultado, resultado validado (para o Desenvolvedor, o relatório **e** o diff que o executor calculou), erro com passos de recuperação, uso informado pelo cliente e resposta bruta;
+- eventos com data e hora (`director_run_events`);
+- resultado das chamadas reais por conexão, para detectar sessão expirada (`connection_log`);
+- conclusões de tarefa registradas fora de uma execução (`task_completions`);
+- projetos locais cadastrados (`local_projects`; remover só marca `removed_at`) e a configuração de execução de cada um, com as variáveis de teste cifradas (`project_configs`);
+- conexões por chave de API, com a chave cifrada (`api_connections`);
+- revisões de aplicação (`apply_reviews`) e aplicações feitas (`applications`), com o resultado e o hash de cada arquivo antes e depois;
+- fora do banco: artefatos do QA em `.ayla/artifacts/<execução>/` e cópias de segurança das aplicações em `.ayla/applications/<id>/`.
 
 Execuções sobrevivem ao recarregar a página e ao reiniciar o executor. Uma execução que estava em planejamento quando o executor foi encerrado é marcada como **interrompida** no próximo início; as que estavam na fila continuam.
 
 Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada pedido leva uma chave de idempotência, e o banco só permite um plano ativo por demanda e um encaminhamento em aberto por tarefa.
 
-**Migração do registro.** A versão 2 do esquema acrescenta as colunas `kind`, `parent_run_id` e `task_id` com `ALTER TABLE … ADD COLUMN` (as linhas existentes não mudam; as antigas viram `director_plan`) e troca o índice “uma execução ativa por demanda” por índices que distinguem plano e tarefa. Antes de migrar, o executor grava uma cópia completa (`.ayla/runs.backup-before-v2-<data>.sqlite`, via `VACUUM INTO`). Não existe rotina que apague registros.
+**Migração do registro.** O esquema está na versão 8 (`ayla_meta.schema_version`). Antes de cada migração, o executor grava uma cópia completa (`.ayla/runs.backup-before-v<N>-<data>.sqlite`, via `VACUUM INTO`). Exemplo, a versão 2: ela acrescenta as colunas `kind`, `parent_run_id` e `task_id` com `ALTER TABLE … ADD COLUMN` (as linhas existentes não mudam; as antigas viram `director_plan`) e troca o índice “uma execução ativa por demanda” por índices que distinguem plano e tarefa. Não existe rotina que apague registros.
 
 ## Estados da conexão
 
@@ -314,16 +517,38 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 - A execução real com cada cliente é feita pela interface ou pela API local, com o executor em execução; os resultados ficam no registro com o cliente e o uso informados.
 - Tarefa dependente e prévia (simulados; a comparação usa **Git real** em pasta temporária): opções de fonte sem criar registro; análise da dependência enviada uma vez, com o commit e a decisão do usuário; só os arquivos confirmados; aprovação de outra execução recusada; primeiro envio numa cópia local com a comparação arquivo a arquivo e sem mencionar envio anterior inexistente; “lido” por símbolo em trecho; prévia bloqueada até as dependências indiretas, sem registro nem chamada, com os mesmos estados na tela e no Markdown; escopo alterar/criar/consultar; falha ao renovar o token classificada como passageira, sem “sessão expirada”.
 - Desenvolvedor (argumentos do cliente verificados sem chamada real; cópia isolada e diff com **Git e `tar` reais** em pasta temporária): modo `developer_write` concede só Read/Edit/Write/Glob/Grep, confina por `--restricted` e nega Bash/PowerShell/rede/subagente, sem alterar o modo somente leitura do Arquiteto; dependências pendentes recusadas; conexão diferente de Claude Code e ficha sem permissão de editar recusadas; preparo congela a revisão sem montar cópia nem chamar o cliente; cliques repetidos geram um único registro; divergência de hash na confirmação recusada e confirmação dupla enfileira uma única vez; execução aprovada materializa a cópia de verdade (sem `.git` do projeto real, sem `node_modules`), escreve de verdade nela e o diff real (não o que o modelo relata) decide o resultado; pedido adversarial que escreve fora do escopo aprovado dentro da própria cópia é reprovado pelo diff real, com o repositório de origem sempre intacto; cancelamento antes e durante a execução; persistência do relatório e do diff (`kind developer_task`).
-- `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente). `pnpm diagnose:run <id>`: composição e uso de uma execução registrada (só leitura do banco).
+- QA e Revisor (`handoff.test.ts`, `qa-tooled.test.ts`; clientes simulados): o preparo exige dependência real e transitiva; a aprovação, a execução e a classificação dos critérios; o veredito final coerente com o QA; e a persistência (`qa_task`, `reviewer_task`).
+- Aplicação e verificação (`apply.test.ts`, com Git real): bloqueios de caminho e de diff; projeto que mudou depois da revisão; preservação de alterações locais; cópia de segurança e restauração; idempotência; diff já incorporado ao histórico.
+- Projetos e configuração (`project-config.test.ts`, `local-source.test.ts`, `stack.test.ts`): comandos sem shell; variáveis cifradas e endereços externos; fonte “Projeto local autorizado”; vários processos com portas reservadas antes; guarda de rede com servidor real.
+- Conexões por chave de API (`api-connections.test.ts`) e proteção HTTP do executor (`executor-http.test.ts`).
+- Resultado em 19/10/2026: **285 testes em 12 arquivos, todos passando** (cerca de 3,5 min no Windows, porque os arquivos rodam um de cada vez). Os blocos que criam repositórios e cópias reais declaram o próprio limite de tempo (`describe(..., { timeout: 30_000 })`); sem isso, eles estouram os 5 s padrão no Windows.
+- `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente). `pnpm check:developer-write`: verificação real do confinamento de escrita do Desenvolvedor (uma chamada). `pnpm diagnose:run <id>`: composição e uso de uma execução registrada (só leitura do banco).
 - Esclarecimento e revisão (simulados): respostas ligadas às perguntas certas, perguntas inventadas/duplicadas/sem resposta recusadas, resposta sua e leitura identificadas, envio anterior intacto (comparação byte a byte do registro), cliques repetidos no novo envio e na confirmação, repetição de pergunta recusada salvo contradição, troca de commit exige motivo e gera revisão, tempo esgotado com limite explícito e revisão seguinte, cópia local com **Git real** em pasta temporária (commit descendente, alteração não commitada ignorada, cópia não modificada, pasta não autorizada, commit fora da história e origem diferente recusados), trechos e janelas, composição que soma exatamente o texto montado, fluxo do Claude Code com repetição de API e uso parcial.
 
-## Desenvolvedor: o que está implementado e o que falta
+## Estado atual e o que falta (19/10/2026)
 
-Implementado (28/09/2026, código real, coberto por testes e por uma revisão real preparada — veja “Caso real da task-3”): encaminhamento em dois passos (preparar/revisar/confirmar); cópia de trabalho isolada por `git archive`, sem histórico do projeto real, sem `node_modules`; escrita do Claude Code confinada por `--restricted` à cópia e aos caminhos aprovados; diff calculado pelo executor (não confiado ao relato do modelo) decidindo o resultado; nada aplicado ao projeto original, comitado ou publicado a partir da execução.
+**Exercitado de verdade:**
+- Diretor, Arquiteto, Desenvolvedor, QA com operações do executor e Revisor, numa mesma demanda (piloto 2, acima);
+- leitura de cópia local não publicada;
+- esclarecimento e revisões de contexto (pilotos 1 e 2);
+- isolamento verificado por chamada real: somente leitura com Claude Code e Codex (25/09) e escrita do Desenvolvedor com Claude Code (28/09).
 
-O que falta, de propósito, nesta versão:
+**Implementado e coberto por testes, ainda sem uso numa demanda real:**
+- aplicar o diff pela interface (nenhuma aplicação registrada até agora);
+- verificar a entrega aplicada;
+- fonte “Projeto local autorizado” e cadastro de projetos pela interface;
+- configuração de execução por projeto;
+- QA com vários processos e guarda de rede;
+- conexões por chave de API.
 
-- **Verificação real de isolamento de escrita.** O Arquiteto tem `pnpm check:readonly` (uma chamada real, gravada em 25/09/2026). O Desenvolvedor ainda não tem o equivalente — a revisão avisa que o `--restricted` está documentado, não confirmado por uma chamada real neste ambiente. Antes de confiar a execução sem supervisão, vale montar esse mesmo tipo de verificação (pedir para escrever fora da cópia e fora do escopo, confirmar que falha de verdade).
-- **Terminal.** Planejado na ficha, mas bloqueado no executor: falta um mecanismo de isolamento de rede comprovado e uma forma de disponibilizar dependências (`node_modules`) sem copiar dados de fora do commit aprovado.
-- **Codex.** Bloqueado para o Desenvolvedor (`WRITE_RESTRICTED.codex.safe = false`): a política de rede do sandbox `workspace-write` não foi verificada neste ambiente.
-- **Aplicar ao projeto, QA e publicação.** A implementação fica só no registro (diff + relatório); levá-la ao checkout real, acionar o QA ou publicar são etapas futuras, cada uma com sua própria aprovação.
+**Pendências nos registros:**
+- **Piloto 1** (plano `92788815`, “Exportar o plano do Diretor em Markdown”): as tarefas 1 a 5 estão concluídas (análises e conclusões registradas). As tarefas 6 e 7 (QA) nunca rodaram: o envio `3d67215c` está em “aguardando aprovação” desde 28/09, preparado antes do QA com operações do executor. O plano não tem tarefa de Revisor.
+- A execução do Desenvolvedor `ff9ce4bb` (piloto 1, task-3) continua em “aguardando esclarecimento”. Ela já está resolvida por uma conclusão `resolved_clarification`; o estado da execução não é reescrito, de propósito.
+
+**O que falta, de propósito, nesta versão:**
+- **Terminal do Desenvolvedor.** Planejado na ficha, mas bloqueado no executor. Falta um isolamento de rede comprovado e uma forma de disponibilizar dependências (`node_modules`) sem copiar dados de fora do commit aprovado. Tipos, lint, testes e build ficam a cargo de “Verificar entrega aplicada” e do QA.
+- **Codex e chave de API para o Desenvolvedor.** Bloqueados (`WRITE_RESTRICTED`). No Codex, a política de rede do sandbox `workspace-write` não foi verificada neste ambiente; o adaptador de API não tem ferramentas.
+- **Dependências do Desenvolvedor.** A prévia e o envio ao Desenvolvedor ainda exigem que **todas** as dependências sejam tarefas do Arquiteto com análise concluída (`developer-preview.ts`). A regra geral de `dependency.ts` (conclusões registradas, implementação aplicada) já vale para o QA e para os estados das tarefas, mas ainda não para esse caso: uma tarefa do Desenvolvedor que depende de outra do Desenvolvedor fica bloqueada.
+- **Isolamento de rede dos comandos do projeto.** O guarda de rede limita só o navegador do QA. Os comandos e scripts do projeto (instalação, testes, servidor) rodam com a rede do sistema.
+- **Commit e publicação.** O Setor IA aplica e verifica, mas não faz commit, push nem deploy. Nos pilotos, o commit foi feito fora dele.
+- **Uso hospedado.** Veja “Publicação na Vercel”.

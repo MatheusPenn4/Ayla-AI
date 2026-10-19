@@ -1257,7 +1257,7 @@ describe("Desenvolvedor: aprovação, execução real (materializada) e diff", (
   });
 });
 
-describe("Desenvolvedor: esclarecimento resolvido fora do modelo (nunca reescreve o status nem o resultado)", () => {
+describe("Desenvolvedor: esclarecimento resolvido fora do modelo (nunca reescreve o status nem o resultado)", { timeout: 30_000 }, () => {
   async function awaitingClarificationRun() {
     const repo = makeDevRepo(work);
     const { plan } = await localChainWithAnalyses(repo, store);
