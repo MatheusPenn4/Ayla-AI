@@ -8,7 +8,7 @@ import { TOOL_INFO, ZONE_LABEL } from "@/lib/office/defaults";
 import { CAPACITY, WORK_ZONES, zoneCapacity } from "@/lib/office/layout";
 import { buildDemandPayload, formatBytes } from "@/lib/integration/contracts";
 import { CONNECTION_STATE_LABEL, connectionLabel, connectionStatusFor } from "@/lib/engine/connections";
-import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type EngineStatus } from "@/lib/engine/types";
+import { ACTIVE_STATUSES, AUTOPILOT_STATUS_LABEL, RUN_STATUS_LABEL, type EngineStatus } from "@/lib/engine/types";
 import type { useRuns } from "@/hooks/use-runs";
 import { StatusBadge } from "./run-dialog";
 import { LocalContextReview } from "./local-source";
@@ -209,6 +209,14 @@ export function DemandQueue({ demands, agents, runs, onNew, onRemove, onEdit, on
                     count("proposed") && `${count("proposed")} proposta(s) para enviar`,
                   ].filter(Boolean);
                   return <button className="chip arch-chip" onClick={() => onOpenRun(lp.id)} title="Abrir as tarefas do último plano pronto">Arquiteto: {parts.join(" · ")}</button>;
+                })()}
+                {(() => {
+                  // Piloto automático of the latest ready plan: a live or stopped policy is always visible here; "Precisa de você" when it waits on the user.
+                  const lp = history.find(r => r.status === "plan_ready" && r.result);
+                  const ap = lp ? runs.autopilotFor(lp.id) : null;
+                  if (!lp || !ap || ap.status === "canceled" || ap.status === "expired") return null;
+                  const needsYou = ap.status === "paused" || ap.status === "waiting_user" || ap.status === "awaiting_approval";
+                  return <button className={`chip ap-chip${needsYou ? " needs-you" : ""}`} onClick={() => onOpenRun(lp.id)} title={ap.stop?.message ?? ap.waiting?.message ?? "Abrir o plano"}>{needsYou ? "Precisa de você · " : ""}Piloto automático: {AUTOPILOT_STATUS_LABEL[ap.status]}</button>;
                 })()}
                 {history.length > 1 && (
                   <span className="run-history">Histórico: {history.slice(0, 5).map(r => <button key={r.id} className="chip" onClick={() => onOpenRun(r.id)} title={new Date(r.createdAt).toLocaleString("pt-BR")}>{RUN_STATUS_LABEL[r.status]}</button>)}</span>

@@ -7,6 +7,7 @@ import path from "node:path";
 import { apiConnectionIdOf, apiConnectionStatus, CONNECTION_IDS, isApiConnectionRef } from "@/lib/engine/connections";
 import { HANDOFF_TARGETS, type AgentConnectionRef, type ConnectionId, type ConnectionStatus, type DirectorSnapshot, type EngineStatus, type LocalResolution, type RunRecord } from "@/lib/engine/types";
 import { apiAdapter } from "./adapters/api";
+import { Supervisor } from "./autopilot";
 import { claudeAdapter } from "./adapters/claude";
 import { codexAdapter } from "./adapters/codex";
 import type { AgentAdapter } from "./adapters/types";
@@ -104,6 +105,10 @@ export class ExecutorService {
   private secretKey: Buffer;
   /** Verifications of applied deliveries running in this process (cancellable). */
   private verifying = new Map<string, AbortController>();
+  /** Autopilot (phase 1): sends Architect, QA and Reviewer tasks under a policy the user approved once. */
+  readonly supervisor: Supervisor;
+  /** Supervisor notifications still being looked at (so idle() really means idle). */
+  private settling = 0;
 
   constructor(private cfg: ExecutorConfig, private deps: ServiceDeps) {
     mkdirSync(cfg.workRoot, { recursive: true });
@@ -115,6 +120,19 @@ export class ExecutorService {
       cwd: statusDir, nodePath: deps.nodePath ?? process.execPath,
     };
     this.secretKey = parseMachineKeyB64(cfg.secretKeyB64 ?? randomMachineKeyB64());
+    this.supervisor = new Supervisor({
+      store: deps.store, maxRunsPerHour: cfg.limits.maxRunsPerHour,
+      readOnlySafe: ref => this.readOnlySafe(ref),
+      prepare: b => this.prepare(b), prepareQA: b => this.prepareQA(b), prepareReviewer: b => this.prepareReviewer(b),
+      sourceOptions: (plan, task) => this.sourceOptions(plan, task),
+      approveByPolicy: (id, hash, ap, rule) => this.approveByPolicy(id, hash, ap, rule),
+    });
+  }
+
+  /** Tells the supervisor that something of a plan changed (fire-and-forget, tracked by idle()). */
+  private notify(fn: () => Promise<void>) {
+    this.settling++;
+    void fn().catch(() => {}).finally(() => { this.settling--; });
   }
 
   get store() { return this.deps.store; }
@@ -136,6 +154,7 @@ export class ExecutorService {
     await this.store.interruptOrphans();
     await this.store.interruptVerifications();
     for (const id of await this.store.queuedIds()) this.enqueue(id);
+    await this.supervisor.boot();
   }
 
   // ---- connections -------------------------------------------------------
@@ -478,7 +497,25 @@ export class ExecutorService {
       : "Envio confirmado por você. O Arquiteto entrou na fila do executor local.";
     await this.store.event(id, "approved", approvedMsg);
     this.enqueue(id);
+    this.notify(() => this.supervisor.poke(parent.id));
     return { status: 202, body: { run: await this.store.get(id), approved: true } };
+  }
+
+  /**
+   * The autopilot's confirmation of a hand-off it prepared and checked against the policy the user approved
+   * (see lib/executor/autopilot.ts). Same checks as approve(), plus: never a Developer hand-off, whatever the
+   * caller. Recorded as "auto_approved" with the policy, never as the user's own "approved".
+   */
+  async approveByPolicy(id: string, snapshotHash: string, ap: { id: string; policyHash: string; approvedAt: string | null }, rule: string): Promise<boolean> {
+    const run = await this.store.get(id);
+    if (!run || (run.kind !== "architect_task" && run.kind !== "qa_task" && run.kind !== "reviewer_task")) return false;
+    if (run.status !== "awaiting_approval" || run.snapshotHash !== snapshotHash) return false;
+    const parent = run.parentRunId ? await this.store.get(run.parentRunId) : null;
+    if (!parent || parent.status !== "plan_ready") return false;
+    if (!(await this.store.approve(id))) return false;
+    await this.store.event(id, "auto_approved", `Envio confirmado pelo piloto automático (política ${ap.id.slice(0, 8)}, aprovada por você${ap.approvedAt ? ` em ${ap.approvedAt}` : ""}). ${rule}`, { autopilotId: ap.id, policyHash: ap.policyHash, rule });
+    this.enqueue(id);
+    return true;
   }
 
   /**
@@ -554,6 +591,7 @@ export class ExecutorService {
       demandId: plan.demandId, parentRunId: b.parentRunId, taskId: b.taskId, kind: b.kind, sourceRunId,
       commit: b.commit, files: b.files as string[], verification: v as never, note: b.note.trim(), validatedBy: "orchestrator", validatedAt: new Date().toISOString(),
     });
+    this.notify(() => this.supervisor.poke(b.parentRunId as string));
     return { status: 201, body: { completion } };
   }
 
@@ -666,7 +704,7 @@ export class ExecutorService {
     this.verifying.set(id, ac);
     await this.store.setApplicationVerification(id, { status: "running", startedAt: new Date().toISOString(), finishedAt: null, version: null, checks: [], message: "Na fila: montando o ambiente isolado…", completionId: null });
     void runVerification(id, { store: this.store, projects: this.projectDeps(), envDeps: this.envDeps(ac.signal), workRoot: this.cfg.workRoot, artifactsRoot: this.artifactsRoot })
-      .catch(() => {}).finally(() => this.verifying.delete(id));
+      .catch(() => {}).finally(() => { this.verifying.delete(id); this.notify(() => this.supervisor.poke(app.planId)); });
     return { status: 202, body: { application: await this.store.getApplication(id), started: true } };
   }
 
@@ -718,7 +756,7 @@ export class ExecutorService {
       const id = this.waiting.shift()!;
       const ac = new AbortController();
       this.running.set(id, ac);
-      void this.execute(id, ac).finally(() => { this.running.delete(id); this.pump(); });
+      void this.execute(id, ac).finally(() => { this.running.delete(id); this.pump(); this.notify(() => this.supervisor.onRunSettled(id)); });
     }
   }
 
@@ -763,6 +801,7 @@ export class ExecutorService {
     if (!/^[0-9a-f-]{36}$/.test(id)) return err(404, "not_found", "Execução não encontrada.");
     const before = await this.store.get(id);
     const changed = await this.store.update(id, { status: "canceled", finishedAt: new Date().toISOString(), leaseUntil: null }, ["awaiting_approval", "queued", "planning"]);
+    if (changed && !this.running.has(id)) this.notify(() => this.supervisor.onRunSettled(id)); // a running one notifies when its process ends
     if (changed) {
       this.waiting = this.waiting.filter(w => w !== id);
       const ac = this.running.get(id);
@@ -776,10 +815,24 @@ export class ExecutorService {
     return { status: 200, body: { run, canceled: changed > 0 } };
   }
 
-  /** Waits for the current processes (used by tests and graceful shutdown). */
+  /** Waits for the current processes and the supervisor's pending steps (used by tests and graceful shutdown). */
   async idle() {
-    while (this.running.size || this.waiting.length) await new Promise(r => setTimeout(r, 10));
+    for (;;) {
+      while (this.running.size || this.waiting.length) await new Promise(r => setTimeout(r, 10));
+      if (!this.settling) await this.supervisor.idle();
+      if (!this.running.size && !this.waiting.length && !this.settling) return;
+      await new Promise(r => setTimeout(r, 10));
+    }
   }
 
-  abortAll() { for (const ac of this.running.values()) ac.abort(); }
+  abortAll() { this.supervisor.stopTimers(); for (const ac of this.running.values()) ac.abort(); }
+
+  // ---- autopilot (phase 1) -----------------------------------------------------------------------------
+
+  prepareAutopilot(body: unknown) { return this.supervisor.prepare(body); }
+  approveAutopilot(id: string, body: unknown) { return this.supervisor.approve(id, body); }
+  pauseAutopilot(id: string) { return this.supervisor.pause(id); }
+  resumeAutopilot(id: string, body: unknown) { return this.supervisor.resume(id, body); }
+  cancelAutopilot(id: string) { return this.supervisor.cancel(id); }
+  listAutopilots(q: { planRunId?: string; demandIds?: string[] }) { return this.supervisor.list(q); }
 }

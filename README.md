@@ -2,7 +2,7 @@
 
 Escritório 3D de uma equipe de colaboradores de IA (Diretor, Arquiteto, Desenvolvedor, QA e Revisor), que planeja, analisa, implementa, verifica e revisa demandas de software **neste computador**. Usa as suas assinaturas do Claude (Claude Code) e do ChatGPT (Codex CLI) e, opcionalmente, chaves de API.
 
-**Fase atual: piloto local.** Nada é delegado automaticamente: cada envio a um colaborador é preparado, congelado, revisado por você e só roda depois da sua confirmação. A execução real só funciona no servidor de desenvolvimento acessado por `localhost`; um build publicado mostra o motor como desativado.
+**Fase atual: piloto local.** Nada roda sem uma confirmação sua. Cada envio a um colaborador é preparado, congelado e revisado por você. Com o piloto automático, você confirma uma política por plano, e o executor só envia o que ela permite. A execução real só funciona no servidor de desenvolvimento acessado por `localhost`; um build publicado mostra o motor como desativado.
 
 ![Escritório](docs/capturas/final-1366-escritorio.png)
 
@@ -22,6 +22,7 @@ Demanda ─▶ Diretor (plano) ─▶ Arquiteto (análise, só leitura)
 - **Aplicar e verificar**: o diff é aplicado depois de uma revisão do estado exato do projeto, com cópia de segurança e restauração em caso de falha. Depois, os comandos configurados do projeto rodam num ambiente isolado. Nada é commitado nem publicado.
 - **QA**: o modelo não tem ferramentas. Ele pede operações de um catálogo fixo; o executor as roda numa cópia isolada da versão testada e devolve evidências numeradas. Cada critério precisa citar essas evidências.
 - **Revisor**: reaproveita o que o QA recebeu e o parecer dele. O veredito (`aprovado`, `aprovado_com_ressalvas`, `reprovado`) não pode contradizer o QA.
+- **Piloto automático (fase 1)**: em vez de aprovar envio por envio, você aprova **uma política** por plano. Ela congela as fichas, o orçamento total de tokens, o máximo de execuções e a validade. O executor então envia sozinho as tarefas do Arquiteto, do QA e do Revisor. Ele para e chama você nestes casos: esclarecimento, falha, cancelamento, orçamento, uso não informado, ficha divergente. O Desenvolvedor continua sempre com você.
 
 Detalhes, garantias de segurança, casos reais e limites: **[docs/executor-local.md](docs/executor-local.md)**.
 
@@ -61,7 +62,7 @@ Se o `pnpm dev` já estava aberto antes do executor, reinicie-o para ele ler o t
 |---|---|
 | `pnpm dev` | interface (Vite/vinext, porta 5173) |
 | `pnpm executor` | executor local (`127.0.0.1:4317`) |
-| `pnpm test` | suíte Vitest (285 testes; usa Git, `tar` e Node reais, cerca de 3,5 min no Windows) |
+| `pnpm test` | suíte Vitest (308 testes; usa Git, `tar` e Node reais, cerca de 5 min no Windows) |
 | `pnpm lint` | ESLint |
 | `pnpm check:clients` | detecção real dos clientes oficiais, sem chamar modelo |
 | `pnpm check:readonly` | verificação real de que o modo somente leitura não escreve (uma chamada por cliente) |

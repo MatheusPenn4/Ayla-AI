@@ -127,6 +127,20 @@ export async function handle(service: ExecutorService, req: IncomingMessage, opt
     if (m === "GET" && r) return await service.artifact(r[1], r[2]);
     r = /^\/v1\/runs\/([0-9a-f-]{36})\/annotations$/.exec(p);
     if (m === "POST" && r) return await service.annotate(r[1], await readJson(req));
+    if (m === "POST" && p === "/v1/autopilots") return await service.prepareAutopilot(await readJson(req));
+    if (m === "GET" && p === "/v1/autopilots") {
+      const plan = url.searchParams.get("plan") ?? "";
+      if (plan) return /^[0-9a-f-]{36}$/.test(plan) ? await service.listAutopilots({ planRunId: plan }) : { status: 400, body: { error: { code: "invalid_request", message: "Plano inválido." } } };
+      return await service.listAutopilots({ demandIds: (url.searchParams.get("demands") ?? "").split(",").map(s => s.trim()).filter(s => /^[A-Za-z0-9_-]{1,64}$/.test(s)).slice(0, 200) });
+    }
+    r = /^\/v1\/autopilots\/([0-9a-f-]{36})\/(approve|pause|resume|cancel)$/.exec(p);
+    if (m === "POST" && r) {
+      const [, apId, action] = r;
+      if (action === "approve") return await service.approveAutopilot(apId, await readJson(req));
+      if (action === "resume") return await service.resumeAutopilot(apId, await readJson(req));
+      if (action === "pause") return await service.pauseAutopilot(apId);
+      return await service.cancelAutopilot(apId);
+    }
     return { status: 404, body: { error: { code: "not_found", message: "Rota inexistente." } } };
   } catch (e) {
     const status = (e as { status?: number }).status ?? 500;

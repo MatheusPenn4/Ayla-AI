@@ -3,21 +3,11 @@
 import { useEffect, useState } from "react";
 import { Loader2, Send, X } from "lucide-react";
 import { EngineApiError, engineApi, type HandoffFollowUp, type SourceOptions } from "@/lib/engine/client";
+import { architectDefaults } from "@/lib/engine/send-defaults";
 import { RUN_STATUS_LABEL, type RunStatus, type SourceComparison } from "@/lib/engine/types";
 
 const HEX40 = /^[0-9a-f]{40}$/;
 const REF = /^[A-Za-z0-9_.@[\]/-]+(#[A-Za-z0-9_$]+)?$/;
-
-/** Suggestions checked by default, in order, while they fit the reading limits (10 files, 12 references). */
-function defaultPick(refs: string[]) {
-  const files = new Set<string>(), out: Record<string, boolean> = {};
-  for (const r of refs) {
-    const p = r.split("#")[0];
-    if (Object.keys(out).length >= 12 || (!files.has(p) && files.size >= 10)) break;
-    files.add(p); out[r] = true;
-  }
-  return out;
-}
 
 /** File-by-file table of a comparison between two commits (read from the authorized local clone). */
 export function ComparisonTable({ c }: { c: SourceComparison }) {
@@ -63,15 +53,11 @@ export function SendForm({ planRunId, taskId, sending, disabled, onSubmit, onClo
         if (!live) return;
         setOpts(o);
         // A retry starts from the previous envio of the task (same commit and files); otherwise from the proposal.
-        const prev = o.previous?.commit && o.previous.files.length ? o.previous : null;
-        if (prev) {
-          setPicked(Object.fromEntries(prev.files.filter(r => o.suggestedFiles.some(f => f.ref === r)).map(r => [r, true])));
-          setExtra(prev.files.filter(r => !o.suggestedFiles.some(f => f.ref === r)).join(", "));
-          setSource(`${prev.via ?? "github"}:${prev.commit}`);
-        } else {
-          setPicked(defaultPick(o.suggestedFiles.map(f => f.ref)));
-          setSource(o.proposed ? `${o.proposed.via}:${o.proposed.commit}` : "");
-        }
+        // Same rule the autopilot uses (lib/engine/send-defaults.ts).
+        const d = architectDefaults(o);
+        setPicked(Object.fromEntries(d.files.filter(r => o.suggestedFiles.some(f => f.ref === r)).map(r => [r, true])));
+        setExtra(d.files.filter(r => !o.suggestedFiles.some(f => f.ref === r)).join(", "));
+        setSource(d.source ? `${d.source.via}:${d.source.commit}` : "");
       })
       .catch(e => live && setError(e instanceof EngineApiError ? e.message : "Não foi possível carregar as opções de fonte."));
     return () => { live = false; };

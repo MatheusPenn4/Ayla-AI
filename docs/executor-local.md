@@ -8,7 +8,7 @@ Os cinco colaboradores executam de verdade, sempre em tarefas que você aprovar:
 - o **QA** verifica: o modelo não tem ferramentas e pede operações que o executor roda numa cópia isolada da versão testada;
 - o **Revisor** forma o parecer final, sem ferramentas.
 
-O diff do Desenvolvedor pode ser **aplicado ao projeto local** e **verificado** pela interface, cada passo com a sua confirmação. As chamadas usam **as suas assinaturas**, por meio dos clientes oficiais instalados e autenticados neste computador:
+O diff do Desenvolvedor pode ser **aplicado ao projeto local** e **verificado** pela interface, cada passo com a sua confirmação. Com o **piloto automático** (fase 1), você aprova uma política por plano e o executor envia sozinho as tarefas do Arquiteto, do QA e do Revisor, parando nos freios. O Desenvolvedor continua manual. As chamadas usam **as suas assinaturas**, por meio dos clientes oficiais instalados e autenticados neste computador:
 
 | Conexão na ficha | Cliente oficial | Conta usada | Como o login é feito |
 |---|---|---|---|
@@ -393,6 +393,80 @@ Em **Configurações → Conexões de IA → Adicionar conexão**, você cadastr
 - “Verificar” faz uma chamada real mínima.
 - O adaptador (`adapters/api.ts`) faz uma única requisição com saída estruturada, sem ferramentas e sem fluxo contínuo. Por isso só serve aos modos de leitura e é recusado para o Desenvolvedor, tanto pelo serviço (`WRITE_RESTRICTED`) quanto pelo próprio adaptador.
 
+## Piloto automático (fase 1: Arquiteto, QA e Revisor)
+
+Em vez de aprovar envio por envio, você aprova **uma política** para um plano pronto do Diretor. Um supervisor no executor (`lib/executor/autopilot.ts`) envia sozinho as tarefas do **Arquiteto**, do **QA** e do **Revisor**, na ordem das dependências. O **Desenvolvedor continua sempre com você** nesta fase.
+
+### Como funciona
+
+1. **Preparar a política** (diálogo do plano → aba Tarefas → Piloto automático; `POST /v1/autopilots`). Nada é enviado neste passo. O executor congela:
+   - as tarefas incluídas, que você pode desmarcar;
+   - as **fichas** do Arquiteto, do QA e do Revisor como estão agora (editar uma ficha depois não muda a política);
+   - o **orçamento total da demanda** em tokens, o **máximo de execuções** e a **validade** (1 a 72 h);
+   - as regras D1 a D4 (abaixo).
+
+   Tudo isso é guardado com um hash.
+2. **Confirmar** (`POST /v1/autopilots/:id/approve` com o hash). É o mesmo padrão dos envios: o conteúdo confirmado precisa ser idêntico ao preparado.
+3. **Supervisor.** É acionado quando a política é ativada, quando qualquer execução do plano termina ou é cancelada, quando uma conclusão é registrada, quando uma verificação de entrega termina e quando o executor reinicia. A cada acionamento:
+   - escolhe a próxima tarefa com a mesma regra que habilita os botões “Enviar”: a primeira tarefa da política, na ordem do plano, ainda não enviada e com todas as dependências satisfeitas por evidência (`lib/engine/autopilot.ts`, sobre `dependency.ts`);
+   - prepara o envio pelos **mesmos métodos do serviço** que a interface usa, com a ficha congelada. Valem as barreiras de sempre: somente leitura, limite por hora, um envio em aberto por tarefa e dependências;
+   - no Arquiteto, usa as mesmas escolhas padrão do formulário “Enviar ao Arquiteto” (`lib/engine/send-defaults.ts`): commit proposto e arquivos sugeridos dentro dos limites;
+   - confere os freios sobre o conteúdo preparado e confirma com `approveByPolicy`. Esse método recusa qualquer envio do Desenvolvedor e grava o evento **`auto_approved`** (política, hash e regra que permitiu), nunca `approved`.
+
+   Trabalha uma tarefa por vez. As chaves de idempotência são determinísticas, então acionamentos simultâneos geram um único envio.
+4. **Tarefas que ficam com você** aparecem como “você” na linha do tempo da política:
+   - todas as do Desenvolvedor;
+   - as do Arquiteto que dependem diretamente de outra especialidade (o envio ao Arquiteto ainda só aceita dependências que sejam análises do Arquiteto).
+
+   Quando o supervisor não pode seguir porque uma dessas tarefas está pendente, a política fica **“Aguardando você”** e **retoma sozinha** quando a tarefa termina. Exemplo: o QA depende da implementação do Desenvolvedor.
+5. **Fim.** Com todas as tarefas da política concluídas, ela termina como **Concluído**, com o veredito do Revisor no evento.
+
+### Regras congeladas (D1 a D4)
+
+| | Regra |
+|---|---|
+| D1 | O Arquiteto aceita o commit que o executor propõe, mesmo diferente do que o Diretor leu. O motivo “Piloto automático (D1): …” fica na revisão do envio. |
+| D2 | O QA só é confirmado quando há versão para testar (projeto local autorizado com a entrega). |
+| D3 | Qualquer falha para a política. Nada é tentado de novo sozinho. |
+| D4 | Uma tarefa já enviada (concluída, com falha ou cancelada) nunca é enviada “novamente” pelo supervisor. |
+
+### Freios
+
+Um freio deixa a política **Pausada**, com o motivo, e um evento `autopilot_stopped` no plano. Um envio já preparado fica **aguardando a sua revisão normal**. Só você retoma, pelo mesmo hash; a execução que causou a parada não é avaliada de novo.
+
+| Freio | Quando |
+|---|---|
+| Orçamento da demanda | uso informado + projeção do próximo envio passaria do orçamento. A projeção é a estimativa do texto × a razão real/estimado observada em execuções anteriores do mesmo tipo e conexão (mediana; 4 sem histórico; entre 1 e 20). |
+| Uso não informado | uma execução da política terminou sem uso informado pelo cliente |
+| Orçamento da ficha | a estimativa do texto do envio já passa do orçamento da ficha |
+| Esclarecimento | um colaborador fez perguntas. O supervisor não responde por você. |
+| Falha | qualquer falha (`auth_busy`, sessão expirada, limite da assinatura, tempo esgotado…) |
+| Cancelamento | você cancelou ou descartou um envio da política |
+| Ficha divergente | o envio preparado não carrega a ficha congelada |
+| Sem versão para testar (D2) | o QA não teria o que testar |
+| Máximo de execuções / plano indisponível / preparo recusado | o limite foi atingido, o plano não está mais pronto, ou o executor recusou preparar (o motivo do executor é mostrado) |
+
+Dois estados **não** são freios:
+- **Limite por hora** (`AYLA_MAX_RUNS_PER_HOUR`): a política espera a janela abrir e segue sozinha, inclusive depois de reiniciar o executor.
+- **Validade:** ao vencer, a política termina como **Vencida**.
+
+**Pausar** e **Encerrar** não interrompem uma execução que já está rodando; só impedem novos envios.
+
+### Interface
+
+- **Diálogo do plano, aba Tarefas:** o painel “Piloto automático” mostra:
+  - a linha do tempo (automático, você, fora da política);
+  - os campos de orçamento, máximo e validade. A sugestão de orçamento é a mediana do uso informado em execuções anteriores de cada tipo, ou 4× o orçamento da ficha sem histórico, com 25% de margem;
+  - as fichas que serão congeladas e as regras.
+
+  Depois de preparada, a política mostra o resumo e o hash e oferece **Confirmar e ativar** ou **Descartar**. Ativa, mostra o estado, os tokens usados, as execuções e o motivo de espera ou de parada, com **Pausar**, **Retomar** e **Encerrar**.
+- **Cartão da tarefa:** a etiqueta **“piloto automático”** marca as execuções confirmadas pela política.
+- **Cartão da demanda:** o selo “Piloto automático: …” vira **“Precisa de você”** quando a política espera confirmação, está pausada ou aguarda uma tarefa sua.
+
+### Rotas
+
+`POST /v1/autopilots` (preparar), `GET /v1/autopilots?plan=<id>` ou `?demands=a,b` (políticas e histórico de uso), `POST /v1/autopilots/:id/approve|pause|resume|cancel`. As rotas web `/api/autopilots/**` repassam só o hash; os mesmos portões das demais rotas valem.
+
 ## Caso real: piloto 2, “Copiar Markdown” (29 e 30/09/2026)
 
 Primeira demanda que passou pelos cinco colaboradores. O plano `d1618429` tem quatro tarefas encadeadas:
@@ -408,7 +482,7 @@ As ressalvas do Revisor:
 - a verificação padrão de testes (E5) falhou;
 - a igualdade com o download anterior ao patch só foi observada pelo Desenvolvedor.
 
-A falha de E5 está no artefato `base-test.log` da execução `9ad3665b`: 5 de 225 testes de `tests/handoff.test.ts` estouraram o limite padrão de 5 s no Windows. Os erros EPERM que aparecem no log são consequência: a limpeza da pasta temporária ocorre enquanto processos do teste interrompido ainda estão abertos. Commits posteriores deram limite próprio à maioria desses blocos; o último que faltava (“Desenvolvedor: esclarecimento resolvido fora do modelo”) foi corrigido em 19/10/2026. Desde então a suíte passa inteira (285 testes).
+A falha de E5 está no artefato `base-test.log` da execução `9ad3665b`: 5 de 225 testes de `tests/handoff.test.ts` estouraram o limite padrão de 5 s no Windows. Os erros EPERM que aparecem no log são consequência: a limpeza da pasta temporária ocorre enquanto processos do teste interrompido ainda estão abertos. Commits posteriores deram limite próprio à maioria desses blocos. Em 19/10/2026, os blocos com Git real que ainda faltavam também receberam limite próprio; a suíte passa inteira desde então.
 
 Este piloto **não** usou a aplicação pela interface, a verificação da entrega aplicada, a fonte “Projeto local autorizado” nem o QA com vários processos. Essas peças vieram depois (30/09 e 01/10) e estão cobertas por testes, mas ainda não foram exercitadas numa demanda real.
 
@@ -434,6 +508,7 @@ Arquivo `.ayla/runs.sqlite` (ignorado pelo Git), mantido pelo executor:
 - resultado das chamadas reais por conexão, para detectar sessão expirada (`connection_log`);
 - conclusões de tarefa registradas fora de uma execução (`task_completions`);
 - projetos locais cadastrados (`local_projects`; remover só marca `removed_at`) e a configuração de execução de cada um, com as variáveis de teste cifradas (`project_configs`);
+- políticas do piloto automático (`autopilots`): a política congelada e o hash, o estado, as execuções que o supervisor confirmou, os tokens usados, o motivo de espera ou de parada. No máximo uma política não final por plano. Os passos do supervisor também viram eventos `autopilot_*` na execução do Diretor, e cada envio confirmado por ele tem o evento `auto_approved`;
 - conexões por chave de API, com a chave cifrada (`api_connections`);
 - revisões de aplicação (`apply_reviews`) e aplicações feitas (`applications`), com o resultado e o hash de cada arquivo antes e depois;
 - fora do banco: artefatos do QA em `.ayla/artifacts/<execução>/` e cópias de segurança das aplicações em `.ayla/applications/<id>/`.
@@ -442,7 +517,7 @@ Execuções sobrevivem ao recarregar a página e ao reiniciar o executor. Uma ex
 
 Cliques repetidos não duplicam: a interface bloqueia o segundo clique, cada pedido leva uma chave de idempotência, e o banco só permite um plano ativo por demanda e um encaminhamento em aberto por tarefa.
 
-**Migração do registro.** O esquema está na versão 8 (`ayla_meta.schema_version`). Antes de cada migração, o executor grava uma cópia completa (`.ayla/runs.backup-before-v<N>-<data>.sqlite`, via `VACUUM INTO`). Exemplo, a versão 2: ela acrescenta as colunas `kind`, `parent_run_id` e `task_id` com `ALTER TABLE … ADD COLUMN` (as linhas existentes não mudam; as antigas viram `director_plan`) e troca o índice “uma execução ativa por demanda” por índices que distinguem plano e tarefa. Não existe rotina que apague registros.
+**Migração do registro.** O esquema está na versão 9 (`ayla_meta.schema_version`; a v9 acrescenta a tabela `autopilots`). Antes de cada migração, o executor grava uma cópia completa (`.ayla/runs.backup-before-v<N>-<data>.sqlite`, via `VACUUM INTO`). Exemplo, a versão 2: ela acrescenta as colunas `kind`, `parent_run_id` e `task_id` com `ALTER TABLE … ADD COLUMN` (as linhas existentes não mudam; as antigas viram `director_plan`) e troca o índice “uma execução ativa por demanda” por índices que distinguem plano e tarefa. Não existe rotina que apague registros.
 
 ## Estados da conexão
 
@@ -521,7 +596,12 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 - Aplicação e verificação (`apply.test.ts`, com Git real): bloqueios de caminho e de diff; projeto que mudou depois da revisão; preservação de alterações locais; cópia de segurança e restauração; idempotência; diff já incorporado ao histórico.
 - Projetos e configuração (`project-config.test.ts`, `local-source.test.ts`, `stack.test.ts`): comandos sem shell; variáveis cifradas e endereços externos; fonte “Projeto local autorizado”; vários processos com portas reservadas antes; guarda de rede com servidor real.
 - Conexões por chave de API (`api-connections.test.ts`) e proteção HTTP do executor (`executor-http.test.ts`).
-- Resultado em 19/10/2026: **285 testes em 12 arquivos, todos passando** (cerca de 3,5 min no Windows, porque os arquivos rodam um de cada vez). Os blocos que criam repositórios e cópias reais declaram o próprio limite de tempo (`describe(..., { timeout: 30_000 })`); sem isso, eles estouram os 5 s padrão no Windows.
+- Piloto automático (`autopilot.test.ts`, regras puras; `handoff.test.ts`, supervisor com clientes simulados e Git real):
+  - a cadeia completa: Arquiteto automático → espera você no Desenvolvedor → QA e Revisor automáticos → concluído, sem nunca preparar nem confirmar o Desenvolvedor;
+  - cada freio: esclarecimento, falha, uso não informado, orçamento da demanda, orçamento da ficha, máximo de execuções, cancelamento, D2;
+  - D1 com o motivo registrado;
+  - integridade: hash adulterado na confirmação e na retomada; `approveByPolicy` recusando o Desenvolvedor; acionamentos simultâneos gerando um único envio; espera pelo limite por hora e retomada depois de reiniciar o executor; política pausada que continua parada.
+- Resultado em 19/10/2026: **308 testes em 13 arquivos, todos passando** (cerca de 5 min no Windows, porque os arquivos rodam um de cada vez). Os blocos que criam repositórios e cópias reais declaram o próprio limite de tempo (`describe(..., { timeout: 30_000 })`); sem isso, eles estouram os 5 s padrão no Windows.
 - `pnpm check:clients`: detecção real (sem chamada de modelo). `pnpm check:readonly`: verificação real de escrita bloqueada (uma chamada pequena por cliente). `pnpm check:developer-write`: verificação real do confinamento de escrita do Desenvolvedor (uma chamada). `pnpm diagnose:run <id>`: composição e uso de uma execução registrada (só leitura do banco).
 - Esclarecimento e revisão (simulados): respostas ligadas às perguntas certas, perguntas inventadas/duplicadas/sem resposta recusadas, resposta sua e leitura identificadas, envio anterior intacto (comparação byte a byte do registro), cliques repetidos no novo envio e na confirmação, repetição de pergunta recusada salvo contradição, troca de commit exige motivo e gera revisão, tempo esgotado com limite explícito e revisão seguinte, cópia local com **Git real** em pasta temporária (commit descendente, alteração não commitada ignorada, cópia não modificada, pasta não autorizada, commit fora da história e origem diferente recusados), trechos e janelas, composição que soma exatamente o texto montado, fluxo do Claude Code com repetição de API e uso parcial.
 
@@ -539,7 +619,8 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 - fonte “Projeto local autorizado” e cadastro de projetos pela interface;
 - configuração de execução por projeto;
 - QA com vários processos e guarda de rede;
-- conexões por chave de API.
+- conexões por chave de API;
+- **piloto automático, fase 1** (19/10/2026): política, supervisor, freios e interface. Só os clientes simulados exercitaram a cadeia completa; ainda falta uma demanda real com o piloto ativo.
 
 **Pendências nos registros:**
 - **Piloto 1** (plano `92788815`, “Exportar o plano do Diretor em Markdown”): as tarefas 1 a 5 estão concluídas (análises e conclusões registradas). As tarefas 6 e 7 (QA) nunca rodaram: o envio `3d67215c` está em “aguardando aprovação” desde 28/09, preparado antes do QA com operações do executor. O plano não tem tarefa de Revisor.
@@ -549,6 +630,8 @@ O que continua proibido nesse desenho: receber senha, cookie, token OAuth ou arq
 - **Terminal do Desenvolvedor.** Planejado na ficha, mas bloqueado no executor. Falta um isolamento de rede comprovado e uma forma de disponibilizar dependências (`node_modules`) sem copiar dados de fora do commit aprovado. Tipos, lint, testes e build ficam a cargo de “Verificar entrega aplicada” e do QA.
 - **Codex e chave de API para o Desenvolvedor.** Bloqueados (`WRITE_RESTRICTED`). No Codex, a política de rede do sandbox `workspace-write` não foi verificada neste ambiente; o adaptador de API não tem ferramentas.
 - **Dependências do Desenvolvedor.** A prévia e o envio ao Desenvolvedor ainda exigem que **todas** as dependências sejam tarefas do Arquiteto com análise concluída (`developer-preview.ts`). A regra geral de `dependency.ts` (conclusões registradas, implementação aplicada) já vale para o QA e para os estados das tarefas, mas ainda não para esse caso: uma tarefa do Desenvolvedor que depende de outra do Desenvolvedor fica bloqueada.
+- **Arquiteto depois de outra especialidade.** O envio ao Arquiteto (`handoff.ts`) só aceita dependências diretas que sejam análises do Arquiteto. Uma tarefa do Arquiteto que depende do Desenvolvedor fica bloqueada no envio manual e fica com você no piloto automático (aparece como “você” na linha do tempo, com o motivo).
+- **Piloto automático, fases 2 e 3.** Ainda não implementadas: Desenvolvedor automático com escopo por padrões e entrega numa branch isolada; ciclo QA → Desenvolvedor com `maxCycles`; resposta automática a dúvidas técnicas.
 - **Isolamento de rede dos comandos do projeto.** O guarda de rede limita só o navegador do QA. Os comandos e scripts do projeto (instalação, testes, servidor) rodam com a rede do sistema.
 - **Commit e publicação.** O Setor IA aplica e verifica, mas não faz commit, push nem deploy. Nos pilotos, o commit foi feito fora dele.
 - **Uso hospedado.** Veja “Publicação na Vercel”.

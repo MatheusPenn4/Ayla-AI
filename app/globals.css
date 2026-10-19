@@ -634,6 +634,25 @@ details.raw summary { cursor: pointer; color: var(--sky); font-size: 12.5px; mar
 .check-row { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
 .check-row input { margin-top: 3px; }
 .arch-chip { border-color: #3d4a8c; }
+/* Piloto automático (fase 1) */
+.autopilot { display: grid; gap: 8px; }
+.autopilot h4 { display: flex; align-items: center; gap: 6px; }
+.ap-timeline, .ap-runs, .ap-sheets { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 12.5px; }
+.ap-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.ap-row small { flex-basis: 100%; }
+.ap-mode { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); }
+.ap-auto .ap-mode { color: #9fe3c0; }
+.ap-manual .ap-mode { color: #ffd38a; }
+.ap-fields { display: flex; flex-wrap: wrap; gap: 8px 12px; }
+.ap-fields label { display: grid; gap: 3px; flex: 1 1 160px; min-width: 0; font-size: 12px; color: var(--muted); }
+.ap-fields input { min-width: 0; }
+.ap-status small { display: block; margin-top: 2px; }
+.ap-status.ap-st-paused, .ap-status.ap-st-waiting_user, .ap-status.ap-st-awaiting_approval { border-color: #7a5a2a; background: #2a2010; color: #ffe6bf; }
+.ap-status.ap-st-concluded { border-color: #2f7a55; background: #0f2a1e; color: #d4ffe9; }
+.ap-stop { color: #ffb4a8; }
+.ap-tag { padding: 2px 7px; border-radius: 6px; border: 1px solid #2f7a55; color: #9fe3c0; font-family: var(--font-mono); font-size: 10px; white-space: nowrap; }
+.ap-chip { border-color: #2f7a55; }
+.ap-chip.needs-you { border-color: #b8862f; color: #ffd38a; }
 .handoff-dialog .run-sec { padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: #0f1230; display: grid; gap: 6px; }
 .handoff-dialog .run-sec ol, .handoff-dialog .run-sec ul { margin: 0; padding-left: 18px; }
 @media (max-width: 760px) { .kv { grid-template-columns: 1fr; } .run-origin button { margin-left: 0; } }

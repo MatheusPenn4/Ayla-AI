@@ -2,7 +2,7 @@
 // The executor uses a local SQLite file (node:sqlite, see sqlite.ts). The SQL
 // is portable: Postgres needs only a driver that maps "?" placeholders to $n.
 import { randomUUID } from "node:crypto";
-import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, ApplicationRecord, ApplicationVerification, DeveloperDiff, LocalResolution, ProjectRunConfig, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
+import type { ApiConnectionRecord, ApiConnectionState, ApiProvider, ApplicationRecord, AutopilotPolicy, AutopilotRecord, AutopilotStatus, AutopilotStop, ApplicationVerification, DeveloperDiff, LocalResolution, ProjectRunConfig, RunBudget, RunDetail, RunError, RunEvent, RunRecord, RunStatus, SourceContext, TaskCompletion, Verification } from "@/lib/engine/types";
 
 export interface SqlDriver {
   readonly kind: string;
@@ -142,10 +142,31 @@ const SCHEMA = [
     secrets_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL
   )`,
+  // Autopilot policies (v9): what the user approved once for a Director plan, frozen with its hash, plus what
+  // the supervisor did under it. At most one non-final policy per plan.
+  `CREATE TABLE IF NOT EXISTS autopilots (
+    id TEXT PRIMARY KEY,
+    plan_run_id TEXT NOT NULL,
+    demand_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    runs_json TEXT NOT NULL DEFAULT '[]',
+    used_tokens INTEGER NOT NULL DEFAULT 0,
+    stop_json TEXT,
+    waiting_json TEXT,
+    handled_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    approved_at TEXT,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS autopilots_one_open ON autopilots (plan_run_id) WHERE status NOT IN ('concluded', 'canceled', 'expired')`,
+  `CREATE INDEX IF NOT EXISTS autopilots_by_demand ON autopilots (demand_id, created_at)`,
 ];
 
-/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off; v7 = local projects, applications of Developer diffs (+ task_completions.application_id); v8 = per-project execution settings. */
-export const SCHEMA_VERSION = 8;
+/** Current schema version. v1 = Director only (commit ae8e896); v2 = run kinds + hand-off links; v3 = rejected Developer diffs kept for inspection; v4 = clarifications resolved outside the model, kept for inspection; v5 = QA hand-off + validated task-completion evidence; v6 = API-key connections + Reviewer hand-off; v7 = local projects, applications of Developer diffs (+ task_completions.application_id); v8 = per-project execution settings; v9 = autopilot policies. */
+export const SCHEMA_VERSION = 9;
 
 /** Columns added after v1. ALTER ... ADD COLUMN keeps every existing row unchanged (new columns get the default). */
 const ADDED_COLUMNS: [string, string][] = [
@@ -267,7 +288,7 @@ export class RunStore {
     const tables = await this.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`);
     if (!tables.some(t => t.name === "director_runs")) return false;
     const cols = await this.db.all<{ name: string }>(`PRAGMA table_info(director_runs)`);
-    if (ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || ["task_completions", "api_connections", "applications", "local_projects", "apply_reviews", "project_configs"].some(n => !tables.some(t => t.name === n))) return true;
+    if (ADDED_COLUMNS.some(([c]) => !cols.some(x => x.name === c)) || ["task_completions", "api_connections", "applications", "local_projects", "apply_reviews", "project_configs", "autopilots"].some(n => !tables.some(t => t.name === n))) return true;
     const ccols = await this.db.all<{ name: string }>(`PRAGMA table_info(task_completions)`);
     return COMPLETION_COLUMNS.some(([c]) => !ccols.some(x => x.name === c));
   }
@@ -664,4 +685,92 @@ export class RunStore {
     const { changes } = await this.db.run(`DELETE FROM api_connections WHERE id = ?`, [id]);
     return changes > 0;
   }
+
+  // ---- autopilot policies ------------------------------------------------------------------------------
+
+  /** Creates a policy (awaiting the user's confirmation) or returns the one this idempotency key already created. */
+  async createAutopilot(input: { id: string; idempotencyKey: string; planRunId: string; demandId: string; policy: AutopilotPolicy; policyHash: string }): Promise<{ autopilot: AutopilotRecord; created: boolean }> {
+    await this.ensureSchema();
+    const byKey = await this.db.all(`SELECT * FROM autopilots WHERE idempotency_key = ?`, [input.idempotencyKey]);
+    if (byKey[0]) return { autopilot: toAutopilot(byKey[0]), created: false };
+    const t = nowIso();
+    await this.db.run(
+      `INSERT INTO autopilots (id, plan_run_id, demand_id, idempotency_key, status, policy_json, policy_hash, created_at, updated_at) VALUES (?, ?, ?, ?, 'awaiting_approval', ?, ?, ?, ?)`,
+      [input.id, input.planRunId, input.demandId, input.idempotencyKey, JSON.stringify(input.policy), input.policyHash, t, t],
+    );
+    return { autopilot: (await this.getAutopilot(input.id))!, created: true };
+  }
+
+  async autopilotByKey(key: string): Promise<AutopilotRecord | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM autopilots WHERE idempotency_key = ?`, [key]);
+    return rows[0] ? toAutopilot(rows[0]) : null;
+  }
+
+  async getAutopilot(id: string): Promise<AutopilotRecord | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM autopilots WHERE id = ?`, [id]);
+    return rows[0] ? toAutopilot(rows[0]) : null;
+  }
+
+  /** The policy of a plan that is not final yet (at most one, by index). */
+  async openAutopilotForPlan(planRunId: string): Promise<AutopilotRecord | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all(`SELECT * FROM autopilots WHERE plan_run_id = ? AND status NOT IN ('concluded', 'canceled', 'expired') LIMIT 1`, [planRunId]);
+    return rows[0] ? toAutopilot(rows[0]) : null;
+  }
+
+  /** Policies of these plans/demands, newest first (history included). */
+  async autopilotsFor(q: { planRunId?: string; demandIds?: string[] }): Promise<AutopilotRecord[]> {
+    await this.ensureSchema();
+    if (q.planRunId) return (await this.db.all(`SELECT * FROM autopilots WHERE plan_run_id = ? ORDER BY created_at DESC`, [q.planRunId])).map(toAutopilot);
+    const ids = q.demandIds ?? [];
+    if (!ids.length) return [];
+    return (await this.db.all(`SELECT * FROM autopilots WHERE demand_id IN (${ids.map(() => "?").join(", ")}) ORDER BY created_at DESC`, ids)).map(toAutopilot);
+  }
+
+  /** Policies the supervisor must look at when the executor starts. */
+  async liveAutopilots(): Promise<AutopilotRecord[]> {
+    await this.ensureSchema();
+    return (await this.db.all(`SELECT * FROM autopilots WHERE status IN ('active', 'waiting_user', 'waiting_rate_limit') ORDER BY created_at`)).map(toAutopilot);
+  }
+
+  /** Atomic update, optionally only from the given statuses (returns false when the record moved on). */
+  async updateAutopilot(id: string, patch: Partial<Pick<AutopilotRecord, "status" | "approvedAt" | "runs" | "usedTokens" | "stop" | "waiting" | "handled">>, onlyIfStatus?: AutopilotStatus[]): Promise<boolean> {
+    await this.ensureSchema();
+    const sets: string[] = ["updated_at = ?"], params: unknown[] = [nowIso()];
+    const col: Record<string, [string, (v: unknown) => unknown]> = {
+      status: ["status", v => v], approvedAt: ["approved_at", v => v], runs: ["runs_json", v => JSON.stringify(v)], usedTokens: ["used_tokens", v => v],
+      stop: ["stop_json", v => (v == null ? null : JSON.stringify(v))], waiting: ["waiting_json", v => (v == null ? null : JSON.stringify(v))], handled: ["handled_json", v => JSON.stringify(v)],
+    };
+    for (const [k, v] of Object.entries(patch)) { const c = col[k]; if (!c) continue; sets.push(`${c[0]} = ?`); params.push(c[1](v)); }
+    let where = "id = ?";
+    params.push(id);
+    if (onlyIfStatus?.length) { where += ` AND status IN (${onlyIfStatus.map(() => "?").join(", ")})`; params.push(...onlyIfStatus); }
+    const { changes } = await this.db.run(`UPDATE autopilots SET ${sets.join(", ")} WHERE ${where}`, params);
+    return changes === 1;
+  }
+
+  /** Runs of the same kind and connection that reported usage — the basis of the autopilot's cost projection. */
+  async usageHistory(kind: RunRecord["kind"], connection: string, limit = 30): Promise<RunRecord[]> {
+    await this.ensureSchema();
+    return (await this.db.all(`SELECT * FROM director_runs WHERE kind = ? AND connection = ? AND finished_at IS NOT NULL ORDER BY created_at DESC LIMIT ?`, [kind, connection, limit])).map(toRecord).filter(r => r.budget?.reportedTotalTokens != null);
+  }
+
+  /** Oldest creation time inside the last hour (when the local hourly limit opens again). */
+  async oldestCreatedSince(iso: string): Promise<string | null> {
+    await this.ensureSchema();
+    const rows = await this.db.all<{ c: string | null }>(`SELECT MIN(created_at) AS c FROM director_runs WHERE created_at >= ?`, [iso]);
+    return rows[0]?.c ?? null;
+  }
+}
+
+function toAutopilot(r: Row): AutopilotRecord {
+  return {
+    id: String(r.id), planRunId: String(r.plan_run_id), demandId: String(r.demand_id), status: r.status as AutopilotStatus,
+    policy: parse<AutopilotPolicy>(r.policy_json)!, policyHash: String(r.policy_hash),
+    createdAt: String(r.created_at), approvedAt: (r.approved_at as string) ?? null, updatedAt: String(r.updated_at),
+    runs: parse<AutopilotRecord["runs"]>(r.runs_json) ?? [], usedTokens: Number(r.used_tokens ?? 0),
+    stop: parse<AutopilotStop>(r.stop_json), waiting: parse<AutopilotRecord["waiting"]>(r.waiting_json), handled: parse<string[]>(r.handled_json) ?? [],
+  };
 }

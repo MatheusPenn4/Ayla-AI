@@ -1003,3 +1003,98 @@ export type EngineStatus = {
   /** What a tool-equipped QA can actually use on this computer. */
   qaTooling?: QAToolingStatus;
 };
+
+// ---- Piloto automático (fase 1: Arquiteto, QA e Revisor) -------------------------------------------------
+
+/** Assignees the autopilot may send by itself in this phase (all of them run without write access). */
+export type AutopilotStage = "architect" | "qa" | "reviewer";
+export const AUTOPILOT_STAGES: AutopilotStage[] = ["architect", "qa", "reviewer"];
+
+/**
+ * - awaiting_approval: prepared and frozen, nothing runs until the user confirms it (by its hash);
+ * - active: the supervisor sends the next eligible task as soon as the previous one settles;
+ * - waiting_user: nothing it may send right now (a Developer task or a hand-off of the user's is pending);
+ *   it resumes BY ITSELF when that changes — not a brake;
+ * - waiting_rate_limit: the local hourly limit was reached; it resumes by itself when the window opens;
+ * - paused: a brake stopped it (or the user paused it); only the user resumes it;
+ * - concluded / canceled / expired: final.
+ */
+export type AutopilotStatus = "awaiting_approval" | "active" | "waiting_user" | "waiting_rate_limit" | "paused" | "concluded" | "canceled" | "expired";
+export const AUTOPILOT_FINAL: AutopilotStatus[] = ["concluded", "canceled", "expired"];
+export const AUTOPILOT_STATUS_LABEL: Record<AutopilotStatus, string> = {
+  awaiting_approval: "Aguardando sua confirmação",
+  active: "Ativo",
+  waiting_user: "Aguardando você",
+  waiting_rate_limit: "Aguardando o limite por hora",
+  paused: "Pausado",
+  concluded: "Concluído",
+  canceled: "Encerrado",
+  expired: "Vencido",
+};
+
+/** Why the supervisor stopped (status "paused"). Every brake leaves an already-prepared hand-off waiting for the user's own review. */
+export type AutopilotStopCode =
+  | "budget" // used + projected cost of the next hand-off would exceed the demand's budget
+  | "usage_unknown" // a finished run reported no usage: the budget could no longer be guaranteed
+  | "sheet_budget" // the hand-off's own text estimate already exceeds the sheet's budget
+  | "clarification" // a collaborator asked a question
+  | "failed" // a run failed (auth_busy, expired session, subscription limit, timeout…) — D3: never retried by itself
+  | "canceled_by_user" // the user canceled or discarded a hand-off of the policy
+  | "sheet_mismatch" // the prepared hand-off does not carry the frozen sheet
+  | "no_tested_version" // D2: QA would have no version to test (no authorized local project)
+  | "max_runs" // the policy's maximum of automatic runs was reached
+  | "prepare_refused" // the executor refused to prepare the hand-off (the reason is shown)
+  | "plan_unavailable" // the Director plan is no longer ready
+  | "user_paused";
+
+export type AutopilotStop = { code: AutopilotStopCode; message: string; taskId: string | null; runId: string | null; at: string };
+
+/** What the user approves once, frozen and identified by its hash. */
+export type AutopilotPolicy = {
+  version: 1;
+  planRunId: string;
+  demandId: string;
+  /** Tasks of the plan the supervisor may send by itself, in plan order. */
+  tasks: { id: string; assignee: AutopilotStage; title: string }[];
+  /** Sheets frozen at approval (later edits in the office never change a running policy). */
+  sheets: Partial<Record<AutopilotStage, TeamMemberInput>>;
+  /** Total tokens this demand may consume through automatic hand-offs (reported by the clients). */
+  budgetTokens: number;
+  maxRuns: number;
+  expiresAt: string;
+  /** Decisions D1–D4, frozen with the policy. */
+  rules: {
+    /** D1: the Architect accepts the commit the executor proposes, even if it is not the Director's, with the reason recorded. */
+    acceptProposedCommit: true;
+    /** D2: QA is only sent when there is a version to test. */
+    qaRequiresTestedVersion: true;
+    /** D3: a failure stops the policy (no automatic retry). */
+    stopOnFailure: true;
+    /** D4: a task already sent is never sent "novamente" by the supervisor. */
+    neverRepeat: true;
+  };
+};
+
+export type AutopilotRecord = {
+  id: string;
+  planRunId: string;
+  demandId: string;
+  status: AutopilotStatus;
+  policy: AutopilotPolicy;
+  policyHash: string;
+  createdAt: string;
+  approvedAt: string | null;
+  updatedAt: string;
+  /** Hand-offs the supervisor approved by itself, in order. */
+  runs: { runId: string; taskId: string; at: string; projectedTokens: number }[];
+  /** Tokens reported by the clients for those runs (recomputed from the records at every step). */
+  usedTokens: number;
+  stop: AutopilotStop | null;
+  /** What the supervisor is waiting for (waiting_user / waiting_rate_limit), in plain words. */
+  waiting: { message: string; until: string | null; taskIds: string[] } | null;
+  /** Settled problems already turned into a stop (a resume never stops twice on the same run). */
+  handled: string[];
+};
+
+/** Suggested budget for a new policy, with how it was computed. */
+export type AutopilotSuggestion = { budgetTokens: number; maxRuns: number; basis: string[] };

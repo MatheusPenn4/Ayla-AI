@@ -1,8 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { EngineApiError, buildStartRequest, engineApi, toTeamInput, type HandoffFollowUp } from "@/lib/engine/client";
-import { ACTIVE_STATUSES, type ApiProvider, type ApplicationRecord, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
+import { EngineApiError, buildStartRequest, engineApi, toTeamInput, type AutopilotUsageHistory, type HandoffFollowUp } from "@/lib/engine/client";
+import { ACTIVE_STATUSES, type ApiProvider, type ApplicationRecord, type AutopilotRecord, type ConnectionId, type EngineStatus, type RunRecord, type TaskCompletion } from "@/lib/engine/types";
 import type { Agent, Demand } from "@/lib/office/types";
 
 const message = (e: unknown, fallback: string) => (e instanceof EngineApiError ? `${e.message}${e.details?.length ? ` (${e.details.join("; ")})` : ""}` : fallback);
@@ -17,6 +17,9 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  /** Piloto automático: policies of these demands (newest first) and the usage history behind the budget suggestion. */
+  const [autopilots, setAutopilots] = useState<AutopilotRecord[]>([]);
+  const [usageHistory, setUsageHistory] = useState<AutopilotUsageHistory | null>(null);
   const [completions, setCompletions] = useState<Record<string, TaskCompletion[]>>({});
   const [applications, setApplications] = useState<Record<string, ApplicationRecord[]>>({});
   const [pending, setPending] = useState<Set<string>>(new Set());
@@ -50,8 +53,10 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
 
   const refresh = useCallback(async () => {
     const ids = demandKey ? demandKey.split(",") : [];
-    if (!ids.length) { setRuns([]); return; }
+    if (!ids.length) { setRuns([]); setAutopilots([]); return; }
     try { setRuns((await engineApi.list(ids)).runs); } catch { /* keep last known state; the banner reports executor problems */ }
+    // Separate request: an older executor without the autopilot keeps the runs working.
+    try { const r = await engineApi.listAutopilots(ids); setAutopilots(r.autopilots); setUsageHistory(r.usageHistory); } catch { /* panel shows the executor's own error when used */ }
   }, [demandKey]);
 
   useEffect(() => {
@@ -61,11 +66,15 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
   }, [hydrated, refresh, refreshStatus]);
 
   const anyActive = runs.some(r => ACTIVE_STATUSES.includes(r.status));
+  // A live policy moves by itself (the supervisor sends the next task): keep polling while one is live.
+  const anyLivePolicy = autopilots.some(a => a.status === "active" || a.status === "waiting_user" || a.status === "waiting_rate_limit");
   useEffect(() => {
-    if (!anyActive) return;
-    const t = setInterval(() => { void refresh(); }, 2000);
+    if (!anyActive && !anyLivePolicy) return;
+    const t = setInterval(() => { void refresh(); }, anyActive ? 2000 : 4000);
     return () => clearInterval(t);
-  }, [anyActive, refresh]);
+  }, [anyActive, anyLivePolicy, refresh]);
+  /** The latest policy of a plan (any status), or null. */
+  const autopilotFor = useCallback((planRunId: string) => autopilots.find(a => a.planRunId === planRunId) ?? null, [autopilots]);
   // When a run ends, connection state may have changed (expired session, limit…).
   const prevActive = useRef(false);
   useEffect(() => {
@@ -251,5 +260,5 @@ export function useRuns(demands: Demand[], hydrated: boolean) {
     try { const { run } = await engineApi.cancel(runId); setRuns(list => list.map(r => (r.id === run.id ? run : r))); } catch { /* shown on next refresh */ }
   }, []);
 
-  return { status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, prepareReviewerHandoff, loadCompletions, completionsFor, loadApplications, applicationsFor, approve, cancel, refresh, refreshStatus, verify, probe, createApiConnection, verifyApiConnection, deleteApiConnection };
+  return { autopilots, autopilotFor, usageHistory, status, statusError, checking, runs, pending, startErrors, latestFor, historyFor, taskRunsFor, handoffsOf, start, prepareHandoff, prepareDeveloperHandoff, prepareQAHandoff, prepareReviewerHandoff, loadCompletions, completionsFor, loadApplications, applicationsFor, approve, cancel, refresh, refreshStatus, verify, probe, createApiConnection, verifyApiConnection, deleteApiConnection };
 }

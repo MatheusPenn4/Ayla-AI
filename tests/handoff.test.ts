@@ -579,7 +579,7 @@ describe("revisão de commit", () => {
   });
 });
 
-describe("cópia local autorizada (somente leitura, Git real em pasta temporária)", () => {
+describe("cópia local autorizada (somente leitura, Git real em pasta temporária)", { timeout: 30_000 }, () => {
   function makeRepo(root: string) {
     const dir = path.join(root, "clone");
     mkdirSync(dir);
@@ -827,7 +827,7 @@ describe("\"lido\" em arquivo enviado só em trecho", () => {
   });
 });
 
-describe("primeiro envio numa cópia local, comparado com o commit do Diretor (Git real)", () => {
+describe("primeiro envio numa cópia local, comparado com o commit do Diretor (Git real)", { timeout: 30_000 }, () => {
   it("registra arquivos confirmados e a comparação arquivo a arquivo; o evento não fala de envio anterior inexistente", async () => {
     const dir = path.join(work, "clone");
     mkdirSync(dir);
@@ -990,7 +990,7 @@ describe("redactSecrets: o diff nunca guarda um segredo reconhecível, mas não 
   });
 });
 
-describe("Desenvolvedor: preparar o envio (nada é construído ou chamado)", () => {
+describe("Desenvolvedor: preparar o envio (nada é construído ou chamado)", { timeout: 30_000 }, () => {
   it("recusa quando as dependências (Arquiteto) não estão concluídas", async () => {
     const { svc } = service([reply(analysis())]);
     const { plan } = await chainWithT1(svc); // only t1 done; t2 still pending
@@ -1040,7 +1040,7 @@ describe("Desenvolvedor: preparar o envio (nada é construído ou chamado)", () 
   });
 });
 
-describe("Desenvolvedor: escopo de edição escolhido explicitamente (nunca inferido da sugestão do Arquiteto)", () => {
+describe("Desenvolvedor: escopo de edição escolhido explicitamente (nunca inferido da sugestão do Arquiteto)", { timeout: 30_000 }, () => {
   it("recusa corpo sem editScope (campo agora obrigatório na validação de entrada)", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await localChainWithAnalyses(repo, store);
@@ -1114,7 +1114,7 @@ describe("Desenvolvedor: escopo de edição escolhido explicitamente (nunca infe
   // ever calling a model, then canceled that test hand-off so the user's own selection is what they confirm.
 });
 
-describe("Desenvolvedor: aprovação, execução real (materializada) e diff", () => {
+describe("Desenvolvedor: aprovação, execução real (materializada) e diff", { timeout: 30_000 }, () => {
   it("divergência no momento da confirmação: hash diferente é recusado; aprovação dupla enfileira uma única vez", async () => {
     const repo = makeDevRepo(work);
     const { plan } = await localChainWithAnalyses(repo, store);
@@ -1788,5 +1788,234 @@ describe("Revisor: aprovação, execução real (simulada) e veredito final coer
     expect(detail.qa).toBeNull();
     expect(detail.developer).toBeNull();
     expect((await store.get(run.id))!.reviewer?.verdict).toBe("aprovado");
+  });
+});
+
+// ---- Piloto automático (fase 1): política aprovada uma vez; Arquiteto, QA e Revisor enviados pelo supervisor ----
+
+const apSheets = () => ({ architect: architectSheet(), qa: qaSheet(), reviewer: reviewerSheet() });
+const apReq = (planRunId: string, over: Record<string, unknown> = {}) => ({ idempotencyKey: `ap:${Math.random().toString(36).slice(2, 12)}`, planRunId, sheets: apSheets(), budgetTokens: 2_000_000, maxRuns: 10, validityHours: 24, ...over });
+type AP = { id: string; status: string; policyHash: string; runs: { runId: string; taskId: string }[]; stop: { code: string; message: string; runId: string | null } | null; waiting: { message: string; taskIds: string[] } | null; usedTokens: number };
+async function activate(svc: ExecutorService, planRunId: string, over: Record<string, unknown> = {}) {
+  const prep = await svc.prepareAutopilot(apReq(planRunId, over));
+  expect(prep.status).toBe(201);
+  const ap = body<{ autopilot: AP }>(prep).autopilot;
+  expect(ap.status).toBe("awaiting_approval");
+  const ok = await svc.approveAutopilot(ap.id, { policyHash: ap.policyHash });
+  expect(ok.status).toBe(202);
+  await svc.idle();
+  return ap.id;
+}
+const apOf = async (id: string) => (await store.getAutopilot(id)) as unknown as AP;
+/** reviewerChainPlan (t1, t2 Architect → t3 Developer → t4 Architect, t5 QA → t6 Reviewer), with the Director's commit = the local repo's base. */
+async function apPlan(repo: { dir: string; base: string }, plan_: DirectorPlan = reviewerChainPlan()) {
+  const plan = await directorPlan(plan_, store, "plan_ready");
+  const detail = (await store.detail(plan))!;
+  await store.update(plan, { context: { ...(detail.context as Extract<RunDetail["context"], { kind: "github" }>)!, commit: repo.base } });
+  return plan;
+}
+const devWrites = async (c: AgentCall) => { writeFileSync(path.join(c.workDir, "src", "serializador.ts"), "export const toMarkdown = () => \"\";\n"); return reply(devResult({ changes: [{ path: "src/serializador.ts", action: "created", reason: "Novo módulo puro." }] })); };
+
+describe("Piloto automático: cadeia completa com a política aprovada uma vez", { timeout: 60_000 }, () => {
+  it("envia t1 e t2 (Arquiteto) sozinho, espera você no Desenvolvedor, e depois envia t5 (QA) e t6 (Revisor) até concluir — nunca o Desenvolvedor", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc, calls } = service([reply(analysis()), reply(analysis()), devWrites, ...qaTurns(), reply(reviewerResultRaw())], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan);
+    let ap = await apOf(id);
+    // t4 (Architect depending on the Developer task) stays with the user: the Architect hand-off only accepts Architect dependencies.
+    expect((await store.getAutopilot(id))!.policy.tasks.map(t => t.id)).toEqual(["t1", "t2", "t5", "t6"]);
+    expect(ap.runs.map(r => r.taskId)).toEqual(["t1", "t2"]);
+    expect(ap.status).toBe("waiting_user");
+    expect(ap.waiting?.taskIds).toContain("t3");
+    expect(ap.waiting?.message).toContain("Desenvolvedor");
+    expect(calls).toHaveLength(2);
+    for (const r of ap.runs) {
+      const ev = await store.events(r.runId);
+      expect(ev.some(e => e.kind === "auto_approved" && e.message.includes(id.slice(0, 8)))).toBe(true);
+      expect(ev.some(e => e.kind === "approved")).toBe(false); // never recorded as the user's own confirmation
+    }
+    expect(await store.runsForTask(plan, "t3")).toHaveLength(0); // the Developer is never prepared by the supervisor
+
+    // The user sends the Developer task by hand; when it settles, the supervisor continues by itself.
+    const t3 = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    await svc.approve(t3.id, { snapshotHash: t3.snapshotHash });
+    await svc.idle();
+    ap = await apOf(id);
+    expect(ap.runs.map(r => r.taskId)).toEqual(["t1", "t2", "t5", "t6"]);
+    expect(ap.status).toBe("concluded");
+    expect((await store.get(ap.runs[3].runId))!.reviewer?.verdict).toBe("aprovado");
+    expect((await store.events(t3.id)).some(e => e.kind === "auto_approved")).toBe(false);
+    expect(ap.usedTokens).toBeGreaterThan(0);
+    expect((await store.events(plan)).map(e => e.kind)).toEqual(expect.arrayContaining(["autopilot_prepared", "autopilot_approved", "autopilot_step", "autopilot_waiting", "autopilot_concluded"]));
+    expect(repo.status()).toBe(""); // the user's checkout is never touched
+  });
+});
+
+describe("Piloto automático: freios", { timeout: 60_000 }, () => {
+  it("esclarecimento pedido para a política; a tarefa seguinte não é preparada", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc } = service([reply(clarify())], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan);
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "clarification" } });
+    expect(await store.runsForTask(plan, "t2")).toHaveLength(0);
+  });
+
+  it("falha para a política (D3: sem nova tentativa automática)", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc, calls } = service([new AgentError("auth_busy", "Failed to refresh OAuth token", false)], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan);
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "failed" } });
+    expect(calls).toHaveLength(1);
+    expect(await store.runsForTask(plan, "t1")).toHaveLength(1);
+  });
+
+  it("uso não informado pelo cliente para a política", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc } = service([reply(analysis(), null)], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan);
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "usage_unknown" } });
+  });
+
+  it("orçamento da demanda: a projeção passaria do limite — o envio fica aguardando a sua revisão e nada é chamado", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc, calls } = service([], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan, { budgetTokens: 1_000 });
+    const ap = await apOf(id);
+    expect(ap).toMatchObject({ status: "paused", stop: { code: "budget" } });
+    expect(ap.runs).toHaveLength(0);
+    expect((await store.get(ap.stop!.runId!))!.status).toBe("awaiting_approval");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("estimativa acima do orçamento da ficha para antes de aprovar", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc, calls } = service([], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan, { sheets: { ...apSheets(), architect: architectSheet({ budget: 10 }) } });
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "sheet_budget" } });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("máximo de execuções da política", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc } = service([reply(analysis())], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan, { maxRuns: 1 });
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "max_runs" } });
+    expect((await apOf(id)).runs.map(r => r.taskId)).toEqual(["t1"]);
+  });
+
+  it("cancelamento de uma execução da política para a política", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    let svcRef: ExecutorService | null = null;
+    const { svc } = service([async () => { const open = (await store.runsForTask(plan, "t1"))[0]; await svcRef!.cancel(open.id); return reply(analysis()); }], { s: store, localRepos: [repo.dir] });
+    svcRef = svc;
+    const id = await activate(svc, plan);
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "canceled_by_user" } });
+  });
+
+  it("D2: QA sem versão para testar (sem projeto local) para a política antes de aprovar", async () => {
+    const plan = await directorPlan(goodPlan()); // t1 Developer → t2 QA; no local project authorized
+    const { svc, calls } = service();
+    expect((await svc.recordTaskCompletion({ parentRunId: plan, taskId: "t1", kind: "direct_implementation", commit: "a".repeat(40), files: ["src/botao.tsx"], verification: { typecheck: null, lint: null, tests: null, build: null }, note: "Implementado fora do encaminhamento (teste)." })).status).toBe(201);
+    await svc.idle();
+    const id = await activate(svc, plan, { sheets: { qa: qaSheet() } });
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "no_tested_version" } });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("Piloto automático: integridade", { timeout: 60_000 }, () => {
+  it("hash adulterado é recusado na confirmação e na retomada", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc } = service([reply(clarify())], { s: store, localRepos: [repo.dir] });
+    const ap = body<{ autopilot: AP }>(await svc.prepareAutopilot(apReq(plan))).autopilot;
+    expect((await svc.approveAutopilot(ap.id, { policyHash: "0".repeat(64) })).status).toBe(409);
+    expect((await apOf(ap.id)).status).toBe("awaiting_approval");
+    await svc.approveAutopilot(ap.id, { policyHash: ap.policyHash });
+    await svc.idle();
+    expect((await apOf(ap.id)).status).toBe("paused"); // clarification
+    expect((await svc.resumeAutopilot(ap.id, { policyHash: "f".repeat(64) })).status).toBe(409);
+    expect((await apOf(ap.id)).status).toBe("paused");
+  });
+
+  it("o supervisor nunca aprova um envio do Desenvolvedor, mesmo chamado diretamente", async () => {
+    const repo = makeDevRepo(work);
+    const { plan } = await localChainWithAnalyses(repo, store);
+    const { svc } = service([], { s: store, localRepos: [repo.dir] });
+    const t3 = body<{ run: RunDetail }>(await svc.prepareDeveloper(devReq(plan, "t3"))).run;
+    expect(await svc.approveByPolicy(t3.id, t3.snapshotHash, { id: "x".repeat(36), policyHash: "h", approvedAt: null }, "teste")).toBe(false);
+    expect((await store.get(t3.id))!.status).toBe("awaiting_approval");
+  });
+
+  it("dois acionamentos simultâneos geram um único envio", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc } = service([reply(clarify())], { s: store, localRepos: [repo.dir] });
+    const ap = body<{ autopilot: AP }>(await svc.prepareAutopilot(apReq(plan))).autopilot;
+    await Promise.all([svc.approveAutopilot(ap.id, { policyHash: ap.policyHash }), svc.supervisor.tick(ap.id), svc.supervisor.tick(ap.id)]);
+    await svc.idle();
+    expect(await store.runsForTask(plan, "t1")).toHaveLength(1);
+  });
+
+  it("limite por hora: espera sem chamar você; ao reiniciar o executor com limite livre, retoma sozinho — e uma política pausada continua parada", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const limited = (steps: Parameters<typeof fakeAdapter>[0], maxRunsPerHour: number) => {
+      const a = fakeAdapter(steps);
+      const svc = new ExecutorService({ ...cfg(), limits: { ...cfg().limits, maxRunsPerHour }, localRepos: [repo.dir] }, { store, runner: runProcess, env: process.env, detectors: { claude_code: async () => connected("claude_code"), codex: async () => connected("codex") }, adapters: { claude_code: a.adapter, codex: a.adapter } });
+      return { svc, calls: a.calls };
+    };
+    const one = limited([], 1); // the Director plan itself already counts in the last hour
+    const id = await activate(one.svc, plan);
+    expect(await apOf(id)).toMatchObject({ status: "waiting_rate_limit" });
+    expect(await store.runsForTask(plan, "t1")).toHaveLength(0);
+    one.svc.abortAll();
+
+    const two = limited([reply(clarify())], 50);
+    await two.svc.boot();
+    await two.svc.idle();
+    expect(await store.runsForTask(plan, "t1")).toHaveLength(1);
+    expect(await apOf(id)).toMatchObject({ status: "paused", stop: { code: "clarification" } });
+
+    const three = limited([], 50);
+    await three.svc.boot();
+    await three.svc.idle();
+    expect(await store.runsForTask(plan, "t2")).toHaveLength(0);
+    expect(three.calls).toHaveLength(0);
+  });
+
+  it("D1: commit proposto diferente do Diretor é aceito com o motivo registrado na revisão", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    // t1 analyzed by hand from the local copy, so t2's proposal (local_git) differs from the Director's GitHub commit.
+    const manual = service([reply(analysis())], { s: store, localRepos: [repo.dir] });
+    const t1 = body<{ run: RunDetail }>(await manual.svc.prepare({ ...handoffReq(plan, "t1"), source: { via: "local_git", commit: repo.base }, revisionReason: "Ler do commit local real (teste)." })).run;
+    await manual.svc.approve(t1.id, { snapshotHash: t1.snapshotHash });
+    await manual.svc.idle();
+    const { svc } = service([reply(clarify())], { s: store, localRepos: [repo.dir] });
+    const id = await activate(svc, plan, { taskIds: ["t2"] });
+    const t2 = (await apOf(id)).runs[0];
+    expect(t2.taskId).toBe("t2");
+    const snap = (await store.snapshot(t2.runId)) as ArchitectSnapshot;
+    expect(snap.revision?.reason).toContain("Piloto automático (D1)");
+    expect((await store.events(t2.runId)).find(e => e.kind === "auto_approved")?.message).toContain("D1");
+  });
+
+  it("recusa preparar sem a ficha do responsável, com ficha sem conexão ou num plano que já tem política em andamento", async () => {
+    const repo = makeDevRepo(work);
+    const plan = await apPlan(repo);
+    const { svc } = service([reply(clarify())], { s: store, localRepos: [repo.dir] });
+    expect(body<{ error: { code: string } }>(await svc.prepareAutopilot(apReq(plan, { sheets: { qa: qaSheet(), reviewer: reviewerSheet() } }))).error.code).toBe("sheet_missing");
+    expect(body<{ error: { code: string } }>(await svc.prepareAutopilot(apReq(plan, { sheets: { ...apSheets(), qa: qaSheet({ connection: "none" }) } }))).error.code).toBe("no_connection");
+    await activate(svc, plan);
+    expect(body<{ error: { code: string } }>(await svc.prepareAutopilot(apReq(plan))).error.code).toBe("autopilot_open");
   });
 });

@@ -23,6 +23,7 @@ import { dependencyBlocker, dependencyEvidence, evidenceLabel } from "@/lib/engi
 import { ACTIVE_STATUSES, RUN_STATUS_LABEL, type ApplicationRecord, type ArchitectSnapshot, type DeveloperSnapshot, type DirectorSnapshot, type PlanTask, type QASnapshot, type ReviewerSnapshot, type RunDetail, type RunRecord, type RunStatus, type TaskCompletion } from "@/lib/engine/types";
 import { QA_TOOL_EVAL_SCHEMA } from "@/lib/engine/qa-tooled-schema";
 import { ApplyDialog } from "./apply-dialog";
+import { AutopilotPanel } from "./autopilot-panel";
 import { AuditNotes, EvidenceCard, StackReportView, versionText } from "./qa-tooling";
 import { LocalContextTable } from "./local-source";
 import { directorPlanToMarkdown, planMarkdownFilename, type PlanMarkdownStep, type PlanMarkdownTask } from "@/lib/engine/plan-markdown";
@@ -194,6 +195,8 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
   useEffect(() => { void loadCompletions(run.id); void loadApplications(run.id); }, [run.id, loadCompletions, loadApplications]);
   const [applyFor, setApplyFor] = useState<{ runId: string; label: string } | null>(null);
   const [sendFor, setSendFor] = useState<string | null>(null);
+  // Runs this plan's autopilot policies confirmed by themselves (shown as such, never as the user's own confirmation).
+  const autoRunIds = new Set(runs.autopilots.filter(a => a.planRunId === run.id).flatMap(a => a.runs.map(r => r.runId)));
   const [previewFor, setPreviewFor] = useState<string | null>(null);
   // The Director's own "coherent final result": the first Reviewer task of this plan that reached a concluded
   // parecer. Nothing is synthesized here — it is exactly the Reviewer's own registered verdict and summary.
@@ -296,6 +299,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
 
           <Tabs.Content value="tasks" className="run-pane">
             <p className="pane-intro">Propostas de delegação do Diretor. Tarefas do <b>Arquiteto</b> (só leitura), do <b>Desenvolvedor</b> (escrita numa cópia isolada), do <b>QA</b> (verificação: pede leitura, comandos e navegador ao executor numa cópia isolada; nunca edita o código) e do <b>Revisor</b> (parecer final, só leitura) podem ser enviadas, uma de cada vez e só depois que você revisar e confirmar.</p>
+            {res && run.status === "plan_ready" && <AutopilotPanel plan={run} agents={agents} runs={runs} onOpenRun={onOpenRun} />}
             {res && run.status === "plan_ready" && !architectTasks.length && (
               <div className="notice">Nenhuma tarefa deste plano foi atribuída ao Arquiteto: não há encaminhamento arquitetural neste plano.</div>
             )}
@@ -309,7 +313,7 @@ function DirectorBody({ run, active, agents, runs, onReplan, onCancel, onHandoff
               const sending = runs.pending.has(`${run.id}:${t.id}`);
               return (
                 <article key={t.id} className={`task-card ${isHandoffTarget(t.assignee) ? "is-handoff" : ""}`}>
-                  <header>{a ? <Avatar look={a.look} color={a.color} size={30} /> : null}<div><b>{t.id} · {t.title}</b><small>{name(t.assignee)} · etapa {t.step_id || "—"}{t.depends_on.length ? ` · depende de ${t.depends_on.join(", ")}` : ""}</small></div>{(() => { const ev = dependencyEvidence(t, runsOf, completionsOf); return ev.kind === "applied_run_result_validated" ? <TaskStateBadge state={st.key} label="Implementação aplicada e validada" title={evidenceLabel(ev)} /> : <TaskStateBadge state={st.key} />; })()}</header>
+                  <header>{a ? <Avatar look={a.look} color={a.color} size={30} /> : null}<div><b>{t.id} · {t.title}</b><small>{name(t.assignee)} · etapa {t.step_id || "—"}{t.depends_on.length ? ` · depende de ${t.depends_on.join(", ")}` : ""}</small></div>{(() => { const ev = dependencyEvidence(t, runsOf, completionsOf); return ev.kind === "applied_run_result_validated" ? <TaskStateBadge state={st.key} label="Implementação aplicada e validada" title={evidenceLabel(ev)} /> : <TaskStateBadge state={st.key} />; })()}{st.run && autoRunIds.has(st.run.id) && <span className="ap-tag" title="Envio preparado e confirmado pelo piloto automático, sob a política que você aprovou">piloto automático</span>}</header>
                   <dl>
                     <dt>Escopo</dt><dd>{t.scope}</dd>
                     <dt>Insumos</dt><dd>{t.inputs || "—"}</dd>

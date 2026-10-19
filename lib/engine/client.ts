@@ -3,7 +3,7 @@
 import { agentBrief } from "@/lib/integration/contracts";
 import type { Agent, Demand } from "@/lib/office/types";
 import type { DeveloperPreview } from "./developer-preview";
-import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, ProjectRefs, ProjectRunConfig, ProjectRunDetection, ResolvedSource, RunDetail, RunRecord, SourceComparison, SourceContext, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
+import type { ApiConnectionRecord, ApiProvider, ApplicationRecord, ApplyReview, AutopilotRecord, ConnectionId, ConnectionStatus, EngineStatus, LocalProject, ProjectRefs, ProjectRunConfig, ProjectRunDetection, ResolvedSource, RunDetail, RunRecord, SourceComparison, SourceContext, StartRunRequest, TaskCompletion, TeamMemberInput } from "./types";
 
 const HEADERS = { "content-type": "application/json", "x-ayla-client": "web" };
 
@@ -130,7 +130,18 @@ export const engineApi = {
   listApplications: (planRunId: string) => call<{ applications: ApplicationRecord[] }>(`/api/runs/${planRunId}/applications`),
   verifyApplication: (id: string) => call<{ application: ApplicationRecord; started: boolean }>(`/api/applications/${id}/verify`, { method: "POST", body: "{}" }),
   cancelVerification: (id: string) => call<{ canceled: boolean; application: ApplicationRecord }>(`/api/applications/${id}/cancel-verification`, { method: "POST", body: "{}" }),
+  /** Piloto automático: policies of these demands (history included) and the usage observed in earlier runs. */
+  listAutopilots: (demandIds: string[]) => call<{ autopilots: AutopilotRecord[]; usageHistory: AutopilotUsageHistory }>(`/api/autopilots?demands=${demandIds.map(encodeURIComponent).join(",")}`),
+  /** Step 1: freezes the policy (with its hash) for confirmation. Nothing is sent. */
+  prepareAutopilot: (req: { idempotencyKey: string; planRunId: string; sheets: Partial<Record<"architect" | "qa" | "reviewer", TeamMemberInput>>; taskIds?: string[]; budgetTokens: number; maxRuns: number; validityHours: number }) =>
+    call<{ autopilot: AutopilotRecord; created: boolean }>("/api/autopilots", { method: "POST", body: JSON.stringify(req) }),
+  /** approve/resume carry the policy hash the user saw; pause/cancel need none. */
+  autopilotAction: (id: string, action: "approve" | "pause" | "resume" | "cancel", policyHash?: string) =>
+    call<{ autopilot: AutopilotRecord }>(`/api/autopilots/${id}/${action}`, { method: "POST", body: JSON.stringify(policyHash ? { policyHash } : {}) }),
 };
+
+/** Median usage the clients reported in earlier runs of each kind (basis of the budget suggestion). */
+export type AutopilotUsageHistory = Record<"architect_task" | "qa_task" | "reviewer_task", { median: number | null; samples: number }>;
 
 /** Where an artifact the executor produced (log, screenshot, download, comparison) can be opened. */
 export const artifactUrl = (ownerId: string, name: string) => `/api/artifacts/${ownerId}/${encodeURIComponent(name)}`;
